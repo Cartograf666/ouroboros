@@ -45,9 +45,9 @@ def resolve_vision_caption_model(ctx: Any, llm: Any, *, use_local: bool = False)
         str(getattr(ctx, "active_model", "") or getattr(ctx, "task_model_override", "") or "").strip(),
     ]
     try:
-        from ouroboros.config import get_light_model, get_heavy_model, parse_fallback_chain
+        from ouroboros.config import get_light_model, parse_fallback_chain
 
-        candidates.extend([get_light_model(), get_heavy_model()])
+        candidates.append(get_light_model())
         candidates.extend(parse_fallback_chain())
     except Exception:
         pass

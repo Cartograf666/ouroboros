@@ -628,8 +628,12 @@ def test_production_final_candidate_binds_exact_host_panel(tmp_path, monkeypatch
 
     import ouroboros.loop as loop
     from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.utils import sanitize_tool_result_for_log
 
-    answer = "Complete answer reviewed by the host panel."
+    answer = "Complete answer; removed ghp_abcdefghijklmnopqrstuvwxyz1234567890AB."
+    safe_answer = sanitize_tool_result_for_log(answer)
+    panel_contents = []
+    panel_candidates = []
 
     class FakeLLM:
         def default_model(self):
@@ -641,7 +645,9 @@ def test_production_final_candidate_binds_exact_host_panel(tmp_path, monkeypatch
         lambda *_args, **_kwargs: ({"role": "assistant", "content": answer}, 0.0),
     )
 
-    def record_exact_host_panel(*, content, llm_trace, **_kwargs):
+    def record_exact_host_panel(*, content, llm_trace, tools, **_kwargs):
+        panel_contents.append(content)
+        panel_candidates.append(tools._ctx._delivery_candidate)
         candidate_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         llm_trace["review_decision"] = {
             "panel_id": "panel-production",
@@ -677,9 +683,16 @@ def test_production_final_candidate_binds_exact_host_panel(tmp_path, monkeypatch
         drive_root=tmp_path,
     )
 
+    candidate = panel_candidates[0]
     binding = trace["delivery_candidate"]["acceptance_binding"]
-    assert result == answer
-    assert binding["candidate_sha256"] == hashlib.sha256(answer.encode("utf-8")).hexdigest()
+    assert safe_answer != answer
+    assert panel_contents == [safe_answer]
+    assert candidate.full_text == safe_answer
+    assert result == safe_answer
+    assert trace["delivery_candidate"]["content_sha256"] == hashlib.sha256(
+        safe_answer.encode("utf-8")
+    ).hexdigest()
+    assert binding["candidate_sha256"] == trace["delivery_candidate"]["content_sha256"]
     assert binding["acceptance_status"] == "pass"
     assert binding["authoritative"] is True
     assert binding["panel_id"] == "panel-production"
@@ -838,6 +851,7 @@ def test_forced_fallback_rejects_stale_delivery_candidate(tmp_path, monkeypatch)
 
     import ouroboros.loop as loop
     from ouroboros.tools.registry import ToolRegistry
+    from ouroboros.utils import sanitize_tool_result_for_log
 
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = "parent1"
@@ -874,14 +888,19 @@ def test_forced_fallback_rejects_stale_delivery_candidate(tmp_path, monkeypatch)
     })
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_args, **_kwargs: (None, 0.0))
 
+    fallback = "host fallback after ghp_abcdefghijklmnopqrstuvwxyz1234567890AB"
+    safe_fallback = sanitize_tool_result_for_log(fallback)
     text, usage, returned_trace = loop._forced_final_answer(
         ctx,
         prompt="finalize",
-        fallback_text="host fallback",
+        fallback_text=fallback,
         reason_code="provider_unavailable",
     )
 
-    assert text == "host fallback"
+    rebound = ctx.delivery_candidate
+    assert safe_fallback != fallback
+    assert text == safe_fallback
+    assert rebound.full_text == safe_fallback
     assert text != candidate.full_text
     assert usage["reason_code"] == "provider_unavailable"
     assert not usage.get("_best_effort_extracted")

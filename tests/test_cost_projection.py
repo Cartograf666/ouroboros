@@ -10,6 +10,7 @@ from __future__ import annotations
 from ouroboros.cost_projection import (
     cost_display,
     cost_projection,
+    honest_accounted_amount,
     with_cost_aliases,
 )
 
@@ -27,6 +28,14 @@ class TestAliases:
         out = with_cost_aliases({"cost_usd": None, "accounted_upper_bound_usd": 9.0})
         assert out["accounted_upper_bound_usd"] is None and out["cost_usd"] is None
 
+    def test_unknown_zero_is_not_reintroduced_by_aliasing(self):
+        out = with_cost_aliases({
+            "cost_usd": 0.0, "unknown_unmetered": 1,
+            "cost_final": False,
+        })
+        assert out["cost_usd"] is None
+        assert out["accounted_upper_bound_usd"] is None
+
     def test_aliasing_never_invents_a_field(self):
         assert "cost_usd" not in with_cost_aliases({"total_rounds": 3})
         assert with_cost_aliases(None) == {}
@@ -37,12 +46,32 @@ class TestAliases:
 
 
 class TestProjection:
+    def test_unknown_zero_accounted_subtotal_is_null_but_measured_zero_survives(self):
+        assert honest_accounted_amount({
+            "accounted_usd": 0.0, "unknown_unmetered": 1,
+            "reserved_usd": 0.0, "unresolved_upper_bound_usd": 0.0,
+        }) is None
+        assert honest_accounted_amount({
+            "accounted_usd": 0.0, "unknown_unmetered": 0,
+        }) == 0.0
+        assert honest_accounted_amount({
+            "accounted_usd": 1.25, "unknown_unmetered": 1,
+        }) == 1.25
+
     def test_unknown_cost_is_null_on_both_names_and_never_final(self):
         out = cost_projection({"status": "completed"})
         assert out["cost_usd"] is None
         assert out["accounted_upper_bound_usd"] is None
         assert out["cost_known"] is False
         assert out["cost_final"] is False
+
+    def test_unknown_zero_source_cost_projects_as_null(self):
+        out = cost_projection({
+            "cost_usd": 0.0, "unknown_unmetered": 1,
+            "cost_final": False,
+        })
+        assert out["cost_usd"] is None
+        assert out["cost_known"] is False
 
     def test_missing_key_default_never_fabricates_zero(self):
         # The exact $0-fabrication class: data.get("cost_usd", 0) at five sites.

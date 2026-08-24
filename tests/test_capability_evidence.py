@@ -353,8 +353,7 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
 def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(
     tmp_path, monkeypatch,
 ):
-    import itertools
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timezone
 
     from ouroboros.capability_evidence import (
         _DENSITY_MEMO,
@@ -365,15 +364,10 @@ def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(
         resolve_review_token_density,
     )
 
-    # Windows clock granularity (~15.6ms) can stamp two back-to-back records
-    # with the SAME observed_at, making "newest" resolution a tie; force
-    # strictly increasing fresh timestamps so recency is deterministic.
+    # Windows clock granularity can stamp back-to-back records identically.
+    # Persisted observation order, not test-synthesised time, breaks that tie.
     base = datetime.now(timezone.utc)
-    ticks = itertools.count()
-    monkeypatch.setattr(
-        ce, "utc_now_iso",
-        lambda: (base + timedelta(milliseconds=next(ticks))).isoformat(),
-    )
+    monkeypatch.setattr(ce, "utc_now_iso", lambda: base.isoformat())
 
     _DENSITY_MEMO.clear()
     chars = 400_000
@@ -400,6 +394,43 @@ def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(
     stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
     assert set(stored["token_density"]["m/one"]) == {"pairs"}
     assert resolve_main_token_density(tmp_path, "", "never/seen") == (1.0, "cold_estimate")
+
+
+def test_density_throttle_uses_legacy_list_order_for_equal_clock_ties(tmp_path):
+    from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
+
+    observed_at = ce.utc_now_iso()
+    ce._save(tmp_path, {"token_density": {"m/one": {"pairs": [
+        {
+            "prompt_chars": 400_000,
+            "prompt_tokens": 100_000,
+            "observed_at": observed_at,
+            "route_fp": "route-a",
+        },
+        {
+            "prompt_chars": 400_000,
+            "prompt_tokens": 200_000,
+            "observed_at": observed_at,
+            "observation_seq": "invalid-legacy-value",
+            "route_fp": "route-a",
+        },
+    ]}}})
+
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=200_000,
+        route_fp="route-a",
+    )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert len(stored["token_density"]["m/one"]["pairs"]) == 2
+
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=100_000,
+        route_fp="route-a",
+    )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert len(stored["token_density"]["m/one"]["pairs"]) == 3
 
 
 def test_density_memo_does_not_claim_a_witness_when_persistence_failed(tmp_path, monkeypatch):
@@ -459,6 +490,7 @@ def test_density_retention_preserves_fresh_high_witness_without_refreshing_its_t
         "source": "dispatch_usage",
         "route_fp": "route-high",
     }]}}})
+    monkeypatch.setattr(ce, "utc_now_iso", lambda: now.isoformat())
 
     for index, density in enumerate((1.0, 1.1, 1.2, 1.3, 1.4, 1.5)):
         _DENSITY_MEMO.clear()
@@ -470,6 +502,10 @@ def test_density_retention_preserves_fresh_high_witness_without_refreshing_its_t
     pairs = stored["token_density"]["m/one"]["pairs"]
     assert len(pairs) == _TOKEN_DENSITY_MAX_PAIRS
     assert any(pair["observed_at"] == old_high_ts for pair in pairs)
+    fresh_sequences = [
+        pair["observation_seq"] for pair in pairs if pair["observed_at"] != old_high_ts
+    ]
+    assert fresh_sequences and all(sequence > 0 for sequence in fresh_sequences)
 
     monkeypatch.setattr(ce, "utc_now", lambda: now + datetime.timedelta(seconds=120))
     assert resolve_main_token_density(tmp_path, "route-high", "m/one") == (

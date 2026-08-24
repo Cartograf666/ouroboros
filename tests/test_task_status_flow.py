@@ -3,6 +3,12 @@ import pathlib
 import time
 from types import SimpleNamespace
 
+_TEST_SUBAGENTS = '{"enabled":true,"items":[{"subagent_id":"api-scout","name":"API scout","recommended_use":"Tests","route":{"kind":"api_model","target_id":"openai/gpt-5.6-sol"},"effort":"high"}]}'
+
+
+def _configure_test_subagent(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_SUBAGENTS", _TEST_SUBAGENTS)
+
 
 class _FakeEventQueue:
     def __init__(self, fail=False, status_root=None):
@@ -20,10 +26,11 @@ class _FakeEventQueue:
         self.events.append(dict(evt))
 
 
-def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path):
+def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
     from ouroboros.task_results import STATUS_REQUESTED
 
+    _configure_test_subagent(monkeypatch)
     event_queue = _FakeEventQueue(status_root=tmp_path)
     ctx = SimpleNamespace(
         task_depth=0,
@@ -43,6 +50,7 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path)
         expected_output="A concise handoff",
         role="architecture",
         context="Model focus A",
+        subagent_id="api-scout",
     )
 
     assert "Subagent request queued" in result
@@ -79,6 +87,7 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
     from ouroboros.tools import control as control_mod
     from ouroboros.tools.control import _schedule_task
 
+    _configure_test_subagent(monkeypatch)
     ctx = SimpleNamespace(
         task_depth=0,
         pending_events=[],
@@ -90,7 +99,7 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
         is_workspace_mode=lambda: False,
     )
 
-    result = _schedule_task(ctx, objective="Fallback child", expected_output="Result")
+    result = _schedule_task(ctx, subagent_id="api-scout", objective="Fallback child", expected_output="Result")
 
     assert "Subagent request queued" in result
     assert len(ctx.pending_events) == 1
@@ -100,7 +109,7 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
     ctx.pending_events = []
     ctx.event_queue = event_queue
     monkeypatch.setattr(control_mod, "write_task_result", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("disk full")))
-    result = _schedule_task(ctx, objective="No status", expected_output="No child")
+    result = _schedule_task(ctx, subagent_id="api-scout", objective="No status", expected_output="No child")
     assert "SUBTASK_STATUS_ERROR" in result
     assert ctx.pending_events == []
     assert event_queue.events == []
@@ -144,9 +153,7 @@ def test_cancel_task_writes_durable_intent_and_emits_live(tmp_path):
 
 
 def test_natural_completion_wins_a_late_cancel(tmp_path, monkeypatch):
-    """Phase A (owner 4=A): a child that finished before the teardown KEEPS its
-    completed result and artifacts; the cancel settles as already_settled and
-    the durable intent is closed — never the old completed-overwrite."""
+    """A child that completed before teardown keeps its result and artifacts."""
     from ouroboros.cancel_intents import active_intent
     from ouroboros.outcomes import public_task_result
     from ouroboros.task_results import (
@@ -191,17 +198,12 @@ def test_natural_completion_wins_a_late_cancel(tmp_path, monkeypatch):
         is_workspace_mode=lambda: False,
     )
 
-    # GR7-1a: "Nothing to cancel" needs a FRESH snapshot that positively
-    # proves no live ownership — a missing snapshot fails OPEN and mints.
     from ouroboros.utils import atomic_write_json, utc_now_iso
 
     atomic_write_json(
         tmp_path / "state" / "queue_snapshot.json",
         {"ts": utc_now_iso(), "running": [], "pending": []},
     )
-    # The child had ALREADY finished, so the tool mints no intent at all: an
-    # intent on a settled task would show a "Cancelling…" badge on a finished
-    # card until the watchdog cleaned it up, and there is nothing to tear down.
     assert "Nothing to cancel" in _cancel_task(ctx, "fast-child")
     assert active_intent(tmp_path, "fast-child") is None
     monkeypatch.setattr(queue_module, "DRIVE_ROOT", tmp_path)
@@ -302,9 +304,10 @@ def test_effective_cancelled_workspace_with_stale_bundle_is_terminal(tmp_path):
     assert waited["all_terminal"] is True
 
 
-def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path):
+def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
 
+    _configure_test_subagent(monkeypatch)
     parent_memory = tmp_path / "memory"
     (parent_memory / "knowledge").mkdir(parents=True)
     (parent_memory / "identity.md").write_text("stable identity", encoding="utf-8")
@@ -323,28 +326,92 @@ def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path):
         is_workspace_mode=lambda: False,
     )
 
-    _schedule_task(ctx, objective="Fork child", expected_output="Result", memory_mode="forked")
+    _schedule_task(ctx, subagent_id="api-scout", objective="Fork child", expected_output="Result", memory_mode="forked")
     forked_drive = tmp_path / "state" / "headless_tasks" / event_queue.events[-1]["task_id"] / "data"
     assert event_queue.events[-1]["drive_root"] == str(forked_drive)
     assert (forked_drive / "memory" / "identity.md").read_text(encoding="utf-8") == "stable identity"
     assert not (forked_drive / "memory" / "scratchpad.md").exists()
     assert (forked_drive / "memory" / "knowledge" / "pattern.md").is_file()
 
-    _schedule_task(ctx, objective="Empty child", expected_output="Result", memory_mode="empty")
+    _schedule_task(ctx, subagent_id="api-scout", objective="Empty child", expected_output="Result", memory_mode="empty")
     empty_drive = tmp_path / "state" / "headless_tasks" / event_queue.events[-1]["task_id"] / "data"
     assert event_queue.events[-1]["drive_root"] == str(empty_drive)
     assert not (empty_drive / "memory" / "identity.md").exists()
 
     before_shared = len(event_queue.events)
-    shared_result = _schedule_task(ctx, objective="Shared child", expected_output="Result", memory_mode="shared")
+    shared_result = _schedule_task(ctx, subagent_id="api-scout", objective="Shared child", expected_output="Result", memory_mode="shared")
     assert "TOOL_ARG_ERROR" in shared_result
     assert "memory_mode=shared is disabled" in shared_result
     assert len(event_queue.events) == before_shared
 
 
-def test_schedule_task_rejects_legacy_description_schema(tmp_path):
+def test_configured_session_child_materializes_initial_and_steered_attachments(tmp_path, monkeypatch):
+    from ouroboros.artifacts import stage_task_attachments
+    from ouroboros.owner_mailbox import write_owner_message
+    from ouroboros.subagent_work_order import compile_external_work_order
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv(
+        "OUROBOROS_SUBAGENTS",
+        '{"enabled":true,"items":[{"subagent_id":"session-scout","name":"Session scout",'
+        '"recommended_use":"Tests","route":{"kind":"agent_session",'
+        '"target_id":"codex=gpt-5.6-sol"},"effort":"high"}]}',
+    )
+    source = tmp_path / "parent-input.txt"
+    source.write_text("session-child-readable", encoding="utf-8")
+    parent_manifest = stage_task_attachments(
+        tmp_path, "parent-attachments", [{"path": str(source), "label": "parent input"}],
+    )
+    later = tmp_path / "steered-input.txt"
+    later.write_text("steered-child-readable", encoding="utf-8")
+    steered_manifest = stage_task_attachments(
+        tmp_path, "parent-attachments", [{"path": str(later), "label": "steered input"}],
+    )
+    assert write_owner_message(
+        tmp_path, "Use the later input", "parent-attachments", msg_id="steer-1",
+        attachment_manifest=steered_manifest,
+    )
+    event_queue = _FakeEventQueue()
+    ctx = SimpleNamespace(
+        task_depth=0, pending_events=[], event_queue=event_queue,
+        drive_root=tmp_path, task_id="parent-attachments",
+        task_contract={"attachment_manifest": [dict(row) for row in parent_manifest]},
+        task_metadata={}, is_direct_chat=False, is_workspace_mode=lambda: False,
+    )
+
+    result = _schedule_task(
+        ctx, subagent_id="session-scout", objective="Inspect inherited input",
+        expected_output="Report", memory_mode="forked",
+    )
+
+    assert "Subagent request queued" in result
+    event = event_queue.events[0]
+    child_manifest = event["task_contract"]["attachment_manifest"]
+    assert [row["label"] for row in child_manifest] == ["parent input", "steered input"]
+    assert str(parent_manifest[0]["abs_path"]) not in str(child_manifest)
+    assert str(steered_manifest[0]["abs_path"]) not in str(child_manifest)
+    child_ctx = ToolContext(
+        repo_dir=tmp_path, drive_root=pathlib.Path(event["drive_root"]),
+        task_id=event["task_id"],
+    )
+    assert "session-child-readable" in _read_file(
+        child_ctx, child_manifest[0]["relpath"], root="artifact_store",
+    )
+    assert "steered-child-readable" in _read_file(
+        child_ctx, child_manifest[1]["relpath"], root="artifact_store",
+    )
+    work_order = compile_external_work_order(event)
+    assert all(row["abs_path"] in work_order for row in child_manifest)
+    assert str(parent_manifest[0]["abs_path"]) not in work_order
+    assert str(steered_manifest[0]["abs_path"]) not in work_order
+
+
+def test_schedule_task_rejects_legacy_description_schema(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
 
+    _configure_test_subagent(monkeypatch)
     ctx = SimpleNamespace(
         task_depth=0,
         pending_events=[],
@@ -363,14 +430,12 @@ def test_schedule_task_rejects_legacy_description_schema(tmp_path):
     assert ctx.pending_events == []
     assert not (tmp_path / "task_results").exists()
 
-    # `deadline_at` is a PUBLIC parameter as of v6.87.7 — the parent LLM is what knows when a
-    # child's handoff stops being useful — so a model emitting it is accepted, not refused.
     from datetime import timedelta
 
     from ouroboros.deadline_utils import utc_now
 
     future = (utc_now() + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    accepted = _schedule_task(ctx, objective="o", expected_output="e", deadline_at=future)
+    accepted = _schedule_task(ctx, subagent_id="api-scout", objective="o", expected_output="e", deadline_at=future)
     assert "TOOL_ARG_ERROR" not in accepted
     assert ctx.pending_events
     ctx.pending_events.clear()
@@ -397,10 +462,11 @@ def test_schedule_task_internal_options_mapping_is_closed(tmp_path):
         _schedule_task(ctx, {"deadline_ats": "typo"}, objective="o", expected_output="e")
 
 
-def test_schedule_task_workspace_mode_inherits_context_and_enqueues(tmp_path):
+def test_schedule_task_workspace_mode_inherits_context_and_enqueues(tmp_path, monkeypatch):
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
     from ouroboros.tools.control import _get_task_result, _schedule_task, _wait_for_task
 
+    _configure_test_subagent(monkeypatch)
     budget_root = tmp_path / "root-data"
     ctx = SimpleNamespace(
         task_depth=0,
@@ -415,7 +481,7 @@ def test_schedule_task_workspace_mode_inherits_context_and_enqueues(tmp_path):
         workspace_mode="external",
     )
 
-    result = _schedule_task(ctx, objective="Inspect workspace", expected_output="Findings")
+    result = _schedule_task(ctx, subagent_id="api-scout", objective="Inspect workspace", expected_output="Findings")
 
     assert "Subagent request queued" in result
     assert ctx.pending_events == []
@@ -750,6 +816,7 @@ def test_wait_for_tasks_projects_execution_evidence_for_harness_children(tmp_pat
             "execution_evidence": {
                 "delegated_runs_started": 0, "delegated_runs_settled": 0,
                 "delegated_runs_succeeded": 0, "delegated_run_failure_states": [],
+                "delegated_runs_source_unresolved": 0,
                 "evidence_read_failed": False, "subscription_cost_usd": None,
                 "subscription_cost_estimated": False, "harness_models": [],
             },
@@ -768,6 +835,7 @@ def test_wait_for_tasks_projects_execution_evidence_for_harness_children(tmp_pat
         "actual_substrate": "native_only",
         "delegated_runs_started": 0,
         "delegated_runs_succeeded": 0,
+        "delegated_runs_source_unresolved": 0,
     }
     # A native child with no custody evidence stays compact — no evidence block.
     assert "execution_evidence" not in payload["tasks"]["nativekid"]
@@ -2043,30 +2111,25 @@ def test_handle_schedule_task_depth_rejection_writes_failed_status(tmp_path, mon
 
 
 def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monkeypatch):
-    """v6.79.0 (owner Q26): a configured depth of 0 means NO delegation.
-
-    Before this, ``_bounded_positive_int_setting`` rewrote a configured 0 to the default 2,
-    so every run that asked for "no swarm" silently delegated two levels deep. All three
-    facts are pinned together: the resolved setting, the tool-side gate, and the supervisor
-    gate — plus the invariant that a ROOT task (depth 0 itself) still runs at depth 0."""
+    """A configured depth of zero disables child delegation, not the root task."""
     from supervisor import events as ev_module
     from ouroboros.config import get_max_subagent_depth
     from ouroboros.task_results import STATUS_FAILED
 
     monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "0")
+    _configure_test_subagent(monkeypatch)
     assert get_max_subagent_depth() == 0
 
-    # Tool-side gate: the first child of a root task is already too deep.
     import ouroboros.tools.control as control
     from ouroboros.tools.registry import ToolContext
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "root-no-swarm"
     ctx.task_depth = 0
-    out = control._schedule_task(ctx, objective="Delegate", expected_output="Something")
+    out = control._schedule_task(
+        ctx, subagent_id="api-scout", objective="Delegate", expected_output="Something")
     assert "depth limit (0) exceeded" in out
 
-    # Supervisor gate: a depth-1 child event is refused; a depth-0 ROOT task is NOT.
     monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
 

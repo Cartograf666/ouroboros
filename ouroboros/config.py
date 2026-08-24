@@ -15,15 +15,12 @@ import time
 from typing import Any, Optional, Sequence
 
 from ouroboros.context_mode_compat import (
-    normalize_and_persist_context_mode_compat,
-    normalize_context_mode,
-    owner_declared_low,
+    normalize_and_persist_context_mode_compat, normalize_context_mode, owner_declared_low,
 )
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire, pid_lock_release as _compat_pid_lock_release
-from ouroboros.provider_models import compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
+from ouroboros.provider_models import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEFAULTS, compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
 from ouroboros.secret_masking import strip_masked_secrets
 from ouroboros.update_channels import UPDATE_SETTINGS_DEFAULTS, normalize_update_channel
-
 
 # Paths
 HOME = pathlib.Path.home()
@@ -38,8 +35,7 @@ RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
 FINALIZATION_GRACE_DEFAULT_SEC = 120
-# Owner finalize-then-stop OUTER safety cap (S3, owner decisions 2026-08-15),
-# from the stop REQUEST; the grace budget above starts only at control DELIVERY
+# Owner finalization outer cap starts at the stop request; grace starts at control delivery
 # (the loop's mailbox drain). No summary by this cap -> honest custody cancel.
 OWNER_STOP_OUTER_CAP_SEC = 600
 # Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
@@ -92,25 +88,22 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_NETWORK_PASSWORD": "",
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
-    "OUROBOROS_MODEL": "x-ai/grok-4.5",
-    # Worker lanes. Empty means "use OUROBOROS_MODEL" (same shape as consciousness),
-    # so the owner sets ONE model by default and optionally overrides a lane. HEAVY is
-    # the strong acting/coding lane (mutative first-level subagents); LIGHT is the cheap
-    # bulk lane (auto / deep subagents); real cheap default since v6.82.0.
-    "OUROBOROS_MODEL_HEAVY": "",
-    "OUROBOROS_MODEL_LIGHT": "google/gemini-3.6-flash",
-    "OUROBOROS_MODEL_VISION": "",
+    "OUROBOROS_MODEL": OPENROUTER_DEFAULTS["main"],
+    # Worker lanes; empty means "use OUROBOROS_MODEL" (one model by default, per-lane
+    # override optional). HEAVY = mutative first-level subagents; LIGHT = auto/deep bulk.
+    "OUROBOROS_MODEL_HEAVY": OPENROUTER_DEFAULTS["heavy"],
+    "OUROBOROS_MODEL_LIGHT": OPENROUTER_DEFAULTS["light"],
+    "OUROBOROS_MODEL_VISION": OPENROUTER_DEFAULTS["vision"],
     "OUROBOROS_IMAGE_INPUT_MODE": "auto",
-    # Background consciousness is a high-horizon cognitive loop, not a cheap
-    # helper lane. Empty means "use OUROBOROS_MODEL".
-    "OUROBOROS_MODEL_CONSCIOUSNESS": "",
+    # Background consciousness is a high-horizon loop, not a cheap helper lane.
+    "OUROBOROS_MODEL_CONSCIOUSNESS": OPENROUTER_DEFAULTS["consciousness"],
     # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a
     # 1-element chain; empty disables cross-model fallback. Resilience slot — keeps a
     # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
-    "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.6-luna",
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai/gpt-5.6-sol-pro",
-    "CLAUDE_CODE_MODEL": "opus[1m]",
-    "OUROBOROS_MAX_WORKERS": 10,
+    "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENROUTER_DEFAULTS["deep_self_review"],
+    "CLAUDE_CODE_MODEL": OPENROUTER_REVIEW_DEFAULTS["advisory"],
+    "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
     "OUROBOROS_MAX_SUBAGENT_DEPTH": 2,
     # Mutative ("acting") subagents master toggle. Empty = follow runtime mode
@@ -127,13 +120,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Single owner-facing knob (math SSOT in ouroboros/retention.py); deprecated
     # per-subsystem keys are migrated to this on settings load.
     "OUROBOROS_GC_RETENTION_DAYS": 7,
-    "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC": 120,
-    "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC": 900,
-    # One-minor deprecated no-op: the v6.65 shared terminal-or-cutoff boundary
-    # no longer stops on heartbeat staleness, but custom saved values stay loud.
-    "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC": 120,
-    "TOTAL_BUDGET": 10.0,
-    "OUROBOROS_PER_TASK_COST_USD": 20.0,
+    "TOTAL_BUDGET": 200.0,
+    "OUROBOROS_PER_TASK_COST_USD": 50.0,
     # cloud.ru catalog prices are RUB per 1M while the budget is USD. No implicit
     # exchange rate: the owner must explicitly configure the divisor.
     "OUROBOROS_RUB_USD_RATE": "",
@@ -159,6 +147,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC": 8,
     # Skill lifecycle lane deadline (wedged-job loud-failure bound).
     "OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC": 1800,
+    "OUROBOROS_CLAUDEXOR_HARNESS_INSTALL_TIMEOUT_SEC": 300,
     "OUROBOROS_SOFT_TIMEOUT_SEC": 600,
     # NOTE: OUROBOROS_HARD_TIMEOUT_SEC no longer terminates tasks — the flat wall-clock
     # kill was replaced by the activity model below (idle + subtree-liveness, abs ceiling).
@@ -214,11 +203,13 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_GENERATIVE_PROBE": "1",
     "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
     # Pre-commit review: comma-separated provider-tagged model list
-    "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.6-luna,google/gemini-3.6-flash,anthropic/claude-sonnet-5",
+    "OUROBOROS_REVIEW_MODELS": ",".join(OPENROUTER_REVIEW_DEFAULTS["triad"]),
     "OUROBOROS_REVIEWER_SLOTS": "",  # structured slot SSOT (reviewer_slot_config.py); "" = legacy comma keys
+    "OUROBOROS_SUBAGENTS": "",  # configured task-actor SSOT; "" = bounded legacy/undecided read
     # INSTALL-TIME facts: the agent-preset generation this install received, and WHEN onboarding last completed
     # (recorded on EVERY completion). Endpoint-authored and disk-only — see ENDPOINT_AUTHORED_SETTINGS.
     "OUROBOROS_SUBSCRIPTION_PRESET_VERSION": "",
+    "OUROBOROS_SUBAGENT_PRESET_RECEIPT": "",
     "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
@@ -253,8 +244,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "MCP_SERVERS": [],
     "MCP_TOOL_TIMEOUT_SEC": 60,
     # Scope review: one or more reviewer slots; enforcement follows OUROBOROS_REVIEW_ENFORCEMENT.
-    "OUROBOROS_SCOPE_REVIEW_MODELS": "openai/gpt-5.6-terra",
-    "OUROBOROS_SCOPE_REVIEW_MODEL": "openai/gpt-5.6-terra",
+    "OUROBOROS_SCOPE_REVIEW_MODELS": ",".join(OPENROUTER_REVIEW_DEFAULTS["scope"]),
+    "OUROBOROS_SCOPE_REVIEW_MODEL": OPENROUTER_REVIEW_DEFAULTS["scope"][0],
     # DEPRECATED, enforcement-inert (v6.80.0): stored, owner-only (dedicated audited endpoint), but
     # NOTHING consults it — whether the BIBLE P3 blocking scope review applies follows owner-only
     # OUROBOROS_CONTEXT_MODE. Degraded opt-in key: removed.
@@ -298,10 +289,10 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC": 300,
     # Acceptance-review budget layer (task_pacing SSOT). The first final review
     # reserves at least 200s; later passes use max(this floor, 1.5×timing EWMA).
-    # max passes remains the legacy default outside Required+Blocking; an explicit
-    # task-local cap is always authoritative.
     "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC": 200,
-    "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES": 1,
+    # Shared paid-review-cycle cap (SSOT + per-gate meaning: ouroboros/review_cycles.py):
+    # STRING "N"|"unlimited": plan review, acceptance (passes = cycles - 1), commit gate and skill review (paid cycles per root task / manual snapshot); identical material is never re-reviewed for pay on any gate.
+    "OUROBOROS_REVIEW_MAX_CYCLES": "2",
     "OUROBOROS_ACCEPTANCE_RESERVE_PCT": 5,
     # Prompt-cache TTL, one honest GLOBAL override (owner decision 2026-08-08, batch #2 Q2=A): applied to
     # EVERY cache_control breakpoint on the Anthropic-normalizing family — main loop, review lanes, safety
@@ -339,12 +330,14 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_FALLBACK_COOLDOWN_ENABLED": True,
     "OUROBOROS_FALLBACK_COOLDOWN_SEC": 120,
     "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL": 1,
-    # Delegated subagents. NARROW key, read ONLY by the subagent scheduler; deliberately
-    # absent from provider_models.MODEL_SETTING_KEYS (see ARCHITECTURE "Delegated
-    # subagents"). Empty = delegation off AND undecided (Settings' Subagents section
-    # offers the connected-subscription default); the literal `off` = delegation off
-    # because the owner said so. Wait keys bound the nanny's QUIET wait only.
+    # Delegated subagents. NARROW key, read ONLY by the subagent scheduler; deliberately absent from
+    # provider_models.MODEL_SETTING_KEYS (see ARCHITECTURE "Delegated subagents"). Empty = delegation off AND
+    # undecided (Settings' Subagents section offers the connected-subscription default); the literal `off` =
+    # delegation off because the owner said so. Wait keys bound the nanny's QUIET wait only.
     "OUROBOROS_SUBAGENT_HARNESS": "",
+    # Optional Delegation account pin (D-U5): a credential-profile id sent as `credentialProfileId`; empty = engine
+    # rotation pool (D28; presets never author it). Read ONLY by get_subagent_harness -> DelegationRoute.profile_id.
+    "OUROBOROS_SUBAGENT_PROFILE": "",
     "OUROBOROS_DELEGATE_WAIT_SEC": 120,
     "OUROBOROS_DELEGATE_WAIT_MAX_SEC": 1800,
 }
@@ -352,14 +345,12 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
 # Claudexor control-plane contract, checked at handshake so an old daemon is a typed
 # lane refusal rather than a mid-run schema surprise.
 CLAUDEXOR_PROTOCOL_MAJOR: int = 3
-# The TRANSPORT floor: the lowest engine that serves the READ-ONLY lane, which sends no
-# `execution` block at all. 3.2.0 schema-accepts every field that lane does send (verified
-# live: the body comes back with only the fake-root error, never a field error), and a
-# read-only run is already scoped by Claudexor's ordinary envelope. Keeping the floor AT the
-# oldest serving engine is the owner's explicit decision — it lets an older daemon keep
-# read-only delegation instead of losing the lane; a floor set to the newest daemon anyone
-# happens to run is not conservative, it is an outage (3.2.1 here refused the operator's own
-# 3.2.0 engine and took read-only delegation down with it).
+# The TRANSPORT floor: the lowest engine that serves the READ-ONLY lane, which sends no `execution` block at all.
+# 3.2.0 schema-accepts every field that lane does send (verified live: the body comes back with only the fake-root
+# error, never a field error), and a read-only run is already scoped by Claudexor's ordinary envelope. Keeping the
+# floor AT the oldest serving engine is the owner's explicit decision — it lets an older daemon keep read-only
+# delegation instead of losing the lane; a floor set to the newest daemon anyone happens to run is not conservative,
+# it is an outage (3.2.1 here refused the operator's own 3.2.0 engine and took read-only delegation down with it).
 CLAUDEXOR_MIN_VERSION: str = "3.2.0"
 # The MARKER floor: the oldest engine whose SCHEMA ACCEPTS `execution.delegated`, which is
 # the only delegated-lane question a version can answer honestly. Measured: `RunExecution`
@@ -471,8 +462,8 @@ def get_consciousness_model() -> str:
     return str(os.environ.get("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
 
 # v6.57.0 — EFFORT_SCALE: ORDERED reasoning-effort SSOT (low→high), the single place a tier
-# is defined (settings, llm.py builder, switch_model enum, subagent lanes). xhigh/max extend
-# none..high; llm.py clamps a request DOWN to each model's learned ceiling (BIBLE P1: disclosed).
+# is defined (settings, llm.py builder, switch_model enum, subagent lanes). Exact-route
+# request-wire recovery, not legacy model-global evidence, owns provider adaptation.
 EFFORT_SCALE: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
@@ -735,14 +726,6 @@ def get_per_call_timeout_ceiling_sec() -> int:
     return _clamped_number_setting("OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", low=1, cast=int)
 
 
-def get_plan_task_swarm_timeout_sec() -> float:
-    return _clamped_number_setting("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", low=0.0)
-
-
-def get_plan_task_swarm_max_wait_sec() -> float:
-    return _clamped_number_setting("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", low=0.0)
-
-
 def get_restart_drain_max_sec() -> int:
     return _clamped_number_setting(
         "OUROBOROS_RESTART_DRAIN_MAX_SEC", low=0, cast=lambda v: int(float(v)))
@@ -860,22 +843,6 @@ def get_allow_mutative_subagents(write_surface: str = "") -> bool:
     return not surface or surface in {"external_workspace", "genesis"}
 
 
-def get_subagent_worktree_root() -> str:
-    """Filesystem root for acting self_worktree checkouts (outside repo/ and data/)."""
-    raw = str(
-        os.environ.get("OUROBOROS_SUBAGENT_WORKTREE_ROOT", "")
-        or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_WORKTREE_ROOT", "")
-    ).strip()
-    return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "subagent_worktrees"))
-
-
-# delegate_wait's ToolEntry per-call timeout (above it a configured ceiling buys a
-# KILLED call, not a longer wait; pinned by test) and the hard max WINDOW per call
-# (F5): 1800 < 2100 (kill) < 2400 (lease) — decoupled, a raised timeout never widens it.
-DELEGATE_WAIT_CEILING_SEC = 2100
-DELEGATE_WAIT_WINDOW_MAX_SEC = 1800
-
-
 def get_delegate_wait_max_sec() -> int:
     """delegate_wait window ceiling: the setting NARROWS, never widens past 1800."""
     return _clamped_number_setting(
@@ -899,18 +866,6 @@ def get_subagent_projects_root() -> str:
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_PROJECTS_ROOT", "")
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "projects"))
-
-
-def get_search_code_wall_sec() -> float:
-    """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
-    directory walk and the batched rg loop so a scan over a very large root cannot run
-    unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
-    raw = (os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "")
-           or str(SETTINGS_DEFAULTS.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45")))
-    try:
-        return max(5.0, float(raw))
-    except (TypeError, ValueError):
-        return 45.0
 
 
 def get_deliverables_root() -> str:
@@ -1029,33 +984,10 @@ def get_llm_transport_read_timeout_sec() -> float:
     return _clamped_number_setting("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", low=60.0, high=7200.0)
 
 
-def get_local_request_timeout_sec() -> float:
-    """Per-request timeout for the local llama.cpp chat lane.
-
-    The local server is the slowest route the loop can take and the one most likely
-    to spend minutes on prefill before the first token, so it needs a MORE generous
-    deadline than the remote transport bound, not a stricter one."""
-    return _clamped_number_setting("OUROBOROS_LOCAL_REQUEST_TIMEOUT_SEC", low=60.0, high=7200.0)
-
-
-def get_progress_ticker_sec() -> float:
-    """Silence window before the heartbeat thread emits a task's current phase.
-
-    Returns 0.0 when the ticker is disabled. Not clamped to a floor above zero:
-    the disable value has to survive, and the heartbeat tick interval already
-    bounds how often this can actually fire."""
-    value = _clamped_number_setting("OUROBOROS_PROGRESS_TICKER_SEC", low=0.0, high=3600.0)
-    return 0.0 if value <= 0 else max(value, 15.0)
-
 
 def get_acceptance_review_est_sec() -> float:
     """Estimated duration of one acceptance review/improvement pass (v6.54.4)."""
     return _clamped_number_setting("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", low=10.0, high=3600.0)
-
-
-def get_acceptance_max_improvement_passes() -> int:
-    """Default COUNT cap for acceptance-review improvement passes (v6.54.4)."""
-    return _clamped_number_setting("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", low=0, high=20, cast=int)
 
 
 def get_acceptance_reserve_pct() -> int:
@@ -1076,9 +1008,7 @@ def get_context_mode() -> str:
     No boot-pin: hot-applies on the next task. The key is dropped from the
     agent-reachable /api/settings POST (P1)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
-    return normalize_context_mode(
-        os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val
-    )
+    return normalize_context_mode(os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val)
 
 
 def get_owner_context_mode() -> str:
@@ -1117,7 +1047,7 @@ _DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUT
 # ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above
 # are disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env
 # timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
-ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
+ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
 
 
 def _guard_context_mode_lowering(settings: dict, *, allow_context_lowering: bool = False) -> None:
@@ -1362,7 +1292,25 @@ def _coerce_setting_value(key: str, value):
 RETIRED_SETTING_KEYS: tuple[str, ...] = (
     # v6.87.7: the depth cap conflated how DEEP delegation nests with how STRONG a descendant is.
     "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT",
+    # knobs are retired (the review-cycle cap OUROBOROS_REVIEW_MAX_CYCLES bounds plan review).
+    "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES",
+    "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
+    "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC",
+    "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
 )
+
+
+def _seed_review_cycles_from_legacy_passes(loaded: dict) -> None:
+    """Migrate the retired acceptance-pass key into ``OUROBOROS_REVIEW_MAX_CYCLES`` (cycles =
+    passes + 1) at LOAD: a runtime "is it customized?" test cannot tell a deliberate "2" from
+    an untouched default, and left acceptance on the legacy number."""
+    legacy = loaded.pop("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", None)
+    try:
+        passes = int(str(legacy).strip()) if legacy is not None else 1
+    except (TypeError, ValueError):
+        return
+    if passes != 1 and "OUROBOROS_REVIEW_MAX_CYCLES" not in loaded:  # 1 = shipped legacy default
+        loaded["OUROBOROS_REVIEW_MAX_CYCLES"] = str(max(0, passes) + 1)
 
 
 def load_settings() -> dict:
@@ -1409,6 +1357,9 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
             loaded["OUROBOROS_GC_RETENTION_DAYS"] = seed
     for _legacy in LEGACY_RETENTION_KEYS:
         loaded.pop(_legacy, None)
+    # Rename alias: a customized acceptance-pass count seeds the shared review-cycle knob
+    # (cycles = passes + 1) unless the owner authored one, then the legacy key is dropped.
+    _seed_review_cycles_from_legacy_passes(loaded)
     for _retired in RETIRED_SETTING_KEYS:
         loaded.pop(_retired, None)
     migrate_legacy_slot_keys(loaded)
@@ -1494,9 +1445,10 @@ def save_settings(
                 f"{baseline_mode!r} -> {new_mode!r}.{hint}"
             )
         try:
+            from ouroboros.utils import replace_atomic
             tmp = SETTINGS_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-            os.replace(str(tmp), str(SETTINGS_PATH))
+            replace_atomic(str(tmp), str(SETTINGS_PATH))
         except OSError:
             SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     finally:
@@ -1525,6 +1477,8 @@ def get_mcp_tool_timeout_sec() -> int:
 
 def get_vision_caption_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", low=1, cast=int)
+def get_claudexor_harness_install_timeout_sec() -> int:
+    return _clamped_number_setting("OUROBOROS_CLAUDEXOR_HARNESS_INSTALL_TIMEOUT_SEC", low=1, cast=int)
 
 
 def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
@@ -1555,6 +1509,13 @@ def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
     return max(0, parsed)
 
 
+
+# delegate_wait's ToolEntry per-call timeout (above it a configured ceiling buys a
+# KILLED call, not a longer wait; pinned by test) and the hard max WINDOW per call
+# (F5): 1800 < 2100 (kill) < 2400 (lease) — decoupled, a raised timeout never widens it.
+DELEGATE_WAIT_CEILING_SEC = 2100
+DELEGATE_WAIT_WINDOW_MAX_SEC = 1800
+
 def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int:
     """Supervisor-loop stall deadline in seconds (0 disables the watchdog)."""
     raw = os.environ.get("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
@@ -1565,7 +1526,6 @@ def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int
     except (TypeError, ValueError):
         parsed = int(SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC)
     return max(0, parsed)
-
 
 # Settings keys deliberately NOT projected into the environment. Everything else in SETTINGS_DEFAULTS IS
 # exported, by derivation rather than a parallel hand-kept list: such a list drifts silently and the failure

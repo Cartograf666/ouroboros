@@ -591,20 +591,28 @@ def test_suppressed_message_promote_is_designed_absence(tmp_path, monkeypatch):
     assert project_binding_for_task(tmp_path, "sup-1")["origin_absent"] == "mid_task_no_origin"
 
 
-def test_mid_archive_cursor_is_ignored_by_context_signature_guard(tmp_path):
-    """Scope r2 advisory: while the consolidation cursor rests INSIDE an archived
-    generation, the context reader's signature guard must ignore the offset
-    (fail-safe to raw tail) instead of clipping the live dialogue."""
+def test_context_reader_follows_mid_archive_consolidation_cursor(tmp_path):
+    """Context and consolidation share one generation-chain cursor owner."""
     from ouroboros.consolidator import _chat_log_signature
-    from ouroboros.context import _chat_log_signature_matches
+    from ouroboros.memory import Memory
 
-    archive = tmp_path / "archived_gen.jsonl"
+    logs = tmp_path / "logs"
+    archive_dir = tmp_path / "archive"
+    logs.mkdir()
+    archive_dir.mkdir()
+    archive = archive_dir / "chat_20260820T010000.jsonl"
     archive.write_text(_entries(0, 5, "old"), encoding="utf-8")
-    live = tmp_path / "chat.jsonl"
+    live = logs / "chat.jsonl"
     live.write_text(_entries(100, 5, "new"), encoding="utf-8")
-    assert _chat_log_signature_matches(
-        _chat_log_signature(archive), _chat_log_signature(live),
-    ) is False
+    entries, coverage = Memory(tmp_path).read_unconsolidated_chat({
+        "last_consolidated_offset": 3,
+        "chat_log_signature": _chat_log_signature(archive),
+    }, 100)
+
+    assert [row["text"] for row in entries] == [
+        "old 3", "old 4", "new 100", "new 101", "new 102", "new 103", "new 104",
+    ]
+    assert coverage["gaps"] == []
 
 
 # ---------------------------------------------------------------- consolidator

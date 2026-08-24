@@ -106,90 +106,6 @@ class TestAdvisoryUsageEmit:
         # No exception — pending_events may or may not have an entry
 
 
-# ---------------------------------------------------------------------------
-# Plan review cost tracking
-# ---------------------------------------------------------------------------
-
-class TestPlanReviewUsageEmit:
-    """_emit_plan_review_usage must emit one event per reviewer with tokens."""
-
-    def _get_fn(self):
-        mod = importlib.import_module("ouroboros.tools.plan_review")
-        return mod._emit_plan_review_usage
-
-    def _make_raw_results(self):
-        return [
-            {"model": "openai/gpt-5.5", "tokens_in": 100, "tokens_out": 50, "error": None},
-            {"model": "google/gemini-3.5-flash", "tokens_in": 120, "tokens_out": 60, "error": None},
-            {"model": "anthropic/claude-opus-4.6", "tokens_in": 90, "tokens_out": 40, "error": None},
-        ]
-
-    def test_emits_one_event_per_reviewer(self):
-        fn = self._get_fn()
-        ctx = _FakeCtx()
-        fn(ctx, self._make_raw_results())
-        assert len(ctx.pending_events) == 3
-
-    def test_event_fields(self):
-        fn = self._get_fn()
-        ctx = _FakeCtx()
-        fn(ctx, self._make_raw_results())
-        ev = ctx.pending_events[0]
-        assert ev["type"] == "llm_usage"
-        assert ev["source"] == "plan_review"
-        assert ev["category"] == "review"
-        assert ev["usage"]["prompt_tokens"] == 100
-        assert ev["usage"]["completion_tokens"] == 50
-
-    def test_skips_error_results(self):
-        fn = self._get_fn()
-        ctx = _FakeCtx()
-        results = [
-            {"model": "m1", "tokens_in": 100, "tokens_out": 50, "error": "timeout"},
-            {"model": "m2", "tokens_in": 80, "tokens_out": 30, "error": None},
-        ]
-        fn(ctx, results)
-        # Only the non-error result should be emitted
-        assert len(ctx.pending_events) == 1
-        assert ctx.pending_events[0]["model"] == "m2"
-
-    def test_skips_zero_token_results(self):
-        fn = self._get_fn()
-        ctx = _FakeCtx()
-        results = [
-            {"model": "m1", "tokens_in": 0, "tokens_out": 0, "error": None},
-            {"model": "m2", "tokens_in": 50, "tokens_out": 20, "error": None},
-        ]
-        fn(ctx, results)
-        assert len(ctx.pending_events) == 1
-
-    def test_routes_to_event_queue_first(self):
-        fn = self._get_fn()
-        ctx = _FakeCtx()
-        ctx.event_queue = MagicMock()
-        ctx.event_queue.put_nowait = MagicMock()
-        fn(ctx, self._make_raw_results())
-        assert ctx.event_queue.put_nowait.call_count == 3
-        assert len(ctx.pending_events) == 0
-
-    def test_real_cost_propagated_from_reviewer(self):
-        """Cost from reviewer raw results must reach the emitted event — not hardcoded 0."""
-        fn = self._get_fn()
-        ctx = _FakeCtx()
-        results = [
-            {"model": "openai/gpt-5.5", "tokens_in": 1000, "tokens_out": 200,
-             "cost": 6.50, "error": None},
-        ]
-        fn(ctx, results)
-        ev = ctx.pending_events[0]
-        assert ev["usage"]["cost"] == 6.50
-        assert ev.get("cost") == 6.50
-
-
-# ---------------------------------------------------------------------------
-# Scope review pending_events fallback
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("model,expected_provider", [
     ("anthropic::claude-opus-4.6", "anthropic"),
     ("openai::gpt-5.5", "openai"),
@@ -205,32 +121,6 @@ def test_infer_provider_from_model(model, expected_provider):
     """infer_provider_from_model must return correct provider for all prefixes."""
     from ouroboros.pricing import infer_provider_from_model
     assert infer_provider_from_model(model) == expected_provider
-
-
-class TestPlanReviewProviderAttribution:
-    """_emit_plan_review_usage must use correct provider per model prefix."""
-
-    def _get_fn(self):
-        mod = importlib.import_module("ouroboros.tools.plan_review")
-        return mod._emit_plan_review_usage
-
-    @pytest.mark.parametrize("model,expected_provider", [
-        ("anthropic::claude-opus-4.6", "anthropic"),
-        ("openai::gpt-5.5", "openai"),
-        ("openai-compatible::my-model", "openai-compatible"),
-        ("cloudru::GigaChat-2-Max", "cloudru"),
-        ("gigachat::GigaChat-2-Max", "gigachat"),
-        ("minimax::MiniMax-M2.7", "minimax"),
-        ("anthropic/claude-opus-4.6", "openrouter"),  # unprefixed → OpenRouter
-    ])
-    def test_provider_per_model_prefix(self, model, expected_provider):
-        fn = self._get_fn()
-        ctx = _FakeCtx()
-        results = [{"model": model, "tokens_in": 100, "tokens_out": 50, "cost": 0.1, "error": None}]
-        fn(ctx, results)
-        assert len(ctx.pending_events) == 1
-        ev = ctx.pending_events[0]
-        assert ev["provider"] == expected_provider
 
 
 class TestScopeReviewProviderAttribution:

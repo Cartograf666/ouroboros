@@ -164,6 +164,7 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws } = {}) {
             const data = await apiClient.updateApply(strat, plan).catch((e) => ({
                 error: String((e && e.message) || e),
                 restart_required: Boolean(e?.body?.restart_required),
+                stash_note: e?.body?.stash_note || '',
             }));
             if (data && data.status === 'ok' && data.restarting) {
                 statusEl.textContent = 'Update applied; smoke-test passed; restarting…';
@@ -175,6 +176,9 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws } = {}) {
                 statusEl.textContent = `Did not complete: ${data.error}. Runtime shutdown was incomplete; restart Ouroboros before retrying.`;
             } else {
                 statusEl.textContent = (data && data.error) ? `Did not complete: ${data.error}` : 'Update did not complete.';
+            }
+            if (data && data.stash_note) {
+                statusEl.textContent += ` (${data.stash_note})`;
             }
         });
     }

@@ -2904,12 +2904,10 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
                 # owner-attested skill -> distinct 'owner-attested' badge (review_profile surfaced).
                 page.wait_for_selector('.skills-card[data-skill="attestedtool"]', timeout=30_000)
                 att_card = page.locator('.skills-card[data-skill="attestedtool"]').first
-                assert att_card.locator(".skills-badge").filter(
-                    has_text="owner-attested").count() >= 1
-                # submitHubReady guard: an owner-attested skill must NOT offer an enabled
-                # publish (the hub refuses to publish owner-attested skills). Render the card
-                # WITH a github token configured (in-page module import — node exec is blocked)
-                # and assert Submit-to-OuroborosHub is disabled for the owner-attested reason.
+                assert att_card.locator(".skills-badge").filter(has_text="owner-attested").count() >= 1
+                # The backend is the sole publication classifier. Owner-attested review is
+                # not publication-ready, but the selected flow may start an ordinary task
+                # that repairs/reviews the bytes before opening a PR.
                 submit_html = page.evaluate(
                     """async () => {
                         const m = await import('/static/modules/skill_card_renderer.js');
@@ -2918,11 +2916,16 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
                               is_self_authored: true, review_status: 'clean',
                               review_gate: { executable_review: true }, review_stale: false,
                               review_profile: 'owner_attested', grants: {}, permissions: [],
-                              payload_root: 'skills/external/att', enabled: true },
+                              payload_root: 'skills/external/att', enabled: true,
+                              submit_hub: { visible: true, publication_ready: false,
+                                task_start_allowed: true, state: 'needs_attention',
+                                reason: 'Owner-attested review needs attention' } },
                             new Set(), new Set(), {}, { githubTokenConfigured: true });
                     }"""
                 )
-                assert 'data-submit-disabled="true"' in submit_html
+                assert 'data-submit-disabled="false"' in submit_html
+                assert 'data-publication-ready="false"' in submit_html
+                assert 'data-submit-state="needs_attention"' in submit_html
                 assert "owner-attested" in submit_html.lower()
                 # Defense-in-depth (mirrors the backend source gate): a marketplace skill
                 # mislabeled self-authored must STILL NOT offer Skip review.
@@ -3146,6 +3149,7 @@ def test_ui_owner_context_mode_and_scope_review_ack(direct_server_with_data):
                 page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                 toggle = page.locator("#chat-context-mode")
                 toggle.wait_for(state="visible", timeout=60_000)
+                page.wait_for_function("() => document.querySelector('#chat-context-mode')?.dataset.contextMode === 'low'", timeout=30_000)
                 assert toggle.get_attribute("data-context-mode") == "low"
                 page.screenshot(path=str(evidence_dir / "context-mode-low-before.png"))
 
@@ -3603,7 +3607,7 @@ def test_ui_smoke_window_pagehide_detaches_login_without_lifecycle_http(direct_s
                             addEventListener: (_t, fn) => { connect = fn; }};
                         const host = {innerHTML: '', querySelector: () => null};
                         const list = {innerHTML: '', querySelectorAll: () => [button]};
-                        const other = {textContent: '', hidden: false, dataset: {}};
+                        const other = document.createElement('div');
                         const doc = {defaultView: window, getElementById: (id) =>
                             id === 'agents-login-host' ? host
                                 : id === 'agents-family-list' ? list : other};
@@ -3817,3 +3821,7 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))
         raise
+
+
+# The in-flight indicator lifecycle smoke test lives in
+# tests/test_ui_smoke_inflight_indicator.py (size-ratchet byte gate on this module).

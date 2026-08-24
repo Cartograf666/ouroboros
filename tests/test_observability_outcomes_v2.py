@@ -34,6 +34,8 @@ def _read_gzip_json(path):
 
 
 def test_redactor_records_key_and_value_rules_without_secret_leak():
+    query_secret = "query-secret-value-123456"
+    basic_secret = "dXNlcjpiYXNpYy1zZWNyZXQtdmFsdWU="
     payload = {
         "OPENAI_API_KEY": "sk-testsecretvalue000000000000",
         "log": "MY_API_KEY=thisisaverylongsecretvalue123456 github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
@@ -60,6 +62,10 @@ def test_redactor_records_key_and_value_rules_without_secret_leak():
             "bearer_token": "verylongbearertokenvalueabcdef",
             "anthropic_secret": "sk-ant-verylongsecretvalue123456",
             "url": "https://user:pass@example.com/path",
+            "request": (
+                f"GET https://example.com/path?api_key={query_secret}&model=test "
+                f"Authorization: Basic {basic_secret}"
+            ),
         },
     }
 
@@ -80,6 +86,8 @@ def test_redactor_records_key_and_value_rules_without_secret_leak():
     assert "stripescretvalue" not in rendered
     assert "verylongsecretvalue" not in rendered
     assert "user:pass" not in rendered
+    assert query_secret not in rendered
+    assert basic_secret not in rendered
     assert redacted.value["prompt_tokens"] == 123
     assert redacted.value["completion_tokens"] == 45
     assert redacted.value["cached_tokens"] == 6
@@ -90,9 +98,12 @@ def test_redactor_records_key_and_value_rules_without_secret_leak():
     assert redacted.value["path"] == "/workspace/reports/summary-long-name.json"
     assert redacted.value["service"] == "background-analysis-service"
     assert redacted.value["public_url"] == "https://example.com/public/long-resource-name"
+    assert "model=test" in redacted.value["nested"]["request"]
     assert redacted.manifest()["redacted"] is True
     rules = {item["rule"] for item in redacted.manifest()["rules"]}
-    assert {"secret_key_name", "url_credentials"} <= rules
+    assert {
+        "basic_auth", "secret_key_name", "secret_query_parameter", "url_credentials",
+    } <= rules
 
 
 def test_redactor_masks_compound_secret_names_without_generic_key_false_positives():

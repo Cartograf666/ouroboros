@@ -71,7 +71,7 @@ def _conflict_repo(tmp_path, monkeypatch):
 def test_materialize_sets_merge_head_and_markers(tmp_path, monkeypatch):
     repo, head, plan = _conflict_repo(tmp_path, monkeypatch)
     assert plan["kind"] == "conflicting", plan
-    ok, msg = update_merge.materialize_assisted_merge_live(
+    ok, msg, _m0 = update_merge.materialize_assisted_merge_live(
         head, plan["local_snapshot"], plan["target_sha"], plan["base_sha"]
     )
     assert ok, msg
@@ -102,6 +102,412 @@ def test_marker_gate_accepts_staged_deletion_and_binary_blob(tmp_path, monkeypat
     ok, message = update_merge.managed_assisted_marker_check()
 
     assert ok, message
+
+
+def test_materialize_projects_version_to_target_and_pins_m0(tmp_path, monkeypatch):
+    """P9 projection (Q8): a conflicted VERSION file — a pure version token — is
+    mechanically resolved to the official target's side BEFORE the resolver sees
+    the tree, and the pinned M0 baseline already includes that projection (the
+    resolution delta must show only the resolver's own work)."""
+    repo, head = _init_repo(tmp_path)
+    (repo / "VERSION").write_text("1.0.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "version base")
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "VERSION").write_text("2.0.0\n")
+    (repo / "official.txt").write_text("official\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "official release")
+    _git(repo, "checkout", "-q", head)
+    (repo / "VERSION").write_text("1.5.0\n")
+    (repo / "local.txt").write_text("local\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "local fork release")
+    _point_at(monkeypatch, tmp_path, repo, head)
+    plan = update_merge.plan_managed_update_merge(fetch=False)
+    assert plan["kind"] == "conflicting", plan
+    assert "VERSION" in (plan["doc_conflict_paths"] + plan["code_conflict_paths"])
+
+    ok, msg, m0 = update_merge.materialize_assisted_merge_live(
+        head, plan["base_sha"], plan["target_sha"], plan["base_sha"]
+    )
+
+    assert ok, msg
+    assert "VERSION projected to the target's version" in msg
+    assert update_merge.live_unmerged_paths() == []  # VERSION was the only conflict
+    assert _git(repo, "show", ":VERSION").stdout == "2.0.0\n"  # staged = target's token
+    assert (repo / "VERSION").read_text() == "2.0.0\n"  # worktree matches
+    assert _git(repo, "show", f"{m0}:VERSION").stdout == "2.0.0\n"  # M0 includes projection
+
+
+def test_materialize_is_immune_to_a_poisoned_rerere_cache(tmp_path, monkeypatch):
+    """The mechanical merge must not replay remembered resolutions: with
+    rerere.enabled=true and a poisoned rr-cache (a prior merge of the SAME
+    conflict resolved to garbage), materialization still yields conflict
+    markers as content — the M0 baseline never inherits rerere state."""
+    repo, head, plan = _conflict_repo(tmp_path, monkeypatch)
+    _git(repo, "config", "rerere.enabled", "true")
+    # Poison the rr-cache: resolve this exact conflict once WITH rerere on.
+    _git(repo, "-c", "rerere.enabled=true", "merge", "--no-commit", "--no-ff", plan["target_sha"])
+    (repo / "a.txt").write_text("poisoned resolution\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "rerere.enabled=true", "rerere")  # record the resolution
+    _git(repo, "merge", "--abort")
+    (repo / "a.txt").write_text("local change\n")  # restore the dirty local edit
+
+    ok, msg, _m0 = update_merge.materialize_assisted_merge_live(
+        head, plan["local_snapshot"], plan["target_sha"], plan["base_sha"]
+    )
+
+    assert ok, msg
+    content = (repo / "a.txt").read_text()
+    assert "<<<<<<<" in content and ">>>>>>>" in content, (
+        "rerere replayed a remembered resolution into the mechanical merge"
+    )
+    assert "poisoned resolution" not in content
+
+
+def test_materialize_token_syncs_clean_carriers_and_leaves_conflicted_ones(tmp_path, monkeypatch):
+    """Q8/Q24 carrier projection: a NON-conflicted carrier whose merged token
+    drifted from the projected VERSION is token-synced and staged; a conflicted
+    carrier keeps its markers for the resolver."""
+    repo, head = _init_repo(tmp_path)
+    (repo / "VERSION").write_text("1.0.0\n")
+    (repo / "web").mkdir()
+    (repo / "web" / "package.json").write_text('{\n  "version": "1.0.0"\n}\n')
+    (repo / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1.0.0"\ndescription = "base"\n')
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "carrier base")
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "VERSION").write_text("2.0.0\n")
+    (repo / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "2.0.0"\ndescription = "official side"\n')
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "official bumps VERSION and pyproject")
+    _git(repo, "checkout", "-q", head)
+    (repo / "web" / "package.json").write_text('{\n  "version": "1.0.1"\n}\n')
+    (repo / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1.0.1"\ndescription = "fork side"\n')
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "fork bumps package.json and pyproject")
+    _point_at(monkeypatch, tmp_path, repo, head)
+    plan = update_merge.plan_managed_update_merge(fetch=False)
+
+    ok, msg, m0 = update_merge.materialize_assisted_merge_live(
+        head, plan["base_sha"], plan["target_sha"], plan["base_sha"]
+    )
+
+    assert ok, msg
+    assert "carrier file(s) token-synced" in msg
+    assert '"version": "2.0.0"' in _git(repo, "show", ":web/package.json").stdout
+    assert '"version": "2.0.0"' in _git(repo, "show", f"{m0}:web/package.json").stdout
+    # The CONFLICTED carrier is never auto-resolved: it keeps its unmerged
+    # stages and its markers for the resolver (the delta's key safety filter).
+    assert "pyproject.toml" in _git(repo, "ls-files", "-u").stdout
+    assert _git(repo, "rev-parse", ":pyproject.toml").returncode != 0
+    assert "<<<<<<<" in (repo / "pyproject.toml").read_text()
+
+
+def test_destructive_apply_guard_catches_late_mutations(tmp_path, monkeypatch):
+    """The guard re-verifies the EXACT planned state immediately before the
+    first destructive command: late edits, late commits, a moved branch, and a
+    live merge all refuse; the pristine state passes."""
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    assert update_merge.destructive_apply_guard(head, pre) == ""
+    (repo / "late.txt").write_text("late edit\n")
+    assert "local changes" in update_merge.destructive_apply_guard(head, pre)
+    (repo / "late.txt").unlink()
+    assert update_merge.destructive_apply_guard(head, pre) == ""
+    (repo / "a.txt").write_text("late committed\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "late commit")
+    assert "HEAD moved" in update_merge.destructive_apply_guard(head, pre)
+
+
+def test_clean_diverged_build_projects_version_to_target(tmp_path, monkeypatch):
+    """Q8 on the CLEAN lane, end-to-end through plan(build=True): a fork-only
+    VERSION bump that merges cleanly must still land under the official
+    target's version blob inside the built merge commit."""
+    repo, head = _init_repo(tmp_path)
+    (repo / "VERSION").write_text("1.0.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "version base")
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "official.txt").write_text("official\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "official touches another file")
+    _git(repo, "checkout", "-q", head)
+    (repo / "VERSION").write_text("1.5.0\n")  # fork-only bump, merges clean
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "fork bump")
+    _point_at(monkeypatch, tmp_path, repo, head)
+
+    plan = update_merge.plan_managed_update_merge(fetch=False, build=True)
+
+    assert plan["kind"] == "clean", plan
+    merge_commit = plan["merge_commit"]
+    assert merge_commit
+    target_version = _git(repo, "show", f"{plan['target_sha']}:VERSION").stdout
+    assert _git(repo, "show", f"{merge_commit}:VERSION").stdout == target_version
+
+
+def test_failed_projection_aborts_materialization(tmp_path, monkeypatch):
+    """A projection that cannot complete must abort materialization (typed
+    failure) — never freeze a half-projected tree as the M0 baseline."""
+    import ouroboros.tools.release_sync as release_sync
+
+    repo, head = _init_repo(tmp_path)
+    (repo / "VERSION").write_text("1.0.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "version base")
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "VERSION").write_text("2.0.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "official bump")
+    _git(repo, "checkout", "-q", head)
+    (repo / "local.txt").write_text("fork work\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "fork work")
+    _point_at(monkeypatch, tmp_path, repo, head)
+    plan = update_merge.plan_managed_update_merge(fetch=False)
+    monkeypatch.setattr(
+        release_sync, "sync_release_metadata",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("sync exploded")),
+    )
+
+    ok, msg, m0 = update_merge.materialize_assisted_merge_live(
+        head, plan["base_sha"], plan["target_sha"], plan["base_sha"]
+    )
+
+    assert not ok
+    assert "carrier projection failed" in msg
+    assert m0 == ""
+
+
+def test_cleanup_only_gate_block_retries_the_marker_and_never_rolls_back(tmp_path, monkeypatch):
+    """A failed marker unlink after a HEALTHY outcome must not become a boot
+    rollback: the cleanup-only gate_blocked branch retries ONLY the cleanup."""
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "landed.txt").write_text("healthy update result\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "healthy landed state")
+    landed = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    update_merge.write_update_tx({
+        "phase": update_merge.MARKER_CLEANUP_RETRY_PHASE,
+        "gate_blocked_reason": "finalize_marker_cleanup_failed",
+        "pre_update_sha": pre, "pre_update_branch": head,
+    })
+    _stub_worker_gates(monkeypatch)
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result.get("finalized") is True, result
+    assert update_merge.read_update_tx() == {}
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == landed, (
+        "the cleanup-only recovery rolled back a healthy update"
+    )
+
+
+def test_restore_skips_drop_when_the_stash_list_changed_mid_restore(tmp_path, monkeypatch):
+    """A concurrent stash push between the apply and the drop shifts every
+    selector: the restore must then KEEP the entry (litter) rather than drop a
+    selector that may now name someone else's work."""
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    (repo / "work.txt").write_text("ours\n")
+    status, our_sha, error = update_merge.stash_local_changes_for_update("race-test")
+    assert status == "ok" and our_sha, error
+
+    real_capture = git_ops.git_capture
+    state = {"list_calls": 0}
+
+    def racing_capture(cmd):
+        if cmd[:3] == ["git", "stash", "list"] and "--format=%H %gd" in cmd:
+            state["list_calls"] += 1
+            if state["list_calls"] == 2:
+                # Interleave a foreign push right before the post-apply re-list.
+                (repo / "foreign.txt").write_text("someone else\n")
+                subprocess.run(["git", "-C", str(repo), "stash", "push",
+                                "--include-untracked", "-m", "foreign",
+                                "--", "foreign.txt"],
+                               capture_output=True, text=True)
+        return real_capture(cmd)
+
+    monkeypatch.setattr(git_ops, "git_capture", racing_capture)
+
+    restored, note = update_merge.restore_update_stash(our_sha, context="race")
+
+    assert restored, note
+    assert (repo / "work.txt").read_text() == "ours\n"
+    shas = _git(repo, "stash", "list", "--format=%H").stdout.split()
+    assert our_sha in shas, "our entry was dropped despite the shifted list"
+    assert len(shas) == 2  # the foreign entry survived too
+
+
+def test_boot_backfill_reprojects_before_pinning_m0(tmp_path, monkeypatch):
+    """A crash between the merge and the mandatory projection must not let boot
+    freeze the unprojected tree as M0: the typed projection re-runs first and a
+    failure rolls back instead of pinning."""
+    repo, head, plan, tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    tx["phase"] = "materializing_assisted"
+    tx.pop("m0_tree", None)
+    tx["local_work_carrier"] = "none"
+    update_merge.write_update_tx(tx)
+    _stub_worker_gates(monkeypatch)
+    monkeypatch.setattr(
+        update_merge, "project_version_carriers",
+        lambda *_a, **_k: (False, "", "sync exploded"),
+    )
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result.get("rolled_back") is True, result
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["base_sha"]
+
+
+def test_projection_postcondition_catches_an_unsyncable_carrier(tmp_path, monkeypatch):
+    """The sync SSOT silently skips token shapes it does not recognize: the
+    postcondition must turn that into a typed failure, never a half-projected
+    M0 (single-quoted pyproject version = a shape the rewriter skips)."""
+    repo, head = _init_repo(tmp_path)
+    (repo / "VERSION").write_text("1.0.0\n")
+    (repo / "pyproject.toml").write_text("[project]\nname = 'x'\nversion = '1.0.0'\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base with single-quoted pyproject")
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "VERSION").write_text("2.0.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "official bumps VERSION only")
+    _git(repo, "checkout", "-q", head)
+    (repo / "local.txt").write_text("fork\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "fork work")
+    _point_at(monkeypatch, tmp_path, repo, head)
+    plan = update_merge.plan_managed_update_merge(fetch=False)
+
+    ok, msg, m0 = update_merge.materialize_assisted_merge_live(
+        head, plan["base_sha"], plan["target_sha"], plan["base_sha"]
+    )
+
+    assert not ok
+    assert "desynced" in msg or "carrier" in msg
+    assert m0 == ""
+
+
+def test_restore_with_marker_refuses_a_dirty_tree(tmp_path, monkeypatch):
+    """Restoring onto a dirty tree is never safe (a conflicting apply's cleanup
+    would wipe whatever made it dirty): the helper preserves the entry and
+    discloses the manual recovery command instead."""
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    (repo / "work.txt").write_text("stashed work\n")
+    status, stash_sha, error = update_merge.stash_local_changes_for_update("dirty-guard")
+    assert status == "ok" and stash_sha, error
+    (repo / "late.txt").write_text("late human edit\n")  # tree dirty again
+    tx = {"stash_sha": stash_sha}
+
+    note = update_merge.restore_stash_with_marker(tx, "unwind-test")
+
+    assert "NOT auto-applied" in note and stash_sha[:12] in note
+    assert (repo / "late.txt").read_text() == "late human edit\n"
+    assert not (repo / "work.txt").exists()  # stayed in the stash, not half-applied
+    assert stash_sha in _git(repo, "stash", "list", "--format=%H").stdout
+
+
+def test_precommit_verify_requires_m0_or_its_reason_on_new_txs(tmp_path, monkeypatch):
+    repo, head, plan, tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    base = {
+        "pre_update_branch": head, "target_sha": plan["target_sha"],
+        "pre_update_sha": plan["base_sha"], "local_work_carrier": "none",
+    }
+    ok, message = update_merge.managed_assisted_precommit_verify(dict(base))
+    assert not ok and "m0_tree" in message
+    ok2, message2 = update_merge.managed_assisted_precommit_verify(
+        dict(base, m0_missing_reason="resumed_with_progress_before_m0_pin")
+    )
+    assert ok2, message2
+    # Legacy tx (no carrier field) is untouched by the requirement.
+    legacy = dict(base)
+    legacy.pop("local_work_carrier")
+    ok3, message3 = update_merge.managed_assisted_precommit_verify(legacy)
+    assert ok3, message3
+
+
+def test_boot_stash_recovery_fails_safe_when_stash_storage_is_unreadable(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    update_merge.write_update_tx({
+        "phase": "stashing_local_work", "attempt_id": "boot-unreadable",
+        "pre_update_sha": "x" * 40, "pre_update_branch": head, "stash_sha": "",
+    })
+    real_capture = git_ops.git_capture
+
+    def flaky(cmd):
+        if cmd[:3] == ["git", "stash", "list"]:
+            return 1, "", "storage down"
+        return real_capture(cmd)
+
+    monkeypatch.setattr(git_ops, "git_capture", flaky)
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert "unreadable" in str(result.get("reason") or "")
+    assert update_merge.read_update_tx() != {}  # the pointer survives for a later boot
+
+
+def test_proof_check_never_fires_for_non_managed_commits():
+    from ouroboros.tools import git as git_tool
+
+    ctx = SimpleNamespace(task_id="ordinary", task_metadata=None, repo_dir="/nonexistent")
+    assert git_tool._managed_candidate_needs_proof(ctx) is False
+
+
+def test_live_unmerged_paths_error_is_not_no_conflicts(monkeypatch):
+    from supervisor import update_candidate
+
+    monkeypatch.setattr(
+        update_candidate._g, "git_capture", lambda cmd: (1, "", "boom")
+    )
+    assert update_candidate.live_unmerged_paths() is None
+
+
+def test_marker_guarded_restore_replay_does_not_wipe_restored_work(tmp_path, monkeypatch):
+    """Crash between the stash apply and its drop: the tx carries
+    stash_restored=True, so a replayed restore must be a no-op — never a
+    conflicting re-apply whose cleanup resets the already-restored copy."""
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    (repo / "work.txt").write_text("owner work\n")
+    status, stash_sha, error = update_merge.stash_local_changes_for_update("replay-test")
+    assert status == "ok" and stash_sha, error
+    tx = {"stash_sha": stash_sha, "pre_update_sha": "x" * 40, "pre_update_branch": head}
+    update_merge.write_update_tx(tx)
+
+    note1 = update_merge.restore_stash_with_marker(tx, "first")
+    assert (repo / "work.txt").read_text() == "owner work\n"
+    assert tx.get("stash_restored") is True
+
+    # Simulate post-restore progress that a naive re-apply would clobber.
+    (repo / "work.txt").write_text("owner work + more\n")
+    note2 = update_merge.restore_stash_with_marker(tx, "replay")
+    assert note2 == ""  # marker short-circuits: no re-apply, no reset
+    assert (repo / "work.txt").read_text() == "owner work + more\n", (note1, note2)
+
+
+def test_carrier_guidance_reaches_the_resolver_objective():
+    from supervisor.update_merge_policy import assisted_objective
+
+    tx = {"target_sha": "t" * 40, "conflict_paths": ["README.md", "ouroboros/loop.py"]}
+    objective = assisted_objective(tx)
+    assert "Version carriers" in objective
+    assert "never delete this fork's local history rows" in objective
+    # No carrier in the conflict set -> no carrier lecture.
+    assert "Version carriers" not in assisted_objective(
+        {"target_sha": "t" * 40, "conflict_paths": ["ouroboros/loop.py"]}
+    )
 
 
 def test_assisted_head_state_in_progress_then_committed(tmp_path, monkeypatch):
@@ -684,7 +1090,7 @@ def test_dirty_local_work_is_in_the_reviewed_diff(tmp_path, monkeypatch):
     plan = update_merge.plan_managed_update_merge(fetch=False)
     assert int(plan["local_dirty_count"]) > 0
 
-    ok, msg = update_merge.materialize_assisted_merge_live(
+    ok, msg, _m0 = update_merge.materialize_assisted_merge_live(
         head, plan["local_snapshot"], plan["target_sha"], plan["base_sha"]
     )
     assert ok, msg
@@ -716,7 +1122,7 @@ def _supervisor_events(tmp_path, event_type):
 def _materialized_conflict_tx(tmp_path, monkeypatch):
     """A live materialized assisted merge with an UNCOMMITTED resolution in the worktree."""
     repo, head, plan = _conflict_repo(tmp_path, monkeypatch)
-    ok, msg = update_merge.materialize_assisted_merge_live(
+    ok, msg, _m0 = update_merge.materialize_assisted_merge_live(
         head, plan["local_snapshot"], plan["target_sha"], plan["base_sha"]
     )
     assert ok, msg
@@ -764,6 +1170,209 @@ def test_orphan_rollback_rescues_uncommitted_resolutions(tmp_path, monkeypatch):
     assert rolled and rolled[-1]["rescue_path"] == str(rescue_dirs[0])
     assert rolled[-1]["reason"] == "assisted_resolution_orphaned"
     assert rolled[-1].get("rescue_ts")
+
+
+def test_tests_evidence_records_only_for_authorized_resolver_and_live_suite(tmp_path, monkeypatch):
+    """Single-run contract (Q10): the pre-commit proof is recorded only by the
+    AUTHORIZED resolver and only when the suite actually ran (an env-disabled
+    suite must not forge a proof)."""
+    repo, head, plan, tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    meta = _authority_metadata(tx)
+
+    monkeypatch.setenv("OUROBOROS_PRE_PUSH_TESTS", "0")
+    assert update_merge.record_managed_tests_evidence("resolver", meta) == ""
+    monkeypatch.setenv("OUROBOROS_PRE_PUSH_TESTS", "1")
+    assert update_merge.record_managed_tests_evidence("other-task", meta) == ""
+
+    # The proof covers what the hermetic runner actually tests: the live
+    # worktree projection INCLUDING unstaged edits and untracked files.
+    (repo / "untracked_helper.py").write_text("VALUE = 1\n")
+    tree = update_merge.record_managed_tests_evidence("resolver", meta)
+    assert tree
+    assert _git(repo, "show", f"{tree}:untracked_helper.py").stdout == "VALUE = 1\n"
+    assert "the resolver's precious resolution" in _git(repo, "show", f"{tree}:a.txt").stdout
+    assert update_merge.managed_tests_evidence_covers(tree)
+    assert not update_merge.managed_tests_evidence_covers("0" * 40)
+    assert not update_merge.managed_tests_evidence_covers("")
+
+    # Fidelity guard: an untracked SYMLINK is not faithfully reproduced by the
+    # runner's untracked copy — no proof may be recorded for such a candidate.
+    (repo / "sneaky_link").symlink_to("a.txt")
+    assert update_merge.record_managed_tests_evidence("resolver", meta) == ""
+
+
+def test_managed_post_commit_gate_reuses_exact_tree_proof(tmp_path, monkeypatch):
+    """The managed gate's mandate is 'the suite provably ran green on the exact
+    committed tree' — proof-by-identity skips the duplicate run; any mismatch
+    still pays a fresh mandatory run. Synthesis F2: the AUTHORITY is the
+    process-held ctx record — FORGED durable ``tests_evidence`` (the tx marker
+    is a plain resolver-writable file) never suppresses the mandatory run."""
+    from ouroboros.tools import git as git_tool
+
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    committed_tree = _git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+    ctx = SimpleNamespace(repo_dir=str(repo), emit_progress_fn=lambda *_a, **_k: None)
+
+    # Process-held proof for the exact committed tree -> no duplicate run.
+    ctx._managed_tests_proof_trees = {committed_tree}
+    monkeypatch.setattr(
+        git_tool, "_post_commit_result",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("duplicate suite run")),
+    )
+    assert git_tool._managed_post_commit_tests_gate(
+        ctx, "msg", 0.0, True, [""], {"target_sha": "x" * 40},
+    ) is None
+
+    # F2(a): a FORGED durable evidence file (tree matches the committed tree)
+    # WITHOUT a ctx record -> the gate still runs the mandatory suite.
+    update_merge.write_update_tx({
+        "phase": "assisted_resolution", "task_id": "resolver",
+        "tests_evidence": {"tree": committed_tree},
+    })
+    forged_ctx = SimpleNamespace(repo_dir=str(repo), emit_progress_fn=lambda *_a, **_k: None)
+    ran = []
+    monkeypatch.setattr(
+        git_tool, "_post_commit_result",
+        lambda *_a, **_k: ran.append("suite") and None,
+    )
+    assert git_tool._managed_post_commit_tests_gate(
+        forged_ctx, "msg", 0.0, True, [""], {"target_sha": "x" * 40},
+    ) is None
+    assert ran == ["suite"], "forged durable tests_evidence suppressed the mandatory run"
+
+    # Mismatched ctx proof -> the mandatory run still happens too.
+    ctx._managed_tests_proof_trees = {"0" * 40}
+    ran.clear()
+    assert git_tool._managed_post_commit_tests_gate(
+        ctx, "msg", 0.0, True, [""], {"target_sha": "x" * 40},
+    ) is None
+    assert ran == ["suite"]
+
+
+def test_rollback_preserves_uncommitted_resolution_on_deterministic_branch(tmp_path, monkeypatch):
+    """An aborted resolution survives on ``failed-update-<target12>`` as a synthetic
+    commit (private index — plain write-tree is fatal on an unmerged index) with the
+    natural [pre, target] parents, and a retry can find it by the target alone."""
+    repo, head, plan, tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    _stub_worker_gates(monkeypatch)
+
+    ok, msg = update_merge.rollback_managed_update("preserve_test")
+
+    assert ok, msg
+    name = f"failed-update-{plan['target_sha'][:12]}"
+    assert name in msg
+    kept = _git(repo, "rev-parse", name).stdout.strip()
+    parents = _git(repo, "rev-list", "--parents", "-n", "1", kept).stdout.split()
+    assert parents[1:] == [plan["base_sha"], plan["target_sha"]]
+    assert "the resolver's precious resolution" in _git(repo, "show", f"{name}:a.txt").stdout
+    rolled = _supervisor_events(tmp_path, "managed_update_rolled_back")
+    assert rolled and rolled[-1]["failed_update_ref"] == name
+    # A later retry of the SAME target finds the preserved attempt by target alone.
+    assert update_merge.existing_failed_update_ref(plan["target_sha"]) == name
+    # And the branch name reaches the resolver's objective text on that retry.
+    retry_tx = dict(tx)
+    retry_tx["failed_update_ref"] = name
+    from supervisor.update_merge_policy import assisted_objective
+
+    assert name in assisted_objective(retry_tx)
+
+
+def test_replayed_rollback_does_not_clobber_the_preserved_attempt(tmp_path, monkeypatch):
+    """A rollback replay (crash after the destructive reset) re-enters with a clean
+    tree at the pre-update sha: it must NOT overwrite the deterministic branch —
+    which holds the real attempt — with the bare base, and a rollback that never
+    materialized anything must not mint a junk branch at all."""
+    repo, head, plan, tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    _stub_worker_gates(monkeypatch)
+    name = f"failed-update-{plan['target_sha'][:12]}"
+
+    ok, msg = update_merge.rollback_managed_update("first")
+    assert ok, msg
+    kept = _git(repo, "rev-parse", name).stdout.strip()
+    assert kept != plan["base_sha"]  # a real attempt, not the base
+
+    # Replay: boot re-enters rolling_back with a fresh tx, tree clean at pre.
+    update_merge.write_update_tx({
+        "pre_update_sha": plan["base_sha"], "pre_update_branch": head,
+        "target_sha": plan["target_sha"],
+    })
+    ok2, msg2 = update_merge.rollback_managed_update("replay")
+    assert ok2, msg2
+    assert _git(repo, "rev-parse", name).stdout.strip() == kept, (
+        "the replayed rollback overwrote the preserved attempt with the pre-update base"
+    )
+    # Never-materialized rollback of a DIFFERENT target mints no junk branch.
+    other_target = "f" * 40
+    update_merge.write_update_tx({
+        "pre_update_sha": plan["base_sha"], "pre_update_branch": head,
+        "target_sha": other_target,
+    })
+    ok3, _msg3 = update_merge.rollback_managed_update("no_mutation")
+    assert ok3
+    assert _git(repo, "rev-parse", f"failed-update-{other_target[:12]}").returncode != 0
+    assert update_merge.existing_failed_update_ref(other_target) == ""
+    # And the retry pointer filters a branch that merely sits on the base.
+    _git(repo, "branch", "-f", f"failed-update-{other_target[:12]}", plan["base_sha"])
+    assert update_merge.existing_failed_update_ref(other_target, not_at=plan["base_sha"]) == ""
+
+
+def test_boot_diverged_abandon_restores_the_stash(tmp_path, monkeypatch):
+    """The diverged-abandon branch clears the tx — the only pointer that a stash
+    restore is owed — so it must bring the owner's stashed work back first."""
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "precious.txt").write_text("owner work\n")
+    status, stash_sha, error = update_merge.stash_local_changes_for_update("diverge-test")
+    assert status == "ok" and stash_sha, error
+    # A real reviewed commit lands on top while the update is in flight.
+    (repo / "landed.txt").write_text("reviewed\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "landed on top")
+    update_merge.write_update_tx({
+        "phase": "assisted_resolution", "task_id": "resolver",
+        "pre_update_sha": pre, "pre_update_branch": head,
+        "local_snapshot": pre, "target_sha": "e" * 40,
+        "stash_sha": stash_sha, "local_work_carrier": "stash",
+    })
+    _stub_worker_gates(monkeypatch)
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result.get("abandoned") is True, result
+    assert (repo / "precious.txt").read_text() == "owner work\n", (
+        "the abandoned update dropped the tx without restoring the owner's stash"
+    )
+    assert update_merge.read_update_tx() == {}
+
+
+def test_materialize_projects_fork_only_version_bump_to_target(tmp_path, monkeypatch):
+    """Q8 is unconditional: a fork-only VERSION bump (target side unchanged, so no
+    conflict) still lands under the official target's version."""
+    repo, head = _init_repo(tmp_path)
+    (repo / "VERSION").write_text("1.0.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "version base")
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "official.txt").write_text("official\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "official change, VERSION untouched")
+    _git(repo, "checkout", "-q", head)
+    (repo / "VERSION").write_text("1.0.1\n")  # fork-only bump
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "fork bump")
+    _point_at(monkeypatch, tmp_path, repo, head)
+    plan = update_merge.plan_managed_update_merge(fetch=False)
+
+    ok, msg, _m0 = update_merge.materialize_assisted_merge_live(
+        head, plan["base_sha"], plan["target_sha"], plan["base_sha"]
+    )
+
+    assert ok, msg
+    assert "VERSION projected to the target's version" in msg
+    assert _git(repo, "show", ":VERSION").stdout == "1.0.0\n"
+    assert (repo / "VERSION").read_text() == "1.0.0\n"
 
 
 def test_boot_cap_rollback_rescues_before_reset(tmp_path, monkeypatch):

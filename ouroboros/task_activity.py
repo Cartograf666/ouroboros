@@ -25,10 +25,13 @@ other's phase, and dropped on task exit.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+
+log = logging.getLogger(__name__)
 
 # Phases the loop stamps. Each renders its own clause; an unknown phase falls
 # back to its own name so a new call site is never silently invisible.
@@ -142,3 +145,86 @@ def render(task_id: str, *, extra: str = "") -> str:
     if extra:
         parts.append(extra)
     return " · ".join(parts)
+
+
+# The heartbeat's own tick, moved out of `agent.py` under the size ratchet.
+# It belongs here: everything it does is this module's business — read the
+# phase, decide whether the silence is long enough to be worth breaking, and
+# render one line. The agent supplies only what it alone knows (how to emit,
+# and when it last spoke).
+
+
+def live_children_clause(task_id: str, *, metadata: Any, drive_root: Any) -> str:
+    """``N of M subagents still running`` for the ticker, or "" when there are none.
+
+    Read from the SAME status root ``get_task_result`` uses, so a forked child
+    drive is not mistaken for an empty subtree. Never raises: a status line is
+    not worth failing a heartbeat tick over."""
+    try:
+        import pathlib as _pathlib
+
+        from ouroboros.task_status import FINAL_STATUSES, find_child_tasks
+
+        meta = metadata if isinstance(metadata, dict) else {}
+        status_root = _pathlib.Path(
+            str(meta.get("budget_drive_root") or "") or str(drive_root)
+        )
+        children = [
+            row for row in find_child_tasks(
+                status_root,
+                parent_task_id=task_id,
+                root_task_id=str(meta.get("root_task_id") or task_id),
+                exclude_task_id=task_id,
+                scope="direct",
+                materialize_artifacts=False,
+            )
+            if isinstance(row, dict)
+        ]
+        live = [
+            child for child in children
+            if str(child.get("status") or "") not in FINAL_STATUSES
+        ]
+        if not live:
+            return ""
+        return f"{len(live)} of {len(children)} subagents still running"
+    except Exception:
+        log.debug("Live-children clause unavailable for the progress ticker", exc_info=True)
+        return ""
+
+
+def emit_tick(task_id: str, *, emit: Any, quiet_since: Any,
+              metadata: Any = None, drive_root: Any = None) -> None:
+    """Emit the current phase when the task has gone quiet for the ticker window.
+
+    Gated on time since the LAST progress line, not on a fixed schedule: a task
+    already narrating itself (tool results, review verdicts, fallbacks) does not
+    need a second voice on top. An unstamped task renders "" and stays silent
+    rather than inventing a reassuring "still working". Swallows its own
+    failures so a heartbeat thread never dies of a status line."""
+    try:
+        window = get_progress_ticker_sec()
+        if window <= 0:
+            return
+        if time.time() - float(quiet_since or 0.0) < window:
+            return
+        line = render(task_id, extra=live_children_clause(
+            task_id, metadata=metadata, drive_root=drive_root))
+        if line:
+            emit(line)
+    except Exception:
+        log.debug("Progress ticker failed", exc_info=True)
+
+
+# The ticker's own silence window. Default in config, reader here — the
+# module that decides when to break a silence should be the one that knows
+# how long a silence has to be.
+def get_progress_ticker_sec() -> float:
+    """Silence window before the heartbeat thread emits a task's current phase.
+
+    Returns 0.0 when the ticker is disabled. Not clamped to a floor above zero:
+    the disable value has to survive, and the heartbeat tick interval already
+    bounds how often this can actually fire."""
+    from ouroboros.config import _clamped_number_setting
+
+    value = _clamped_number_setting("OUROBOROS_PROGRESS_TICKER_SEC", low=0.0, high=3600.0)
+    return 0.0 if value <= 0 else max(value, 15.0)

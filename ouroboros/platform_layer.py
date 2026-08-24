@@ -437,6 +437,26 @@ def pid_is_alive(pid: int) -> bool:
         return False
 
 
+def pid_provably_gone(pid: int) -> bool:
+    """True only when the OS positively answers that ``pid`` does not exist.
+
+    Stricter than ``not pid_is_alive``: the POSIX branch there folds EVERY
+    OSError into 'dead', but EPERM means the process EXISTS and merely refuses
+    our signal — a caller deciding whether a killed process is really gone
+    must treat that (and anything else undeterminable) as still present."""
+    if pid <= 0:
+        return True
+    if IS_WINDOWS:
+        return not pid_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 # Windows file locking via LockFileEx/UnlockFileEx; unlike msvcrt.locking(),
 # this works on empty files by locking a range beyond current size.
 
@@ -674,7 +694,11 @@ def process_command(pid: int) -> str:
     if IS_WINDOWS:
         return ""
     try:
-        result = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+        # -ww: unlimited width. BSD ps truncates to the terminal/128 cols
+        # otherwise, and consumers match exact argv tokens — a packaged
+        # interpreter path is long enough to push the script argument off the
+        # end of a truncated line.
+        result = subprocess.run(["ps", "-ww", "-p", str(int(pid)), "-o", "command="],
                                 capture_output=True, text=True, timeout=3)
         return result.stdout.strip()
     except Exception:
@@ -815,8 +839,14 @@ def kill_process_on_port(port: int) -> None:
                         except (ValueError, ProcessLookupError, PermissionError):
                             pass
         else:
+            # -sTCP:LISTEN scopes the sweep to the listener, mirroring the
+            # Windows branch's LISTENING filter: a bare tcp:PORT selector also
+            # matches ESTABLISHED client sockets, so on browser-mode installs
+            # the sweep would SIGKILL the owner's own browser mid-session.
+            # -nP skips host/port name resolution so a slow resolver cannot
+            # eat the 5s timeout.
             res = subprocess.run(
-                ["lsof", "-ti", f"tcp:{port}"],
+                ["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
                 capture_output=True, text=True, timeout=5,
             )
             for pid_str in res.stdout.strip().split():

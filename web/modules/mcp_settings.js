@@ -105,9 +105,9 @@ function renderServerCard(server, index) {
                         <input type="checkbox" data-mcp-field="enabled" ${enabled ? 'checked' : ''}>
                         <span>Enabled</span>
                     </label>
-                    <button type="button" class="settings-ghost-btn" data-mcp-test>Test</button>
-                    <button type="button" class="settings-ghost-btn" data-mcp-refresh>Refresh tools</button>
-                    <button type="button" class="settings-ghost-btn mcp-server-remove" data-mcp-remove>Remove</button>
+                    <button type="button" class="btn btn-default" data-mcp-test>Test</button>
+                    <button type="button" class="btn btn-default" data-mcp-refresh>Refresh tools</button>
+                    <button type="button" class="btn btn-default mcp-server-remove" data-mcp-remove>Remove</button>
                 </div>
             </header>
             <div class="form-grid two">
@@ -149,8 +149,8 @@ function renderServerCard(server, index) {
                     <label>Auth token (optional)</label>
                     <div class="secret-input-row">
                         <input type="password" data-mcp-field="auth_token" value="${escapeHtml(authToken)}" placeholder="${escapeHtml(authPlaceholder)}" autocomplete="off" spellcheck="false">
-                        <button type="button" class="settings-ghost-btn" data-mcp-token-toggle>Show</button>
-                        <button type="button" class="settings-ghost-btn" data-mcp-token-clear>Clear</button>
+                        <button type="button" class="btn btn-default" data-mcp-token-toggle>Show</button>
+                        <button type="button" class="btn btn-default" data-mcp-token-clear>Clear</button>
                     </div>
                 </div>
             </div>`}

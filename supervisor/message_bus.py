@@ -8,11 +8,14 @@ import queue
 import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
+from ouroboros.artifacts import store_chat_media_bytes
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_TYPING, CHAT_VIDEO, publish_event
 from supervisor.state import append_jsonl, load_state
 from ouroboros.utils import utc_now_iso
+from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +24,19 @@ DATA_DIR = None  # pathlib.Path
 TOTAL_BUDGET_LIMIT: float = 0.0
 BUDGET_REPORT_EVERY_MESSAGES: int = 10
 _BRIDGE: Optional["LocalChatBridge"] = None
+
+
+def _chat_media_download_url(task_id: str, data: bytes, mime: str) -> str:
+    if not DATA_DIR:
+        return ""
+    try:
+        stored = store_chat_media_bytes(DATA_DIR, task_id, data, mime)
+    except Exception:
+        log.warning("Could not persist outbound chat media", exc_info=True)
+        return ""
+    if not stored:
+        return ""
+    return f"/api/tasks/{quote(task_id, safe='')}/artifacts/{quote(str(stored['name']), safe='')}"
 
 
 def coerce_chat_identity(value: Any, default: int = 1) -> int:
@@ -385,8 +401,10 @@ class LocalChatBridge:
         client_message_id: str,
         action: str,
         target: str = "",
+        target_label: str = "",
         status: str = "accepted",
         options: Optional[List[Dict[str, Any]]] = None,
+        attachment_manifest: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Emit a typed routing receipt without creating an assistant bubble.
 
@@ -406,8 +424,14 @@ class LocalChatBridge:
             "suppress_bubble": True,
             "ts": utc_now_iso(),
         }
+        if str(target_label or ""):
+            payload["target_label"] = str(target_label)
         if options is not None:
             payload["options"] = [dict(row) for row in options if isinstance(row, dict)]
+        if attachment_manifest is not None:
+            payload["attachment_manifest"] = [
+                dict(row) for row in attachment_manifest if isinstance(row, dict)
+            ]
         if self._broadcast_fn and not is_a2a_chat_id(chat_id):
             self._broadcast_fn(payload)
         if not is_a2a_chat_id(chat_id):
@@ -417,14 +441,51 @@ class LocalChatBridge:
                 "transport": dict(self._chat_transports.get(int(chat_id or 0), {}) or {}),
             })
 
-    def send_chat_action(self, chat_id: int, action: str = "typing") -> bool:
-        """Send typing indicator to UI/event subscribers."""
+    def send_chat_action(
+        self,
+        chat_id: int,
+        action: str = "typing",
+        *,
+        activity_id: str = "",
+        client_message_id: str = "",
+        phase: str = "thinking",
+        kind: str = "",
+    ) -> bool:
+        """Send typing indicator to UI/event subscribers.
+
+        ``kind`` is stamped only for registry-tracked direct/ephemeral turns
+        (``direct_chat``/``ephemeral_decision``); queued managed tasks emit
+        typing without it, so the client knows the /api/state snapshot has no
+        deletion authority over their entries.
+        """
         if is_a2a_chat_id(chat_id):
             return True
+        payload: Dict[str, Any] = {
+            "type": "typing",
+            "action": action,
+            "chat_id": int(chat_id or 0),
+        }
+        if activity_id:
+            payload["activity_id"] = str(activity_id)
+        if client_message_id:
+            payload["client_message_id"] = str(client_message_id)
+        if phase:
+            payload["phase"] = str(phase)
+        if kind:
+            payload["kind"] = str(kind)
+
         if self._broadcast_fn:
-            self._broadcast_fn({"type": "typing", "action": action, "chat_id": int(chat_id or 0)})
+            self._broadcast_fn(payload)
         typing_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
-        publish_event(CHAT_TYPING, {"chat_id": int(chat_id or 0), "action": str(action or ""), "transport": typing_transport})
+        publish_event(CHAT_TYPING, {
+            "chat_id": int(chat_id or 0),
+            "action": str(action or ""),
+            "activity_id": str(activity_id or ""),
+            "client_message_id": str(client_message_id or ""),
+            "phase": str(phase or "thinking"),
+            "kind": str(kind or ""),
+            "transport": typing_transport,
+        })
         return True
 
     def send_photo(
@@ -433,10 +494,12 @@ class LocalChatBridge:
         photo_bytes: bytes,
         caption: str = "",
         mime: str = "image/png",
+        task_id: str = "",
     ) -> Tuple[bool, str]:
         """Send photo to UI and host event subscribers."""
         if is_a2a_chat_id(chat_id):
             return True, "ok"
+        download_url = _chat_media_download_url(task_id, photo_bytes, mime)
         b64_str = base64.b64encode(photo_bytes).decode("ascii")
         msg = {
             "type": "photo",
@@ -468,8 +531,10 @@ class LocalChatBridge:
             owner_id,
             caption or "Photo attachment",
             ts=msg["ts"],
+            task_id=str(task_id or ""),
             record_type="photo",
             mime=str(mime or ""),
+            download_url=download_url,
             caption=str(caption or ""),
         )
         _advance_project_visible_revision(chat_id)
@@ -481,10 +546,12 @@ class LocalChatBridge:
         video_bytes: bytes,
         caption: str = "",
         mime: str = "video/mp4",
+        task_id: str = "",
     ) -> Tuple[bool, str]:
         """Send video to UI and host event subscribers."""
         if is_a2a_chat_id(chat_id):
             return True, "ok"
+        download_url = _chat_media_download_url(task_id, video_bytes, mime)
         b64_str = base64.b64encode(video_bytes).decode("ascii")
         msg = {
             "type": "video",
@@ -516,8 +583,10 @@ class LocalChatBridge:
             owner_id,
             caption or "Video attachment",
             ts=msg["ts"],
+            task_id=str(task_id or ""),
             record_type="video",
             mime=str(mime or ""),
+            download_url=download_url,
             caption=str(caption or ""),
         )
         _advance_project_visible_revision(chat_id)
@@ -794,6 +863,8 @@ def log_chat(
     mime: str = "",
     download_url: str = "",
     caption: str = "",
+    client_surface: Optional[Dict[str, Any]] = None,
+    message_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     if DATA_DIR:
         record = {
@@ -818,6 +889,20 @@ def log_chat(
         # persisted row as a DocumentOutbound WS envelope.
         if record_type:
             record["type"] = record_type
+        if client_surface:
+            # Per-message sending-surface provenance (Owner Surface Fact);
+            # optional column, never a "type":"chat" literal (AST-scan hygiene).
+            record["client_surface"] = dict(client_surface)
+        # Speech rows persist only the compact identity required to route a
+        # child final after progress retention/rotation has removed its cards.
+        meta = dict(message_meta or {})
+        for key in SUBAGENT_MESSAGE_FIELDS:
+            if key in meta:
+                record[key] = meta[key]
+        if record_type == "project_completion_summary":
+            for key in ("project_id", "project_name", "target_label", "status"):
+                if key in meta:
+                    record[key] = meta[key]
         if filename:
             record["filename"] = filename
         if mime:
@@ -867,6 +952,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
             fmt=fmt,
             task_id=task_id,
             record_type=system_type,
+            message_meta=progress_meta,
         )
 
     if _text.strip() in ("", "\u200b"):

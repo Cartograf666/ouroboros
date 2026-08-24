@@ -313,11 +313,19 @@ def test_chat_remote_no_proxy_retries_openrouter_parameter_rejection():
     messages = [{"role": "user", "content": "hello"}]
     captured_kwargs = []
 
+    class ParameterRejection(RuntimeError):
+        status_code = 404
+        body = {"error": {
+            "message": "No endpoints found for requested parameter temperature",
+        }}
+
     class FakeCompletions:
         def create(self, **kwargs):
             captured_kwargs.append(kwargs)
             if len(captured_kwargs) == 1:
-                raise RuntimeError("404 No endpoints found that can handle the requested parameters")
+                raise ParameterRejection(
+                    "404 No endpoints found for requested parameter temperature"
+                )
             return MagicMock(
                 model_dump=lambda: {
                     "choices": [{"message": {"role": "assistant", "content": "ok", "tool_calls": None}}],
@@ -380,13 +388,15 @@ def test_plan_review_slots_use_no_proxy(tmp_path):
 
     # The slot runner (and its LLMClient construction site) moved to
     # plan_review_runtime; patch the owning module, not the re-exporting one.
+    from ouroboros.review_substrate import ReviewSlot
+
     with patch.object(plan_review_runtime, "LLMClient", return_value=FakeLLMClient()):
         result = _asyncio.run(
             plan_review._run_plan_review_slots(
                 fake_ctx,
-                ["openai/gpt-5.5"],
-                "system prompt",
-                "user content",
+                [ReviewSlot(slot_id="slot_1", model="openai/gpt-5.5", effort="high")],
+                system_prompt="system prompt",
+                user_content="user content",
             )
         )
 

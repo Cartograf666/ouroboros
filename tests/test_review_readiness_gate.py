@@ -152,6 +152,25 @@ class TestCheckWorktreeReadiness:
             result = check_worktree_readiness(tmp_path)
             assert isinstance(result, list), f"Expected list, got {type(result)}"
 
+    def test_size_ratchet_findings_surface_as_official_ci_warnings(self, tmp_path, monkeypatch):
+        """Size-ratchet validator findings surface as warn-only readiness lines
+        naming the enforcing surface (the official repository CI), never as a
+        local block. Real scratch git checkout; the validator is stubbed to a
+        deterministic finding."""
+        import ouroboros.review as review_module
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "dirty.py").write_text("x = 1\n", encoding="utf-8")
+
+        finding = "byte debt grew: ouroboros/example.py 200001 -> 200002"
+        monkeypatch.setattr(review_module, "validate_size_ratchet", lambda *_a, **_k: [finding])
+
+        warnings = check_worktree_readiness(repo)
+
+        assert f"official CI will enforce: {finding}" in warnings
+
 
 class TestReadinessGateBlocksBeforeAlreadyFresh:
     """Regression: readiness gate must block on clean worktree even if a prior fresh run exists."""

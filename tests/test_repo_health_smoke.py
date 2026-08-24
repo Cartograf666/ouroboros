@@ -25,8 +25,11 @@ from ouroboros.review import (
     iter_gated_functions,
     iter_gated_modules,
     parse_size_ratchet_manifest,
+    resolve_committed_manifest_text,
     validate_manifest_transition,
     validate_size_ratchet,
+    validate_size_ratchet_candidate,
+    validate_size_ratchet_transition_against_base,
 )
 from ouroboros.tools.health import _codebase_health
 from scripts import regenerate_size_ratchet as regenerate
@@ -357,9 +360,15 @@ def test_total_function_cap_checks_staged_and_live_projections(tmp_path: Path) -
     _write_manifest(repo, _manifest(sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "bootstrap ratchet")
-    paths = [f"batch_{index}.py" for index in range(7)]
-    source = "".join(f"def f{index}(): pass\n" for index in range(929))
-    total = len(paths) * 929
+    functions_per_path = MAX_MODULE_LINES
+    paths = [
+        f"batch_{index}.py"
+        for index in range((MAX_TOTAL_FUNCTIONS // functions_per_path) + 1)
+    ]
+    source = "".join(
+        f"def f{index}(): pass\n" for index in range(functions_per_path)
+    )
+    total = len(paths) * functions_per_path
     assert total > MAX_TOTAL_FUNCTIONS
 
     for rel in paths:
@@ -476,11 +485,29 @@ def test_tree_validation_rejects_stale_byte_count(tmp_path: Path) -> None:
     errors = validate_size_ratchet(repo)
 
     assert "BYTE_DEBT differs from live exact counts: live={}" in errors
-    assert "bootstrap: BYTE_DEBT differs from live exact counts: live={}" in errors
-    assert "bootstrap: BYTE_BASELINE_DEBT differs from exact BASELINE_SOURCE_SHA inventory" in errors
+    assert "bootstrap: BYTE_BASELINE_DEBT differs from the bootstrap candidate inventory" in errors
 
 
-def test_clean_committed_tree_validates_transition_against_parent(tmp_path: Path) -> None:
+# ── New-semantics contract: merge-aware previous, pairwise base-vs-tip ──
+#
+# The first-parent committed-history replay was retired (official CI enforces
+# the pairwise base-vs-tip transition instead; local surfaces only warn).
+# Retired replay pins, each an accepted owner tradeoff recorded in the PR:
+#   - test_clean_committed_tree_validates_transition_against_parent /
+#     test_full_history_rejects_add_and_carry_bypass: a debt-adding commit is
+#     now green LOCALLY once committed; the pairwise CI check against the
+#     event base catches it (contract test below).
+#   - test_full_history_rejects_retired_debt_reentry: re-entry WITHIN one
+#     base..tip interval is no longer detected; re-entry across the interval
+#     boundary still is (contract test below).
+#   - test_full_history_rejects_transient_unrecorded_giant /
+#     test_full_history_ignores_tree_controlled_export_attributes: transient
+#     intra-interval states are invisible to a pairwise check by design
+#     (exact-ref blob reading itself stays pinned by
+#     test_ref_inventory_reads_unsubstituted_git_blob_bytes).
+
+
+def test_committed_debt_is_green_locally_and_caught_by_the_pairwise_base_check(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     baseline = _bootstrap_repo(
         repo,
@@ -492,37 +519,27 @@ def test_clean_committed_tree_validates_transition_against_parent(tmp_path: Path
     _write_manifest(repo, _manifest(giant_paths=frozenset({"old.py"}), sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "bootstrap ratchet")
+    bootstrap = _git(repo, "rev-parse", "HEAD")
 
     _write_lines(repo / "old.py", 1)
     _write_lines(repo / "new.py", MAX_MODULE_LINES + 1)
     _write_manifest(repo, _manifest(giant_paths=frozenset({"new.py"}), sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "swap debt")
-    swap = _git(repo, "rev-parse", "HEAD")
-
-    assert validate_size_ratchet(repo) == [f"{swap[:12]}: new module debt above 1600 lines: new.py"]
-
-
-def test_full_history_rejects_add_and_carry_bypass(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    baseline = _bootstrap_repo(repo)
-    _write_manifest(repo, _manifest(sha=baseline))
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "bootstrap ratchet")
-
-    _write_lines(repo / "new.py", MAX_MODULE_LINES + 1)
-    _write_manifest(repo, _manifest(giant_paths=frozenset({"new.py"}), sha=baseline))
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "self-authorize giant")
-    bad_commit = _git(repo, "rev-parse", "HEAD")
     (repo / "README.md").write_text("carry\n", encoding="utf-8")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "unrelated tip")
 
-    assert validate_size_ratchet(repo) == [f"{bad_commit[:12]}: new module debt above 1600 lines: new.py"]
+    # Local validation sees an exact manifest and no replay: green.
+    assert validate_size_ratchet(repo) == []
+    # The official-CI pairwise check against the event base still blocks the
+    # swapped-in debt, even when a later unrelated commit carries it.
+    assert validate_size_ratchet_transition_against_base(repo, bootstrap) == [
+        "new module debt above 1600 lines: new.py"
+    ]
 
 
-def test_full_history_rejects_retired_debt_reentry(tmp_path: Path) -> None:
+def test_pairwise_check_catches_reentry_across_the_interval_boundary(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     baseline = _bootstrap_repo(repo, files={"old.py": "x\n" * (MAX_MODULE_LINES + 1)})
     _write_manifest(repo, _manifest(giant_paths=frozenset({"old.py"}), sha=baseline))
@@ -532,50 +549,186 @@ def test_full_history_rejects_retired_debt_reentry(tmp_path: Path) -> None:
     _write_manifest(repo, _manifest(sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "retire debt")
+    retire = _git(repo, "rev-parse", "HEAD")
     _write_lines(repo / "old.py", MAX_MODULE_LINES + 1)
     _write_manifest(repo, _manifest(giant_paths=frozenset({"old.py"}), sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "reenter debt")
-    reentry = _git(repo, "rev-parse", "HEAD")
 
-    assert validate_size_ratchet(repo) == [f"{reentry[:12]}: new module debt above 1600 lines: old.py"]
+    assert validate_size_ratchet_transition_against_base(repo, retire) == [
+        "new module debt above 1600 lines: old.py"
+    ]
+    # Degraded local semantics (no base env): the tip's parent is the retire
+    # commit, so the same re-entry is still caught without any explicit base.
+    assert validate_size_ratchet_transition_against_base(repo, None) == [
+        "new module debt above 1600 lines: old.py"
+    ]
 
 
-def test_full_history_rejects_transient_unrecorded_giant(tmp_path: Path) -> None:
+def test_pairwise_base_semantics(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    pre_bootstrap = _bootstrap_repo(repo)
+    _write_manifest(repo, _manifest(sha=pre_bootstrap))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap ratchet")
+    clean = _git(repo, "rev-parse", "HEAD")
+    _write_lines(repo / "new.py", MAX_MODULE_LINES + 1)
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"new.py"}), sha=pre_bootstrap))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "grow debt")
+
+    regression = ["new module debt above 1600 lines: new.py"]
+    # Explicit resolvable base: the pairwise transition blocks the regression.
+    assert validate_size_ratchet_transition_against_base(repo, clean) == regression
+    # All-zeros base (new-branch / tag push): DEGRADES to the tip's parent —
+    # a skip would let a recreated branch grandfather debt in one green run.
+    assert validate_size_ratchet_transition_against_base(repo, "0" * 40) == regression
+    # Resolvable base whose tree lacks the manifest: FAIL-CLOSED — inside an
+    # interval this means the manifest was deleted (laundering vector), and
+    # genuine first adoption re-runs with a post-adoption base.
+    [pre_bootstrap_error] = validate_size_ratchet_transition_against_base(repo, pre_bootstrap)
+    assert "does not carry the size-ratchet manifest" in pre_bootstrap_error
+    assert "deletion inside the interval" in pre_bootstrap_error
+    # No base / unresolvable base (force-push history loss): degrade to the
+    # tip's parent manifest — still a real shrink-only check.
+    assert validate_size_ratchet_transition_against_base(repo, None) == regression
+    assert validate_size_ratchet_transition_against_base(repo, "deadbeef" * 5) == regression
+
+    manifestless = tmp_path / "manifestless"
+    _bootstrap_repo(manifestless)
+    assert validate_size_ratchet_transition_against_base(manifestless, None) == [
+        "pairwise: HEAD does not carry the size-ratchet manifest"
+    ]
+
+
+def test_pairwise_blocks_delete_then_rebootstrap_laundering(tmp_path: Path) -> None:
+    """Two-push laundering: push 1 deletes the manifest, push 2 lands a fresh
+    bootstrap manifest grandfathering new debt. The second push's base (push
+    1's tip) resolves but lacks the manifest — the pairwise check must FAIL,
+    never skip as 'pre-bootstrap'."""
     repo = tmp_path / "repo"
     baseline = _bootstrap_repo(repo)
     _write_manifest(repo, _manifest(sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "bootstrap ratchet")
-    _write_lines(repo / "transient.py", MAX_MODULE_LINES + 1)
+    (repo / "ouroboros" / "size_ratchet_manifest.py").unlink()
     _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "unrecorded giant")
-    bad_commit = _git(repo, "rev-parse", "HEAD")
-    (repo / "transient.py").unlink()
+    _git(repo, "commit", "-qm", "delete manifest")
+    deletion_tip = _git(repo, "rev-parse", "HEAD")
+    _write_lines(repo / "fat.py", MAX_MODULE_LINES + 1)
+    head = _git(repo, "rev-parse", "HEAD")
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"fat.py"}), sha=head))
     _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "remove transient giant")
+    _git(repo, "commit", "-qm", "rebootstrap grandfathering fat.py")
 
-    assert validate_size_ratchet(repo) == [f"{bad_commit[:12]}: GIANT_PATHS missing live entry: 'transient.py'"]
+    [error] = validate_size_ratchet_transition_against_base(repo, deletion_tip)
+    assert "deletion inside the interval" in error
 
 
-def test_full_history_ignores_tree_controlled_export_attributes(tmp_path: Path) -> None:
+def test_pairwise_degraded_parent_base_must_match_its_own_tree(tmp_path: Path) -> None:
+    """Force-push laundering: an unresolvable base degrades to the tip's parent
+    manifest — which must first validate against the PARENT's own tree, or a
+    fabricated parent manifest pre-declaring the tip's debt becomes transition
+    authority."""
     repo = tmp_path / "repo"
     baseline = _bootstrap_repo(repo)
-    _write_manifest(repo, _manifest(sha=baseline))
+    # Parent commit: manifest FABRICATES giant debt for a file its tree lacks.
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"fat.py"}), sha=baseline))
     _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "bootstrap ratchet")
+    _git(repo, "commit", "-qm", "fabricated parent manifest")
+    # Tip: actually adds the fat module the parent pre-declared.
+    _write_lines(repo / "fat.py", MAX_MODULE_LINES + 1)
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"fat.py"}), sha=baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "land the debt")
 
-    (repo / ".gitattributes").write_text("hidden.py export-ignore\n", encoding="utf-8")
-    _write_lines(repo / "hidden.py", MAX_MODULE_LINES + 1)
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "hide transient giant from archives")
-    bad_commit = _git(repo, "rev-parse", "HEAD")
-    (repo / ".gitattributes").unlink()
-    (repo / "hidden.py").unlink()
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "remove hidden giant")
+    [error] = validate_size_ratchet_transition_against_base(repo, "deadbeef" * 5)
+    assert "fabricated base" in error or "does not match the parent's own tree" in error
 
-    assert validate_size_ratchet(repo) == [f"{bad_commit[:12]}: GIANT_PATHS missing live entry: 'hidden.py'"]
+
+def test_interval_rationale_form_allows_legal_reentry_and_blocks_drops(tmp_path: Path) -> None:
+    """Across an interval a band path may legally retire and re-enter with a
+    fresh rationale (every adjacent step green): the pairwise interval form
+    accepts the changed rationale and rejects a dropped or blank one. The
+    adjacent form keeps byte-equality."""
+    from ouroboros.review import parse_size_ratchet_manifest, validate_manifest_transition
+    import scripts.regenerate_size_ratchet as regen
+
+    base = _manifest(band_paths={"mod.py": "old reason"}, sha="a" * 40)
+    tip_fresh = _manifest(band_paths={"mod.py": "fresh reason"}, sha="a" * 40)
+    tip_dropped = _manifest(band_paths={"mod.py": None}, sha="a" * 40)
+
+    def _parse(manifest):
+        return parse_size_ratchet_manifest(regen._render(manifest))
+
+    assert validate_manifest_transition(_parse(tip_fresh), _parse(base), adjacent=False) == []
+    assert validate_manifest_transition(_parse(tip_fresh), _parse(base)) == [
+        "surviving band rationale is immutable: mod.py"
+    ]
+    assert validate_manifest_transition(_parse(tip_dropped), _parse(base), adjacent=False) == [
+        "band rationale dropped across the interval: mod.py"
+    ]
+    # Blank strings are refused at the parse boundary ("nonblank or None"), so
+    # a rendered manifest can never carry one; the transition guard still
+    # treats a directly constructed blank rationale as a drop (defense in
+    # depth for in-memory candidates that bypass the parser).
+    for blank in ("", "   "):
+        tip_blank = _manifest(band_paths={"mod.py": blank}, sha="a" * 40)
+        assert validate_manifest_transition(tip_blank, _parse(base), adjacent=False) == [
+            "band rationale dropped across the interval: mod.py"
+        ]
+
+
+def _merge_commit_without_manifest(repo: Path, manifest: SizeRatchetManifest) -> str:
+    """HEAD becomes a merge whose TREE lacks the manifest but whose second parent carries it."""
+    local = _git(repo, "rev-parse", "HEAD")
+    local_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    _git(repo, "checkout", "-q", "-b", "official")
+    _write_manifest(repo, manifest)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "official manifest")
+    official = _git(repo, "rev-parse", "HEAD")
+    merge = _git(repo, "commit-tree", local_tree, "-p", local, "-p", official, "-m", "merge official")
+    _git(repo, "checkout", "-q", "-")
+    _git(repo, "reset", "-q", "--hard", merge)
+    return official
+
+
+def test_previous_manifest_resolves_through_any_merge_parent(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo)
+    official_manifest = _manifest(sha=baseline)
+    _merge_commit_without_manifest(repo, official_manifest)
+
+    assert resolve_committed_manifest_text(repo) == regenerate._render(official_manifest)
+
+    # The live manifest is validated as a TRANSITION against the merge
+    # parent's manifest — not accepted as a fresh bootstrap.
+    _write_lines(repo / "big.py", MAX_MODULE_LINES + 1)
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"big.py"}), sha=baseline))
+    errors = validate_size_ratchet(repo)
+    assert "new module debt above 1600 lines: big.py" in errors
+
+    # And a debt-free live tree with the parent's manifest text is green.
+    (repo / "big.py").unlink()
+    _write_manifest(repo, official_manifest)
+    assert validate_size_ratchet(repo) == []
+
+
+def test_generator_previous_resolves_through_merge_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _bootstrap_repo(repo)
+    inherited_sha = "f" * 40
+    _merge_commit_without_manifest(repo, _manifest(sha=inherited_sha))
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+
+    generated = regenerate._next_manifest({})
+
+    # Bootstrap would have stamped the merge HEAD; inheriting the merge
+    # parent's baseline proves the previous manifest resolved merge-aware.
+    assert generated.baseline_source_sha == inherited_sha
 
 
 def test_ref_inventory_reads_unsubstituted_git_blob_bytes(tmp_path: Path) -> None:
@@ -595,18 +748,43 @@ def test_ref_inventory_reads_unsubstituted_git_blob_bytes(tmp_path: Path) -> Non
     assert module._source_text == source
 
 
-def test_bootstrap_manifest_must_equal_exact_baseline_inventory(tmp_path: Path) -> None:
+def test_bootstrap_accepts_the_current_tree_as_its_own_authority(tmp_path: Path) -> None:
+    """Rewritten replay pin (was: bootstrap must equal the exact baseline-SHA
+    inventory, and only while ``BASELINE_SOURCE_SHA == HEAD``). A checkout with
+    no committed manifest anywhere now bootstraps from its own tree: existing
+    debt is grandfathered by the manifest that records it exactly, and the
+    baseline SHA is provenance, not a HEAD anchor — a fork adopting the
+    ratchet is never trapped."""
     repo = tmp_path / "repo"
-    baseline = _bootstrap_repo(repo)
-    _write_lines(repo / "new.py", MAX_MODULE_LINES + 1)
-    _write_manifest(repo, _manifest(giant_paths=frozenset({"new.py"}), sha=baseline))
+    _bootstrap_repo(repo, files={"big.py": "x\n" * (MAX_MODULE_LINES + 1)})
+
+    # Uncommitted bootstrap with a foreign baseline SHA: accepted.
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"big.py"}), sha="b" * 40))
+    assert validate_size_ratchet(repo) == []
+
+    # A committed self-authorizing bootstrap is equally green.
     _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "self-authorizing bootstrap")
+    _git(repo, "commit", "-qm", "self-grandfathering bootstrap")
+    assert validate_size_ratchet(repo) == []
 
-    assert "bootstrap: GIANT_PATHS contains stale entry: 'new.py'" in validate_size_ratchet(repo)
+
+def test_bootstrap_baselines_must_match_the_bootstrap_tree(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    head = _bootstrap_repo(repo)
+    _write_manifest(
+        repo,
+        _manifest(band_baseline_paths=frozenset({"phantom.py"}), sha=head),
+    )
+
+    errors = validate_size_ratchet(repo)
+
+    assert errors == ["bootstrap: BAND_BASELINE_PATHS differs from the bootstrap candidate inventory"]
 
 
-def test_clean_bootstrap_requires_accessible_parent_authority(tmp_path: Path) -> None:
+def test_shallow_clone_validates_without_baseline_ancestry(tmp_path: Path) -> None:
+    """Rewritten replay pin (was: a depth-1 clone failed closed on inaccessible
+    ancestry). The merge-aware previous resolves from HEAD's own tree, so a
+    shallow clone validates exactly like a deep one."""
     source = tmp_path / "source"
     parent = _bootstrap_repo(source)
     _write_manifest(source, _manifest(sha=parent))
@@ -624,9 +802,7 @@ def test_clean_bootstrap_requires_accessible_parent_authority(tmp_path: Path) ->
         check=True,
     )
 
-    assert validate_size_ratchet(shallow) == [
-        "size-ratchet transition authority unavailable: BASELINE_SOURCE_SHA ancestry is inaccessible"
-    ]
+    assert validate_size_ratchet(shallow) == []
     assert validate_size_ratchet(deep) == []
 
 
@@ -788,7 +964,7 @@ def test_generator_candidate_allows_tracked_source_deletion(tmp_path: Path, monk
     assert generated.giant_paths == frozenset()
 
 
-def test_manifest_render_is_deterministic_and_checked_in_generator_is_exact() -> None:
+def test_manifest_render_is_deterministic() -> None:
     manifest_a = _manifest(
         giant_paths=frozenset({"z.py", "a.py"}),
         function_debt=frozenset({("z.py", "z"), ("a.py", "A.run")}),
@@ -803,6 +979,11 @@ def test_manifest_render_is_deterministic_and_checked_in_generator_is_exact() ->
     )
     assert regenerate._render(manifest_a) == regenerate._render(manifest_b)
 
+
+@pytest.mark.size_ratchet
+def test_checked_in_manifest_generator_check_is_exact() -> None:
+    """Live-tree half of the old determinism test: rides the official-CI-only
+    ``size_ratchet`` lane (render determinism above stays in the local lanes)."""
     result = subprocess.run(
         [sys.executable, "scripts/regenerate_size_ratchet.py", "--check"],
         cwd=Path(__file__).parents[1],
@@ -811,6 +992,57 @@ def test_manifest_render_is_deterministic_and_checked_in_generator_is_exact() ->
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_generator_refuses_an_unmerged_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = tmp_path / "repo"
+    _bootstrap_repo(repo, files={"x.py": "x = 1\n"})
+    _git(repo, "checkout", "-q", "-b", "side")
+    (repo / "x.py").write_text("x = 2\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "side change")
+    _git(repo, "checkout", "-q", "-")
+    (repo / "x.py").write_text("x = 3\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "main change")
+    merge = subprocess.run(
+        ["git", "merge", "side"], cwd=repo, check=False, capture_output=True, text=True
+    )
+    assert merge.returncode != 0
+    assert _git(repo, "ls-files", "-u")
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+
+    with pytest.raises(ValueError, match="merge in progress: resolve conflicts first"):
+        regenerate._next_manifest({})
+
+
+def test_generator_validates_the_candidate_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E4 fix: a red candidate never reaches disk. The bootstrap candidate is
+    seeded from exact HEAD blobs, so a live tree that diverged from HEAD makes
+    the rendered manifest invalid — previously it was written first and the
+    failure left the wrong manifest behind."""
+    repo = tmp_path / "repo"
+    _bootstrap_repo(repo, files={"old.py": "x\n" * (MAX_MODULE_LINES + 1)})
+    (repo / "old.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+
+    assert regenerate.main([]) == 2
+    assert not (repo / "ouroboros" / "size_ratchet_manifest.py").exists()
+
+
+def test_generator_writes_a_validated_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = tmp_path / "repo"
+    _bootstrap_repo(repo)
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+
+    assert regenerate.main([]) == 0
+    assert (repo / "ouroboros" / "size_ratchet_manifest.py").exists()
+    assert validate_size_ratchet(repo) == []
+    assert validate_size_ratchet_candidate(
+        repo, (repo / "ouroboros" / "size_ratchet_manifest.py").read_text(encoding="utf-8")
+    ) == []
 
 
 def test_health_metrics_use_the_same_inventory(tmp_path: Path) -> None:
@@ -826,3 +1058,95 @@ def test_health_metrics_use_the_same_inventory(tmp_path: Path) -> None:
     assert metrics["total_lines"] == sum(item.line_count for item in inventory.modules)
     assert f"**Analyzed:** {len(inventory.modules)} files" in report
     assert f"**Functions:** {len(inventory.functions)}" in report
+
+
+def test_health_report_renders_size_ratchet_findings_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``codebase_health`` renders the dedicated warn-only findings section
+    naming the enforcing surface (official CI) when the validator reports
+    findings, and omits it — reporting the green line instead — when the
+    validator returns none."""
+    from ouroboros import review as review_module
+
+    (tmp_path / "runtime.py").write_text("x = 1\n", encoding="utf-8")
+
+    finding = "byte debt grew: ouroboros/example.py 200001 -> 200002"
+    monkeypatch.setattr(review_module, "validate_size_ratchet", lambda *_a, **_k: [finding])
+    report = _codebase_health(SimpleNamespace(repo_dir=tmp_path))
+    assert "### Size-Ratchet Findings (official CI will enforce)" in report
+    assert f"  - {finding}" in report
+
+    monkeypatch.setattr(review_module, "validate_size_ratchet", lambda *_a, **_k: [])
+    report = _codebase_health(SimpleNamespace(repo_dir=tmp_path))
+    assert "Size-Ratchet Findings" not in report
+    assert "Size-ratchet manifest is exact and shrink-only against the committed authority" in report
+
+
+def test_staged_tree_is_read_without_taking_the_live_index_lock(tmp_path: Path) -> None:
+    """The validator must not die on a concurrent ``.git/index.lock``.
+
+    ``git write-tree`` holds ``index.lock`` with ``LOCK_DIE_ON_ERROR``, so a
+    parallel ``git status``/``git diff`` refresh of the same checkout (xdist
+    workers, an agent shell) used to kill ``validate_size_ratchet`` with exit
+    128 (CI run 31967137491). The staged tree is read from a private index copy.
+    """
+    from ouroboros.review import _staged_tree_without_index_lock
+
+    repo = tmp_path / "repo"
+    _bootstrap_repo(repo)
+    (repo / "staged.py").write_text("y = 2\n", encoding="utf-8")
+    _git(repo, "add", "staged.py")
+    expected = _git(repo, "write-tree")
+    assert expected != _git(repo, "rev-parse", "HEAD^{tree}")
+
+    lock = repo / ".git" / "index.lock"
+    lock.write_bytes(b"")
+    try:
+        # The fixture reaches the guarded branch: the plain command really dies here.
+        with pytest.raises(subprocess.CalledProcessError):
+            _git(repo, "write-tree")
+        assert _staged_tree_without_index_lock(repo) == expected
+        assert lock.exists()
+    finally:
+        lock.unlink(missing_ok=True)
+    assert _staged_tree_without_index_lock(repo) == expected
+
+
+def test_function_inventory_parses_each_distinct_module_text_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One validation run inventories several trees sharing unchanged blobs.
+
+    A function inventory is a pure function of (path, text): it is parsed once
+    and reused, so a run that inventories the live tree, the staged index, and
+    HEAD/parent refs (pairwise transition) scales with distinct module texts,
+    not with trees x modules. A different text or a different path under the
+    same text is a cache miss.
+    """
+    from ouroboros import review as review_module
+    from ouroboros.review import GatedModule, _iter_gated_functions_from_modules
+
+    calls: list[str] = []
+    real_parse = review_module.ast.parse
+
+    def counting_parse(source, filename="<unknown>", *args, **kwargs):
+        calls.append(filename)
+        return real_parse(source, filename, *args, **kwargs)
+
+    monkeypatch.setattr(review_module.ast, "parse", counting_parse)
+    monkeypatch.setattr(review_module, "_MODULE_FUNCTIONS_CACHE", {})
+    text_a = "def one():\n    return 1\n\n\nclass K:\n    def two(self):\n        return 2\n"
+    text_b = text_a + "\n\ndef three():\n    return 3\n"
+    module = GatedModule("ouroboros/example.py", 7, len(text_a), text_a)
+
+    first = tuple(_iter_gated_functions_from_modules([module]))
+    second = tuple(_iter_gated_functions_from_modules([module]))
+    assert first == second
+    assert [f.qualname for f in first] == ["one", "K.two"]
+    assert calls == ["ouroboros/example.py"]
+
+    tuple(_iter_gated_functions_from_modules([GatedModule("ouroboros/example.py", 11, len(text_b), text_b)]))
+    tuple(_iter_gated_functions_from_modules([GatedModule("ouroboros/other.py", 7, len(text_a), text_a)]))
+    assert calls == ["ouroboros/example.py", "ouroboros/example.py", "ouroboros/other.py"]
+
+    with pytest.raises(ValueError, match="invalid syntax"):
+        tuple(_iter_gated_functions_from_modules([GatedModule("ouroboros/bad.py", 1, 8, "def (:\n")]))

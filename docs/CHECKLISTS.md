@@ -113,12 +113,12 @@ or Intent/Scope checklists are.
 | # | Check | How |
 |---|-------|-----|
 | 1 | `VERSION`, `README.md` badge, `docs/ARCHITECTURE.md` header, and the latest git tag — are all four carrying the *author-facing* spelling (for example `4.50.0-rc.3`)? And does `pyproject.toml` carry the **PEP 440 canonical form** of that same version (for example `4.50.0rc3`)? | `read_file` each file before editing. Never reconstruct version strings from memory — the in-context copy may be stale. The `VERSION` vs `pyproject.toml` divergence is intentional: `pyproject.toml` must satisfy PEP 440 so pip / build / twine accept it, while `VERSION` / tags / README / ARCHITECTURE use the author-facing spelling. `tests/test_packaging_sync.py::test_version_file_and_pyproject_are_synced` enforces the relationship via `ouroboros.tools.release_sync._normalize_pep440`. |
-| 2 | Preparing any commit → is `VERSION` bumped? | Under BIBLE.md P9, every commit is a release. A `VERSION` bump is mandatory for every commit, including docs/config/memory changes. Update `VERSION`, `pyproject.toml`, `README.md`, and `docs/ARCHITECTURE.md` together. |
+| 2 | Preparing any commit → is `VERSION` bumped? | Under BIBLE.md P9, every commit is a release. A `VERSION` bump is mandatory for every commit, including docs/config/memory changes. Update `VERSION`, `pyproject.toml`, `README.md`, and `docs/ARCHITECTURE.md` together. Exception: external contribution commits are version-neutral per P9 (proposed) / CONTRIBUTING.md — the maintainer's integration commit performs the bump, so unchanged carriers on a contributor PR are correct. |
 | 3 | New or changed logic → does an existing or newly staged test assert on the specific scenario it introduces? | Name the scenario your code handles in plain words. If no test asserts on THAT named scenario, write or update one now. "Tests exist for the module" is not the same as "tests cover this new behavior". |
 | 4 | Shared log / memory / replay format changed? | Grep every reader and writer first. JSONL logs (`events.jsonl`, `task_reflections.jsonl`, replay indexes), durable state files (`advisory_review.json`, `review_continuations/*.json`), and canonical-vs-derived memory pairs (patterns-register journal / `patterns.md`, improvement-backlog items) must stay coherent across every consumer. |
 | 5 | New validation guard, input filter, or edge-case check? | Before the first commit attempt, name three concrete ways it could break: wrong bounds, legitimate inputs it silently blocks, platform-specific edge cases. If you cannot name three, think longer. One honest minute here is cheaper than one reviewer round. |
 | 6 | New tool added? | `get_tools()` exports it, `prompts/SYSTEM.md` tool tables mention it, the handler signature matches the declared schema, and (if it mutates repo state) it is routed through the reviewed commit path rather than ad-hoc `run_command`. Also add an explicit entry in `ouroboros/safety.py::TOOL_POLICY` (`POLICY_SKIP` for trusted built-ins, `POLICY_CHECK` for opaque or outward-facing ones) — the `test_tool_policy_covers_all_builtin_tools` invariant will fail otherwise, and without an entry the tool falls through to `DEFAULT_POLICY = check` and pays a light-model LLM call per invocation. |
-| 7 | Tests green before first `commit_reviewed`? | Run `pytest -x` on the narrowest relevant target(s) you can name before the first `advisory_review` / `commit_reviewed` attempt. If a new `.py` file is added under `ouroboros/` or `supervisor/`, **always** run `pytest tests/test_smoke.py` first — module-size and function-count violations are cheap to catch locally and expensive in review. A red test suite before the first commit attempt has caused repeated $2-5 blocked-review cycles. |
+| 7 | Tests green before first `commit_reviewed`? | Run `pytest -x` on the narrowest relevant target(s) you can name before the first `advisory_review` / `commit_reviewed` attempt. Size gates no longer block locally: they live in the official-CI-only `size_ratchet` pytest lane (manifest exactness plus the pairwise base-vs-tip shrink-only transition), and local surfaces (`check_worktree_readiness`, `codebase_health`) surface the same `validate_size_ratchet` findings as "official CI will enforce" warnings. When a size warning appears — or a new `.py` file lands under `ouroboros/` or `supervisor/` — run `pytest tests/ -m size_ratchet` and `scripts/regenerate_size_ratchet.py` locally to preview and fix what official CI would reject. A red test suite before the first commit attempt has caused repeated $2-5 blocked-review cycles. |
 | 8 | Adding a `README.md` version row? | BIBLE.md P9 hard cap: ≤ 2 major, ≤ 5 minor, ≤ 5 patch visible entries. Categories are mutually exclusive: major = `X.0.0` (minor=0, patch=0); minor = `X.Y.0` (patch=0, Y≠0); patch = all other `X.Y.Z` (Z≠0). Count existing rows in the category you are adding to. Easy check: `run_command(["python", "-c", "import sys; from ouroboros.tools.release_sync import check_history_limit; warns=check_history_limit(open('README.md').read()); print(warns or 'OK')"])` — if it prints warnings, trim the oldest row in the over-limit category **in the same edit** before committing. |
 | 9 | Changing any of `build.sh`, `build_linux.sh`, `build_windows.ps1`, `Dockerfile`, or `ouroboros/tools/browser.py`? | Cross-surface doc sync is mandatory. Check ALL of: `README.md` Install section (Linux native-lib caveat), `README.md` Build section (per-platform instructions), `docs/ARCHITECTURE.md` browser tools paragraph, WebKit/mobile verification notes, and inline comments in the touched build script. Any one of these being stale has blocked review twice. Verify before staging. |
 | 10 | Changing `ouroboros/tools/commit_gate.py`? | Coupled surfaces that MUST be updated atomically in the same commit: (a) `claude_advisory_review.py::get_tools()` tool description for `advisory_review` and `review_status`; (b) `claude_advisory_review.py::_next_step_guidance()` strings; (c) `docs/DEVELOPMENT.md` Review & Commit Protocol section; (d) `prompts/SYSTEM.md` Commit review section. Missing any one has blocked review. |
@@ -157,13 +157,13 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
 | # | item | what to check | severity when FAIL |
 |---|------|---------------|--------------------|
 | 1 | bible_compliance | Does the diff violate any BIBLE.md principle? | critical |
-| 2 | development_compliance | Does it follow DEVELOPMENT.md patterns? Check explicitly: (a) naming conventions (snake_case modules/vars, PascalCase classes, UPPER_SNAKE_CASE constants); (b) entity type rules — Gateway classes contain ONLY transport, no business logic; Tool functions are thin wrappers; (c) Python everywhere (including `tests/`/`devtools/`) and first-party `web/**/*.js` (including `web/tests/`) target ~1000 lines; exact repo-relative module debt above the 1600-line hard gate, exact `(path, qualname)` Python-function debt above 300 lines, the exact-current 1001-1500 band (new/re-entered paths need a nonblank rationale), and exact byte debt above 200,000 canonical UTF-8/LF bytes are checked in to `ouroboros/size_ratchet_manifest.py`, stale entries fail, methods above 150 lines are a decomposition signal, runtime-code total Python function/method count stays under `ouroboros/review.py::MAX_TOTAL_FUNCTIONS`, and more than eight parameters is a decomposition signal, not a hard gate; (d) no gratuitous abstract layers, and any SOLID/minimalism finding names an exact symbol/authority, concrete duplication or coupling, and a smaller contract-preserving alternative rather than citing diff size (P7 Minimalism) — and when the diff ADDS a surface (a new module, state file, ledger, resolver, cache, retry path, tool, endpoint, or background loop), the reviewer consults the docs/ARCHITECTURE.md map and NAMES the existing mechanism that already covers the need when one exists (the same generative duty the plan reviewer carries: "an existing function/module that already solves this, named exactly"); absence of a covering mechanism may be stated in one line; (e) new LLM calls go through the shared `LLMClient`/`llm.py` layer, not ad-hoc HTTP clients; (f) cognitive artifacts (identity.md, scratchpad, task reflections, review outputs) must NOT use hardcoded `[:N]` truncation — explicit omission notes required; (g) new `get_tools()` exports follow the ToolEntry pattern in registry.py; (h) provider independence — no change may make a core capability (agent loop, multi-model commit review, scope review, or memory/context flows) silently require a second provider or OpenRouter specifically, and every supported single direct provider (local, OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat) must keep its model AND review/scope slots self-fillable (see DEVELOPMENT.md "Provider Independence"); (i) a claimed-complete visible UI change includes vision-inspected evidence from at least one relevant real consumer flow. A screenshot file without inspection is insufficient; states/viewports/additional engines are risk-selected, mobile/WebKit are not universal, and an unavailable optional engine alone is not degradation. | critical |
+| 2 | development_compliance | Does it follow DEVELOPMENT.md patterns? Check explicitly: (a) naming conventions (snake_case modules/vars, PascalCase classes, UPPER_SNAKE_CASE constants); (b) entity type rules — Gateway classes contain ONLY transport, no business logic; Tool functions are thin wrappers; (c) Python everywhere (including `tests/`/`devtools/`) and first-party `web/**/*.js` (including `web/tests/`) target ~1000 lines; exact repo-relative module debt above the 1600-line hard gate, exact `(path, qualname)` Python-function debt above 300 lines, the exact-current 1001-1500 band (new/re-entered paths need a nonblank rationale), and exact byte debt above 200,000 canonical UTF-8/LF bytes are checked in to `ouroboros/size_ratchet_manifest.py`; the enforcing surface for all of these (and for `MAX_TOTAL_FUNCTIONS`) is the official repository CI's `size_ratchet` pytest lane — manifest exactness on the tip tree plus the pairwise base-vs-tip shrink-only transition — while local runs surface the same `validate_size_ratchet` findings as warnings (a stale or growing entry is therefore review debt to flag, not a local commit block); methods above 150 lines are a decomposition signal, runtime-code total Python function/method count stays under `ouroboros/review.py::MAX_TOTAL_FUNCTIONS`, and more than eight parameters is a decomposition signal, not a hard gate; (d) no gratuitous abstract layers, and any SOLID/minimalism finding names an exact symbol/authority, concrete duplication or coupling, and a smaller contract-preserving alternative rather than citing diff size (P7 Minimalism) — and when the diff ADDS a surface (a new module, state file, ledger, resolver, cache, retry path, tool, endpoint, or background loop), the reviewer consults the docs/ARCHITECTURE.md map and NAMES the existing mechanism that already covers the need when one exists (name it exactly — the reuse-first duty this checklist carries for a CHANGE; the plan-review checklist judges an intention and has no such generative duty); absence of a covering mechanism may be stated in one line; (e) new LLM calls go through the shared `LLMClient`/`llm.py` layer, not ad-hoc HTTP clients; (f) cognitive artifacts (identity.md, scratchpad, task reflections, review outputs) must NOT use hardcoded `[:N]` truncation — explicit omission notes required; (g) new `get_tools()` exports follow the ToolEntry pattern in registry.py; (h) provider independence — no change may make a core capability (agent loop, multi-model commit review, scope review, or memory/context flows) silently require a second provider or OpenRouter specifically, and every supported single direct provider (local, OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat) must keep its model AND review/scope slots self-fillable (see DEVELOPMENT.md "Provider Independence"); (i) a claimed-complete visible UI change includes vision-inspected evidence from at least one relevant real consumer flow. A screenshot file without inspection is insufficient; states/viewports/additional engines are risk-selected, mobile/WebKit are not universal, and an unavailable optional engine alone is not degradation. | critical |
 | 3 | secrets_check | Are secrets, API keys, .env files, credentials present in the diff? | critical |
 | 4 | code_quality | Careful code review: bugs, logic errors, crashes, regressions, race conditions, resource leaks? | critical |
 | 5 | security_issues | Security vulnerabilities: injection, path traversal, secret leakage, unsafe operations? | critical |
 | 6 | tests_affected | Did code logic change without corresponding test changes? (PASS if only docs/config/memory changed, or if tests already cover the new behavior.) **Critical FAIL requires all three:** (a) name a specific behavior, code path, symbol, or failure scenario that THIS diff introduces or changes; (b) explain why existing or newly staged tests do NOT catch that specific scenario; (c) the gap is concrete, not speculative. Adjacent tests in the same module or for the same feature count as coverage. Requiring an additional overlapping selector/unit/e2e test is only justified when a second distinct failure mode is named explicitly. If the only concern is "I'd feel better with one more test," that is advisory, not critical. | critical |
 | 7 | architecture_doc | New module, endpoint, or data flow added but ARCHITECTURE.md not updated? (Write "Not applicable" with PASS if no architectural change.) | critical |
-| 8 | version_bump | Does this commit leave VERSION unchanged, or leave release artifacts out of sync? | critical |
+| 8 | version_bump | Does this commit leave VERSION unchanged, or leave release artifacts out of sync? Exception: external contribution commits are version-neutral per P9 (proposed) / CONTRIBUTING.md — the maintainer's integration commit performs the bump; unchanged carriers on a contributor PR are correct, not a FAIL. | critical |
 | 9 | changelog_and_badge | VERSION bumped but README.md badge or changelog not updated? (PASS if VERSION not bumped.) | critical |
 | 10 | tool_registration | New tool function added but not exported in `get_tools()` OR missing explicit entry in `ouroboros/safety.py::TOOL_POLICY`? (PASS if no new tool.) Both surfaces are required: `get_tools()` makes the tool visible; `TOOL_POLICY` makes the per-call safety routing explicit and is guarded by the `test_tool_policy_covers_all_builtin_tools` invariant. | critical |
 | 11 | context_building | New data/memory files that should appear in LLM context (context.py) but don't? | advisory |
@@ -173,23 +173,28 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
 | 15 | cross_platform | Does the diff use platform-specific APIs (`os.kill`, `os.setsid`, `os.killpg`, `os.getpgid`, `fcntl`, `msvcrt`, `signal.SIGKILL`, `signal.SIGTERM`, `subprocess` with `start_new_session`/`creationflags`, hardcoded `/` or `\\` in filesystem paths) outside of `ouroboros/platform_layer.py`? Does it import Unix-only or Windows-only modules (`fcntl`, `msvcrt`, `winreg`, `resource`) at any level without a platform guard (`sys.platform`/`IS_WINDOWS` check)? | critical |
 | 16 | changelog_accuracy | Do the exact wording, test counts, and minor description details in the README Version History row match what the diff actually does? Wording drift, off-by-one test counts, minor inaccuracies in descriptive prose — these belong here, NOT in `self_consistency` or `changelog_and_badge`. This item exists so reviewers have a dedicated advisory bucket for prose-level changelog imprecision that does not affect release metadata, runtime behavior, or safety contracts. | advisory |
 | 17 | gateway_parity | If the diff changes any browser-facing endpoint, WebSocket message, or frontend API call, are `ouroboros/gateway/contracts.py`, `ouroboros/gateway/router.py`, `web/modules/api_client.js`, `web/modules/api_types.js`, and `tests/test_gateway_parity.py` still aligned? Missing alignment is advisory unless it also breaks a frozen contract, safety guard, release metadata, or runtime behavior. | advisory |
-| 18 | subagent_isolation | If the diff changes `schedule_subagent`, child-task queueing, task constraints, tool discovery/execution, data reads, or memory handoff, does it preserve the accepted live-subagent contract: strict `objective` + `expected_output` schema, inferred lineage/workspace/contract/deadline/resource inheritance, `local_readonly_subagent` schema and execute-time allowlist, subagent-scoped secret/control-file denial for data tools, nested readonly delegation only within configured depth/cap limits (since v6.87.7 depth bounds how deep delegation NESTS and never how strong a descendant is — since v6.87.26 an omitted lane INHERITS the parent's effective lane at every depth, an explicit lane is honored at every depth, and any child landing below what was asked for discloses it through `capability_delta` — since v6.87.28 the parent declares only `write_surface`/`model_lane`/`executor`, and model/effort/route/profile are derived by the ONE dispatch-time resolution `subagents.resolve_subagent_dispatch`, so a schedule-time surface must never mint a second answer), no arbitrary local writes/commits/review/runtime/tool-expansion/skills-lifecycle/shell (bounded media projection such as `extract_video_frames` may write derived outputs only under `artifact_store/video_frames` through a host-owned command shape), enabled external tools allowed only by owner policy and inherited resources, the subagent browser boundary (external HTTP(S) + `file://` scoped to `workspace_root` + loopback EXCEPT Ouroboros control-plane ports; private/link-local/reserved/DNS-rebind still blocked; `evaluate` JS unavailable; `vlm_query`/`analyze_screenshot` available), full task-result handoff, new/changed wait/timeout paths for cognitive work using progress-aware/re-decidable waiting rather than a fixed cutoff that discards in-flight work (P5), and tests for both allowed and blocked paths? | critical |
+| 18 | subagent_isolation | If the diff changes `schedule_subagent`, child-task queueing, task constraints, tool discovery/execution, data reads, or memory handoff, does it preserve the accepted live-subagent contract: strict `subagent_id` + `objective` + `expected_output` schema, inferred lineage/workspace/contract/deadline/resource inheritance, `local_readonly_subagent` schema and execute-time allowlist, subagent-scoped secret/control-file denial for data tools, nested readonly delegation only within configured depth/cap limits (depth bounds how deep delegation NESTS, never actor strength; every new call names `subagent_id`, the scheduler snapshots the exact normalized `ConfiguredSubagent` route at task start, and a session choice starts that exact route or returns a typed refusal; the model-visible schema must not expose `model_lane`/`executor`, while hidden legacy selectors map deterministically to one migrated row or return `subagent_selection_required`), no arbitrary local writes/commits/review/runtime/tool-expansion/skills-lifecycle/shell (bounded media projection such as `extract_video_frames` may write derived outputs only under `artifact_store/video_frames` through a host-owned command shape), enabled external tools allowed only by owner policy and inherited resources, the subagent browser boundary (external HTTP(S) + `file://` scoped to `workspace_root` + loopback EXCEPT Ouroboros control-plane ports; private/link-local/reserved/DNS-rebind still blocked; `evaluate` JS unavailable to `local_readonly_subagent`, available to a valid `acting_subagent` on its current page; `vlm_query`/`analyze_screenshot` available), full task-result handoff, new/changed wait/timeout paths for cognitive work using progress-aware/re-decidable waiting rather than a fixed cutoff that discards in-flight work (P5), and tests for both allowed and blocked paths? | critical |
 | 19 | evolution_durability | If the diff touches `supervisor/git_ops.py`, `launcher.py`, `server.py`, `ouroboros/preflight_runner.py`, `ouroboros/tools/review_helpers.py`, `ouroboros/tools/git.py`, tests, review gates, or evolution code, does it preserve hermetic preflight, live repo/data mutation fuses, remote-optional local commit success, and transaction/rescue evidence for interrupted self-modification? | critical |
 | 20 | context_budget_ssot | If the diff changes context-size budgets/constants (`ouroboros/context_budget.py`), the context layout/manifest, a section's tier/policy, or the typed ContextFit deficit/reclaim contract: does it keep the low/max context split coherent (single SSOT + both profiles + docs + drift-guard tests in sync), preserve the tier-0 always-full core (BIBLE/SYSTEM/identity/scratchpad/knowledge-index/recent-dialogue) in EVERY mode, use a visible on-demand pointer instead of silent truncation (P1), and leave the blocking scope-reviewer >=1M floor untouched wherever scope review applies? Since v6.80.0 the owner-only `OUROBOROS_CONTEXT_MODE` ALSO decides scope-review applicability (`max`: blocking ≥1M gate; `low`: declaredly not performed with a typed skip row), so any change that widens what `low` mode implies, or that lets the AGENT reach that setting, is an immune-system change under P3 — not a context-budget tweak. (PASS with "Not applicable" if no context-budget/layout change.) | critical |
 | 21 | capability_regression | Does the diff REMOVE or NARROW a previously-supported user-facing behavior or capability — a tool/flag/mode/path that worked before now errors or is gated tighter (e.g. a new `is_dir`/existence guard that blocks a legitimate create, a tightened allowlist that drops a real path, a removed fallback)? If so, is it INTENTIONAL and disclosed as a breaking/capability change in the commit message + changelog? Accidental capability removal is the failure class this item names. Ask whether a golden "from zero" test would have caught it. Severity follows the `Critical surface whitelist` below — silently removing a documented capability or a safety/release contract is critical; a deliberate, disclosed narrowing or an internal-only refactor is advisory. **Standing disclosure (v6.80.0), do not re-raise as an undisclosed removal:** the audited owner-opt-in DEGRADED ADVISORY scope review was REMOVED as a capability, together with `OUROBOROS_SCOPE_REVIEW_DEGRADED`. By owner decision the frozen gateway surface of `OUROBOROS_SCOPE_REVIEW_FLOOR` is NOT removed: the endpoint, contract field, route, merge-skip, web client and all three self-lowering guards stay, the stored value is preserved, and every write is answered with an explicit deprecation notice — the key is simply ENFORCEMENT-INERT (nothing consults it, no getter exists). Whether the P3 blocking scope review applies is decided solely by the owner-only `OUROBOROS_CONTEXT_MODE`, read as the owner-selected value through `config.get_owner_context_mode`; persistent system auto-Low and settings-time model downgrades are retired, so only the owner endpoint authors stored Low. The REPLACEMENT PATH for an install with no ≥1M-context reviewer (fully local, GigaChat-only, single small provider) is the `low` context mode: whole-repository scope review is then declaredly NOT performed, every skipped commit records a typed `scope_review status="skipped_low_context_mode"` evidence row, and the diff-reviewer triad still blocks in every mode. Since the BIBLE P3 retrieving-scope amendment, `low` is no longer the only ADMITTED replacement path: the owner may instead declare a RETRIEVING scope reviewer (reads the surface itself through read-only tools; owner-selected per scope slot; context window established by sourced Capability Evidence at ≥200K tokens; every such review records a typed durable row naming the mode; opened artifacts recorded as forensic, non-certifying evidence) as a second, owner-declared AGENTIC DELIVERY of the same authoritative review — not a degraded fallback, in BIBLE P3's own words, once its four bounds hold. That mode is IMPLEMENTED — with its fourth BIBLE bound DISCLOSED AS UNIMPLEMENTED rather than claimed: the artifacts a session opened are not recorded, because the host cannot see them and no upstream Claudexor read-event capability exists yet, so the coverage manifest states that coverage is the session's own retrieval and is not host-attested. What IS implemented: the scope fan-out delivers an `agent_session` row through the review-execution seam, `scope_review_session` gates its blocking authority on SOURCED ≥200K window evidence (stale or unsourced evidence downgrades the row to a typed `session_advisory` whose findings are advisory AND which BLOCKS the commit for want of an authoritative verdict — the same shape as a sub-floor api row; returning a non-blocking row there made the P3 gate fail OPEN on an all-retrieving panel), the ≥200K floor is REACHABLE through the same owner-capability-ack the api slot uses (the scope-slot save offers session rows their ack against the session floor, fingerprinted under the `agent_session` provider rather than a guessed one), and every such review records a typed durable row naming the mode. Two costs are accepted explicitly by the owner: in `low` the whole-repository architectural review is lost even when a genuine ≥1M reviewer IS configured (the coupling is a POLICY choice, not a technical limit), and no partial-coverage reviewer remains that could be mistaken for the gate. The replacement path is REACHABLE: during the one compatibility window `OUROBOROS_CONTEXT_MODE_AUTO_LOW=false` is an inert owner-provenance tombstone, bare env Low remains owner Max, `/api/state.context_mode_auto_low` is the frozen literal `false`, and scope-slot changes still surface the pinned reviewer's `needs_ack` through the existing owner-capability-ack flow. Also disclosed: review-pack sizing is deliberately conservative — the review reducer takes the DENSEST still-fresh witnessed density times its safety factor and never sizes below the Claude-derived 1.65 cold floor (or the independent absolute-margin bound), so a lighter measured tokenizer does NOT earn a larger review pack; the cap may loosen back toward that floor only after the supporting dense witness expires, never because lighter traffic refreshed or evicted an unsupported maximum. Main-context density is the separate liberal reducer (newest fresh exact-route witness, then newest exact-model witness, then neutral 1.0) and is not floored. A stale stored degraded key is inert (every consumer iterates `SETTINGS_DEFAULTS`) and never fails settings validation. Since v6.87.44 blocking scope authority is a property of sourced, non-stale ≥1M Capability Evidence for the slot's route — the designated default carries no name-based authority and is probed (metadata-only, rate-limited by the evidence TTL, v6.87.45) like any pin; the no-evidence 1M sentinel only SIZES prompts and never signs a blocking verdict. The floor guard also became PRECISE rather than weaker, by INVERTED polarity: reaching the key or the owner endpoint is blocked unless the whole command line is demonstrably read-only inspection (per-segment command-head allowlist), so a pure `grep OUROBOROS_SCOPE_REVIEW_FLOOR data/settings.json` read is no longer blocked while an interpreter or HTTP client naming the endpoint is refused whatever verb spelling it carries. **Standing disclosure (v6.89.0), do not re-raise as an undisclosed narrowing:** the light-mode interpreter write fence is INVERTED — an inline invocation is refused unless python's AST proves it cannot write into the repo. The narrowing is bounded to what the owner approved: a non-python inline invocation that names the repo by an ABSOLUTE path, or by a `./`- or `../`-prefixed relative one, is refused even for reading. One that does not name the repo in one of those spellings still runs, whatever it writes elsewhere — the resolved-cwd test is python-only, because the DEFAULT shell cwd is the repository and applying it to every family refused ordinary `node -e` / `ruby -e` work outright. Measured, a PLAIN relative spelling does not count as naming the repo: `EMBEDDED_RELATIVE_PATH_RE` anchors on `./`/`../`, so `node -e "…('ouroboros/safety.py')"` names the repo to a reader but not to the scan and RUNS — for a write as much as for a read. Disclosed, not closed: widening the regex would be a strengthening. `drive`, `user_files` and advanced/pro are untouched: the non-python read-vs-write refinement was rolled back to the public head, which leaves a KNOWN write hole there (`node -e "require('fs').writeFileSync('<drive>/logs/chat.jsonl','')"` runs) — disclosed, not closed, under the owner's standing direction that protection may be weakened but not strengthened. Measured, that drive hole covers the NODE and PHP families in EVERY spelling: `node`, `nodejs`, `node18`, `php` and `php8.3` all reach another task's drive path unblocked (the versioned spellings blocked at the public head and no longer do; the unversioned ones were already open). It does NOT extend to ruby or perl — both are `LIGHT_SHELL_WRITER_COMMANDS` members, so `ruby`, `ruby3.2`, `perl` and `perl5.38` are still caught by the conservative full-mention scan on the earlier writer-command branch. One narrowing does ride with the inversion and is deliberate: python inline code is now inspected on `run_command`, not only on `run_script`. Three gaps are DISCLOSED rather than detected, and must not be re-raised as findings to fix. (a) No invariant ties the AST walker to the write-indicator regex: `<mod>.open(p,"w")` (io/codecs/gzip/bz2/lzma) counts as a write to the regex while the walker reads argument 0 as the MODE and can answer "no targets", which the fence reads as a proven read; measured, that truncates a repo source file. (b) Aliased writers escape the walker's vocabulary (`import shutil as sh`, `from shutil import copy`, `getattr(os,"replace")`). (c) The fence is a light-mode convenience boundary against the agent's own mistakes, not a containment boundary against a determined writer. **Standing disclosure (Q4=A sandbox unwind, owner decision 2026-08-08), do not re-raise as an undisclosed widening or narrowing:** the argv-text blanket `GIT_VIA_SHELL_BLOCKED` default lane was deliberately replaced by the target-aware `git_shell_policy.external_workspace_git_violation` resolver for ALL non-workspace shell lanes. Mutating git is free outside the Ouroboros runtime in every runtime mode including light and direct chat; read-only git is allowed even at runtime targets (the v4.5.1/f14baf8f false-block line); only mutating git that targets the system repo / data drives (bidirectional, casefold, symlink-resolved containment) is refused, with `commit_reviewed` as the remedy; acting `self_worktree` children keep the strict read-only git policy, and the `allowed_resources.network` fence and `gh repo create/delete`/`gh auth` blocks are unchanged. Disclosed residuals, not defects to fix: git launched through a transparent wrapper (`nice`/`xargs`) or from interpreter code is not classified by the deterministic guard (the pre-flip text classifier never saw the interpreter form either; the LLM safety layer and the light post-exec system-repo dirtiness tripwire remain), and `-c` alias/config indirection is not parsed. Completing that unwind, two composition rules are also standing and disclosed: `git init <dir>` / `git clone <url> <dir>` are judged by their DESTINATION rather than the cwd (the default lane's cwd IS the system repo, so the cwd verdict was a blanket false block; the destination is the last path-shaped operand with init/clone's own value-taking flags consumed; with no destination the cwd remains the target; `--flag=<path>` retargets stay checked by the flag's documented type while non-path flag values like `-b feature/x` are never resolved as paths; relative candidates are canonicalized like absolute ones), and in external-workspace mode the runtime/secret READ guard exempts commands proven read-only git in EVERY segment (`is_readonly_git_command`) — all-or-nothing, so a compound that merely starts with git still meets the full guard, and WRITE-aware, so a read-only subcommand carrying the diff `--output=<file>` option (which truncates the file) or `--no-index` (which reads arbitrary host files) does not ride the exemption; `--output` targets are containment-judged at the FILE, and only with those rules does "the credential surface is unchanged" hold. | advisory |
 | 22 | cache_friendliness | If the diff builds or reorders LLM prompt/context content (context builders, review prompt assembly, message construction in `llm.py` callers): does it keep prompt caching intact — stable governance/policy content BEFORE dynamic evidence, no dynamic values (timestamps, hashes, round counters, task ids) injected into a stable cached prefix, and no removal/breakage of existing `cache_control` markers or session/cache affinity keys? A change that silently fragments an existing cached prefix re-bills the full prompt on every repeat call. (PASS with "Not applicable" if no prompt/context assembly changed.) | advisory |
-| 23 | delegated_transport | If the diff touches the delegated execution/review transport (`ouroboros/subagents.py` dispatch/route-health, `ouroboros/tools/delegate.py`, `ouroboros/delegate_custody.py`, `ouroboros/delegate_progress.py`, `ouroboros/review_execution.py` session executors, `ouroboros/gateways/claudexor.py`, `ouroboros/claudexor_daemon.py`, `ouroboros/claudexor_runtime.py`), does it preserve the delegation invariants: capability reductions reach all three destinations (durable envelope, child prompt, parent result — D4); a result counts as received only after a hash-bound read to EOF and retries replay the recorded byte-identical body (D7); an unavailable pinned route is a TYPED blocker and `auto` falls back loudly, never a silent re-route onto another model/route (D28); quota exhaustion needs POSITIVE evidence judged against the route's own model (`applies_to_models` scoping, absence = unknown = usable); delegated spend settles through custody with unknown-never-rendered-as-zero and root/parent lineage; and no vendor/harness name is ever branched on in core? (PASS with "Not applicable" if no delegated-transport surface changed.) | critical |
-| 24 | perf_lifecycle | If the diff adds or changes an endpoint, poller, subscription, or timer, or reads a growing store (JSONL log, ledger, event table): does any interaction-path read scan an unbounded store per request/message/tick (a full-table read filtered in code is such a scan)? Is a subscription/observer/interval/listener added without a paired disposer? Does O(history) work run on a poll/stream path? Does a GET handler perform new steady-state durable writes outside the two named exceptions? The authoritative definitions are DEVELOPMENT.md "Invariant: Projection over replay (hot readers of growing stores)" and "Invariant: UI resources carry a disposer" — check against those, do not re-derive them here. (PASS with "Not applicable" if the diff touches none of these surfaces.) | advisory |
+| 23 | delegated_transport | If the diff touches the delegated execution/review transport (ouroboros/subagents.py dispatch/route-health, ouroboros/tools/delegate.py, ouroboros/delegate_custody.py, ouroboros/delegate_progress.py, ouroboros/review_execution.py session executors, ouroboros/gateways/claudexor.py, ouroboros/claudexor_daemon.py, ouroboros/claudexor_runtime.py), does it preserve the delegation invariants: capability reductions reach all three destinations (durable envelope, child prompt, parent result — D4); a result counts as received only after a hash-bound read to EOF and retries replay the recorded byte-identical body (D7); the exact selected subagent_id snapshot starts its exact session route with custody-durable requested→effective evidence or returns a TYPED refusal, and neither host dispatch nor tool preflight substitutes another session/API/native route — any fallback is a new explicit LLM selection; quota exhaustion needs POSITIVE evidence judged against the route's own model (applies_to_models scoping, absence = unknown = usable); delegated spend settles through custody with unknown-never-rendered-as-zero and root/parent lineage; and no vendor/harness name is ever branched on in core. For configured external work orders, verify the one total 250,000-character cap, byte-complete fitting orders, full-SHA/source-selector partial lenses only on a positively interactive route, typed cannot-verify refusal otherwise, byte-identical pending recovery of the stored compact body, durable STARTED/replay source state, an actor-readable `get_task_result` canonical range whose renderer is shared with exact source_response verification, a retry after `already_resolved` only when a durable prior delivered event binds the same interaction and exact source selector, terminal cannot_verify before complete interval coverage, and apply refusal until coverage is complete (reject remains available); a disclosed partial lens must never be treated as a complete contract. (PASS with "Not applicable" if no delegated-transport surface changed.) | critical |
+| 24 | perf_lifecycle | If the diff adds or changes an endpoint, poller, subscription, or timer, or reads a growing store (JSONL log, ledger, event table): does any interaction-path read scan an unbounded store per request/message/tick (a full-table read filtered in code is such a scan)? Is a subscription/observer/interval/listener added without a paired disposer? Does O(history) work run on a poll/stream path? Does a GET handler perform new steady-state durable writes outside the two named exceptions? The authoritative definitions are DEVELOPMENT.md "Invariant: Projection over replay (hot readers of growing stores)" and "Invariant: UI resources carry a disposer" — check against those, do not re-derive them here. For an embedded or framed UI surface, also use DEVELOPMENT.md "Invariant: Embedded surfaces declare geometry and refresh semantics" for host geometry/overflow, teardown, retry/error, and real-consumer visual evidence. (PASS with "Not applicable" if the diff touches none of these surfaces.) | advisory |
+| 25 | source_completeness | If any changed consumer can authorize PASS, a destructive rewrite, or replacement of a full contract, does its input distinguish complete from partial and carry a source reference the same actor can resolve? Does the consumer materialize every named omitted source before the decision, or abstain with the existing typed incomplete/degraded outcome? A marker or host claim alone is never sufficient. | critical when applicable |
+| 26 | actor_readable_projection | If the diff adds a bounded projection, omission marker, summary, or status count, can the actor who must decide read the exact canonical source through an existing path? Verify the ref, root, generation/range or ID, and the reader's ability to resolve it; host-unattested or merely hypothetical retrieval does not certify completeness. | critical when applicable |
+| 27 | canonical_memory_fork | If the diff touches Project/fork/execution roots, summaries, memory, or GC, does it preserve one canonical identity and distinguish authority/biography from execution-local state? Are referenced canonical artifacts promoted or retained before a child/root is collected, with missing legacy bytes represented as gaps? | critical when applicable |
+| 28 | review_artifact_continuity | If the diff changes plan, triad, scope, advisory, or acceptance evidence, are exact artifact bodies, source selectors, candidate SHA, reviewer model/profile/thread/route continuity, and all omissions retained? A bounded hot index or partial reviewer view must remain DEGRADED/NOT_RUN rather than PASS. | critical when applicable |
+| 29 | display_identity_replay | If the diff changes routing, steering, task cards, or history replay, does it preserve the event-time human `Project › Task` presentation snapshot in both live and replay paths while keeping opaque IDs as internal/debug facts? | advisory when applicable |
 
-**Standing note for item 21 (2026-08-15), do not re-raise as a missing successor class:** the delegated-coding target class lost in the D10 migration — editing one exact non-Git installed skill payload — is restored through `delegate_start(root="skill_payload", bucket, skill_name)` (private standalone snapshot, explicit parent CAS apply, review goes stale), with a golden registry-level test pinning it.
+**Standing note for item 21 (2026-08-15), do not re-raise as a missing successor class:** the delegated-coding target class lost in the D10 migration — editing one exact non-Git installed skill payload — is restored through `delegate_start(subagent_id=..., prompt=..., root="skill_payload", bucket=..., skill_name=...)` (private standalone snapshot, explicit parent CAS apply, review goes stale), with a golden registry-level test pinning it.
 
 ### Severity rules
 
 - Items 1-5 are always critical.
-- Items 6-10, 14-15, 18, 19, 20, and 23 are conditionally critical: FAIL only when the condition applies.
+- Items 6-10, 14-15, 18-20, 23, and 25-28 are conditionally critical: FAIL only when the condition applies.
   If the condition does not apply, write verdict PASS with a short reason
   (e.g. "Not applicable — no code logic change").
-- Items 11-12, 16-17, 22, and 24 are advisory: FAIL produces a warning but does not
+- Items 11-12, 16-17, 22, 24, and 29 are advisory: FAIL produces a warning but does not
   block. Item 22 (`cache_friendliness`) passes with "Not applicable" when the
   diff touches no prompt/context assembly. Item 24 (`perf_lifecycle`) passes with
   "Not applicable" when the diff adds/changes no endpoint, poller, subscription,
@@ -480,10 +485,25 @@ Payload data access is scoped to the selected non-native skill under
 `data/skills/ouroboroshub/<skill>/`. Marketplace/official provenance
 sidecars inside those payload roots (`.clawhub.json`, `.ouroboroshub.json`)
 remain control-plane state and are not writable from Repair mode. User-managed
-payloads accidentally left under `data/skills/native/` are blocked with an
-actionable manual-upgrade error; move them to `data/skills/external/` or
-reinstall them. The Repair guard still does not grant write access to true
-native launcher-seeded skills.
+payloads physically left under `data/skills/native/` without `.seed-origin` are
+classified as logical `external` in place for ordinary top-level
+read/write/edit/shell/delegation in every runtime mode; no migration is needed.
+The constrained Repair contract itself remains non-native and does not gain
+that alias. A marker-present launcher seed stays read/review-only, and generic
+tools still cannot mutate `.seed-origin`, review/grant state, marketplace
+provenance, dependency sidecars, or other control state.
+
+The direct/read-only inspection profiles may read, list, and search a selected
+native payload, including ordinary payload markers and dependency directories;
+that read contract does not extend to native mutation, owner state, grants,
+review/enablement, acting selection, or the constrained Repair lane.
+
+A selected `skill_publish` task may recover one exact known manifestless
+`user_repo` leaf through the existing selected-candidate binding: omitted
+`bucket` permits inspect operations and creation only of root `SKILL.md` or
+`skill.json`, after which ordinary discovery and fresh review resume. Reviewers
+must verify that grouping roots, unknown/colliding identities, explicit wrong
+buckets, nested manifests, and path escapes remain refused.
 
 ### Output contract
 
@@ -501,7 +521,7 @@ and do not return `PASS` for an item that also has a `FAIL` — the concrete
 | # | item | what to check | severity when FAIL |
 |---|------|---------------|--------------------|
 | 1 | manifest_schema | Does the manifest parse cleanly? Does `type` match the actual payload (`instruction` = no scripts/entry; `script` = at least one entry in `scripts`; `extension` = non-empty `entry`)? Is `runtime` one of `python`/`python3`/`node`/`bash`/`deno`/`ruby`/`go` for `type: script` (empty `""` is allowed ONLY for `type: instruction` since instruction skills never execute; extension entries are Python `plugin.py` modules)? Is `timeout_sec` > 0? | critical |
-| 2 | permissions_honesty | Do the declared `permissions` match what the scripts actually do? Missing permission declaration for an effect the code performs is a concrete FAIL. Examples: `net` must be declared if any script uses `httpx`/`requests`/`socket`/`urllib`; `fs` must be declared if a script writes outside the skill state dir; `subprocess` must be declared if a script spawns another process. | critical |
+| 2 | permissions_honesty | Do the declared `permissions` match what the scripts actually do? Missing permission declaration for an effect the code performs is a concrete FAIL. Examples: `net` must be declared if any script uses `httpx`/`requests`/`socket`/`urllib`; `fs` must be declared if a script writes outside the skill state dir; `subprocess` must be declared if a skill spawns another process. A transport using the `presence` permission must submit only authenticated provider event facts plus an opaque owner-created binding; supplying prompt text, a profile, tools, roots, destinations, authority hashes, or owner commands as trusted fields is a concrete FAIL. | critical |
 | 3 | no_repo_mutation | Does any script attempt to write to the self-modifying Ouroboros repo (`~/Ouroboros/repo/`)? Import of `write_file`/`commit_reviewed` against the system repo, `git add`/`git commit`, or any path that starts with `OUROBOROS_REPO_DIR` / `~/Ouroboros/repo` is a concrete FAIL. Skills may only propose patches by returning artifact bundles; commits go through the first-party reviewed path. | critical |
 | 4 | path_confinement | Do scripts stay inside the skill directory and the dedicated state dir (`~/Ouroboros/data/state/skills/<name>/`)? Absolute paths, `..` traversal, and writes to arbitrary user home subdirs are concrete FAIL. Reading from outside the skill dir is OK for read-only lookups (e.g. system info), write-path confinement is the strict rule. | critical |
 | 5 | env_allowlist | Is `env_from_settings` a short, justified list of settings keys? Core keys in `FORBIDDEN_SKILL_SETTINGS` (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY`, `CLOUDRU_FOUNDATION_MODELS_API_KEY`, `GIGACHAT_CREDENTIALS`, `GIGACHAT_PASSWORD`, `ANTHROPIC_API_KEY`, `MINIMAX_API_KEY`, `TELEGRAM_BOT_TOKEN`, `GITHUB_TOKEN`, `OUROBOROS_NETWORK_PASSWORD`) may be declared only when the skill genuinely needs that provider/token for its stated purpose; runtime forwards them only after a fresh executable review and a content-bound desktop-launcher owner grant. v5.2.2 dual-track grants: both `type: script` skills (forwarded by `_scrub_env`) and `type: extension` skills (forwarded by `PluginAPIImpl.get_settings`) are eligible; `type: instruction` skills cannot receive core keys. Mark unjustified core-key requests or non-forbidden secrets unrelated to the purpose as FAIL. An empty list is the default and always fine. | critical |
@@ -653,135 +673,118 @@ block repo commits and vice versa.
 
 ## Plan Review Checklist
 
-Used by `plan_task` for pre-implementation design reviews, BEFORE any code is written.
-Reviewers see the proposed plan, HEAD snapshots of files planned to be touched,
-and an agent-selected context level: `minimal`, `localized`, `broad`, or
-`constitutional`. `minimal` keeps governance docs and touched-file snapshots
-but omits the generated Atlas; `localized` adds a bounded neighborhood around
-planned files, `broad` is for shared contracts, and `constitutional` is
-reserved for self-evolution / immune-system surfaces.
-If a requested non-minimal Atlas has a typed assembly failure, or its final
-prompt leaves fewer than reviewer quorum callable, plan review rebuilds the
-same fingerprint/scout wave once at loud `minimal`. Reviewers must judge only
-the evidence actually present; the requested/effective levels, cause, Atlas
-omission, and any planned-touch snapshot omission remain explicit. A compiler
-exception, monetary budget refusal, or minimal prompt that still does not fit
-does not trigger another fallback.
+Used by `plan_task` to review an INTENTION before the work starts — the same organ whether the
+work is code, research, a deliverable, or an action in the world. Reviewers see the agent's typed
+SPEC, the task objective, the evidence the agent declared (attached bounded, with every absence
+named), and — for a self-modification plan — BIBLE.md and ARCHITECTURE.md in full (inline for
+an api reviewer; a retrieving reviewer reads both in full with its own tools, the pack names them
+as mandatory reads); every other plan gets the heading-derived navigation maps of BIBLE.md and
+ARCHITECTURE.md and may request more with `need_evidence` (the host attaches it on the next cycle).
+Judge only the evidence actually present; nothing missing is ever silent.
 
-**Reviewer role is GENERATIVE, not audit.** The primary job is to contribute
-ideas the implementer may not see, using the repository evidence available for
-the selected context level. Finding defects in
-the plan is secondary; proposing concrete alternatives, surfacing existing
-surfaces that already solve the goal, and flagging subtle contract breaks the
-implementer missed is primary.
+**One question: is this SPEC sufficient to START the work safely?** Not "is everything
+specified" — details may be worked out while doing. The reviewer does not write a competing
+plan, does not propose alternatives for their own sake, and has no finding quota. The agent
+authors the plan (P0); reviewers attack it; the host counts, aggregates and enforces.
 
-### Required output structure
+### The spec you are reviewing
 
-Reviewers must structure their response in this order:
+```
+goal · in_scope[] · non_goals[] · acceptance_claims[] (checkable "done" statements)
+invariants[] (budget, deadline, safety, irreversibility, external commitments)
+decisions[] {choice, rejected[], why}  ·  deferred[] {what, why_safe_to_defer}
+affected_resources[] (what the work will CHANGE)  ·  evidence[] (what to look at)
+```
+Every element has a host-minted id (`goal`, `claim_N`, `invariant_N`, `decision_N`, `deferred_N`).
+Those ids are the only valid `breaks` targets. Ids may shift between cycles when the agent
+rewrites the spec — re-target `breaks` against the CURRENT ids using the Spec delta.
 
-1. **Your own approach.** State concisely what YOU would do if this goal
-   came to you with the available repository evidence: the concrete alternative path, the
-   existing file/function you would reuse, or the simpler route. If after real
-   effort you genuinely see no better approach, say so explicitly.
-2. **`## PROPOSALS` section.** Include only evidence-backed contributions; there
-   is no target count. Each proposal should be one of:
-   - An existing function/module that already solves this (named exactly).
-   - A subtle contract break or shared-state interaction the plan likely missed.
-   - A simpler path with less surface area that still preserves the goal.
-   - A risk pattern visible from codebase history in your context.
-   - A BIBLE.md alignment issue with a specific principle cited.
-3. **Per-item verdicts** (PASS / RISK / FAIL), each with a detailed explanation
-   and — when RISK or FAIL — a concrete fix naming the exact file/function/symbol.
-4. **Addressable findings block.** Immediately before the final line, write
-   `PLAN_FINDINGS_JSON:` followed by exactly one standalone JSON array. Include
-   every material RISK/FAIL as an object with a unique local `id`, `level`
-   (`RISK` or `FAIL`), `summary`, and `recommendation`; use `[]` when GREEN.
-5. **Final line.** End with exactly one aggregate line and no content after it:
-   - `AGGREGATE: GREEN`
-   - `AGGREGATE: REVIEW_REQUIRED`
-   - `AGGREGATE: REVISE_PLAN`
+### The rubric (five domain-free questions + one for self-modification)
 
-### Checklist items
+| # | item | what to check |
+|---|------|---------------|
+| 1 | success conditions | Are the acceptance claims checkable — could a third party tell whether each one holds? |
+| 2 | load-bearing decisions | Are the decisions that are expensive to reverse explicit, with their rejected alternatives and why? |
+| 3 | constraints and invariants | Are the real constraints named — budget, deadline, safety, irreversibility, commitments to others? |
+| 4 | deferrals | Is anything deferred that will be expensive to change once the work has started? |
+| 5 | evidence sufficiency | Is the evidence enough to judge? If not, ask for exactly what is missing (`need_evidence` with a locator) instead of inventing a gap. |
+| 6 | governance (self-modification plans only) | Does the intention contradict BIBLE.md or a frozen contract? Name the principle or contract. |
 
-| # | item | what to check | severity |
-|---|------|---------------|----------|
-| 1 | completeness | Are there files, tests, docs, prompts, configs, or sibling paths that must also change but are NOT mentioned in the plan? Name each one specifically. | FAIL if a required touchpoint is concretely missing; RISK if uncertain |
-| 2 | correctness | Given the existing code, will the proposed approach actually work? Are there hidden dependencies, wrong assumptions about how existing code works, or API mismatches? Name exact functions/constants/modules at risk. | FAIL if a concrete breakage can be identified; RISK if uncertain |
-| 3 | minimalism | Does the plan duplicate a named authority or create concrete coupling that an existing extension seam avoids? If yes, name the exact symbol/authority/coupling and the smaller existing seam, including how it preserves the required contract. When the plan ADDS a surface (a new module, state file, ledger, resolver, cache, retry path, tool, endpoint, or background loop), consult the docs/ARCHITECTURE.md map and NAME the existing mechanism that already covers the need when one exists; absence of a covering mechanism may be stated in one line. | RISK only for a concrete, evidence-backed alternative; diff size alone is not a finding |
-| 4 | bible_alignment | Does the proposed approach violate any BIBLE.md principle? Check especially P5 (LLM-First — no hardcoded behavior logic), P7 (Minimalism — no gratuitous abstraction), and P2 (Meta-over-Patch — fix the class, not the instance). | FAIL if a concrete principle violation is identifiable |
-| 5 | implicit_contracts | Does the plan touch a module that other modules depend on through implicit contracts — format assumptions, expected function signatures, shared constants, protocol invariants? Name the callers/dependents that would break. | FAIL if a concrete broken caller can be named; RISK if uncertain |
-| 6 | testability | Is the plan testable? Are there obvious edge cases not covered by the stated test approach? Are there integration boundaries that require mocking or fixtures not mentioned? | RISK (advisory) |
-| 7 | architecture_fit | Does the plan solve the class of problem or is it a narrow patch leaving the root cause unresolved? If the latter, describe what architectural change would address the root cause. | RISK (advisory) |
-| 8 | forgotten_docs | If the change affects behavior described in ARCHITECTURE.md, SYSTEM.md, README.md, DEVELOPMENT.md, or BIBLE.md, is that update included in the plan? Name the specific stale artifact. | FAIL if a concrete doc/prompt becomes stale and is not mentioned |
+### Height rule — what may block
 
-### Aggregate signal levels (adaptive quorum)
+A finding is **blocking** only if being wrong about it AFTER the work starts would invalidate work
+already done, violate a declared commitment, or make an acceptance claim unverifiable — and it
+MUST name the spec id it breaks. Everything else is a **note**. If missing evidence makes a claim
+structurally unverifiable, that is blocking against the claim, not a `need_evidence` request.
 
-The coordinator aggregates the configured reviewer slots (an arbitrary N,
-duplicates allowed) via `config.adaptive_quorum(N)` — the same reviewer-slot
-SSOT used by commit/scope/skill review: `2` for `N ≥ 3`, `N` for `N` in
-`{1, 2}` (i.e. `min(2, N)`).
+- `blocking` — requires `breaks: <spec id>`. Without a valid id the host demotes it to a note and
+  discloses the demotion.
+- `note` — the agent disposes of it (accept / reject with rationale / defer) at no cost.
+- `need_evidence` — a typed request `{locator, why}`. It never blocks by itself and the same
+  locator cannot be asked twice on one task; the host attaches the locator on the next cycle
+  (through the same evidence policy), so the agent's next envelope carries it — a new
+  fingerprint, i.e. a paid cycle that actually has the evidence.
 
-- **GREEN** — all responding reviewers PASS. A preflight-excluded slot was not
-  called and did not vote. Read every called reviewer's `## PROPOSALS` section
-  (they are the point of this call), then proceed with implementation.
-- **REVIEW_REQUIRED** — one or more of: (a) a `REVISE_PLAN` count BELOW the
-  adaptive quorum (minority dissent — e.g. exactly one dissent in a 2+-slot
-  setup); (b) one or more RISK items were raised; (c) non-substantive
-  degradation occurred (a reviewer errored, timed out, or returned an
-  unparseable response, so `GREEN` cannot be confirmed). Read every reviewer's
-  full response and all PROPOSALS before deciding: a single dissenting reviewer
-  often sees the structural issue the others missed. Findings are inputs to the
-  main agent, which may accept, reject, or defer each one, including all of them.
-- **REVISE_PLAN** — a `REVISE_PLAN` count **at or above `adaptive_quorum(N)`**
-  (2-of-N for 3+ slots, both in a 2-slot setup, and the lone reviewer in a
-  1-slot setup). Quorum confirms a structural problem with the plan. Blocking
-  mode requires changed plan text and a fresh panel; advisory mode may proceed
-  only under loud host disclosure and the main agent's rationale. A single
-  dissent in a multi-reviewer setup surfaces as `REVIEW_REQUIRED`, not
-  `REVISE_PLAN`.
+### Output
+
+Return ONLY a JSON array of findings (optionally one code fence); for nothing to report return the
+empty array followed by `NO_FINDINGS`. Each element:
+
+```
+{"id": "f1", "class": "blocking|note|need_evidence", "breaks": "<spec id>",
+ "locator": "<path|url|task:id>", "summary": "...", "recommendation": "..."}
+```
+
+There is no reviewer-authored aggregate line: the HOST computes the aggregate from the findings
+across all configured slots using `config.adaptive_quorum(N)`. A reviewer never emits GREEN as
+authority, and prose outside the array is not parsed.
+
+### Cycles and closure
+
+- **GREEN** — no findings. Proceed.
+- **REVIEW_REQUIRED** — notes / `need_evidence`, or a blocking finding BELOW quorum. The agent
+  closes notes and `need_evidence` with one disposition call covering every finding id
+  (accept / reject with rationale / defer) — no new panel, no cost. A below-quorum blocking
+  finding stays OPEN whatever the disposition says: it closes only through a changed spec
+  (a new fingerprint, the next paid cycle) or a reject the next paid delta cycle judges.
+- **REVISE_PLAN** — blocking findings at quorum. A disposition can never close it: the agent
+  either changes the spec (a new fingerprint, the next paid cycle) or rejects a blocking finding
+  with a rationale that rides into that next cycle, where reviewers mark it resolved or still open.
+- **DEGRADED** — no parseable quorum. Not a verdict, but the dispatched panel PAID its cycle:
+  the wave records OPEN with each slot's typed failure state (code and reset time when known),
+  the control line reports DEGRADED honestly, and the recorded result replays for free ONLY
+  under all three conditions — an identical envelope, a NON-EMPTY recorded structural
+  lane-health epoch that a fresh snapshot still matches, and an unchanged reviewer roster
+  (slot ids, targets, routes, pinned profiles and EFFORTS). An empty-epoch DEGRADED wave
+  (slots died at dispatch time, no structural snapshot evidence) re-dispatches a PAID panel
+  on the identical envelope; so does a healed or newly dead lane or a changed roster. Only a
+  wave in which no reviewer slot was physically dispatched (typed $0 skip rows only —
+  pre-fan-out health skips included) stays unpaid.
+  When the wave's typed rows prove the quorum STRUCTURALLY unreachable, the wave carries
+  `quorum_unreachable` + the earliest reset: under blocking the finalization gate releases for
+  an agent-chosen honest `blocked_with_evidence` terminal (review stays open, implementation
+  stays held), waiting via a one-shot `schedule_followup` and asking the owner stay open too.
+
+Paid cycles per task are bounded by the owner's `OUROBOROS_REVIEW_MAX_CYCLES` (default 2,
+`unlimited` available). Replaying an identical envelope is free — identical including the
+evidence the host attaches for reviewers' `need_evidence` requests, so a request received in the
+last cycle makes the next envelope a new one. On cycle 2+ every reviewer sees
+all reviewers' findings from the previous cycle, the agent's dispositions and the spec delta:
+a reformulation of an earlier finding is not a new finding, and a new blocking finding must say
+why it was invisible before. When the cap is spent under blocking enforcement the host holds
+implementation and escalates with the typed `review_cycles_exhausted` reason; under advisory the
+agent may proceed with the wave open under a loud host disclosure.
 
 ### Rules for reviewers
 
-- Outside the force-plan gate, `plan_review` remains advisory: the implementer
-  decides what to do with the feedback. Force-plan follows the owner-selected
-  `OUROBOROS_REVIEW_ENFORCEMENT`: `blocking` holds normal finalization until
-  `GREEN` or a valid reference-only disposition closes `REVIEW_REQUIRED`,
-  while `advisory` permits agent judgment and preserves an explicit disclosure.
-  The disposition is a separate `plan_task` call containing only
-  `review_disposition`; it may close only the latest still-current, reviewed,
-  integrated, non-degraded `REVIEW_REQUIRED` fingerprint. It never resends the
-  plan envelope or calls a reviewer, covers every finding exactly once, and
-  exact replay is idempotent. Mixed disposition/envelope calls and vacuous
-  disposition-only calls are rejected before recording a new attempt. Ordinary
-  invalid review-mode envelopes still record a new current attempt so stale
-  review authority cannot revive.
-  Reviewer unavailability is audit evidence, not a disposition-able verdict:
-  blocking retries the same fingerprint/wave against its immutable first-panel
-  scout snapshot until review returns or a real rail fires.
-  `REVISE_PLAN` still requires changed plan text/fingerprint and a fresh review
-  in the blocking lane; advisory may proceed only with loud disclosure and the
-  main agent's rationale. Blocking permits analysis and non-mutating preparation
-  while review recovers, but implementation starts only after closure or a real
-  task-wide rail. This remains an LLM-first obligation, not a per-write/per-shell
-  gate; real deadline, budget, provider, or round rails preserve useful best-effort
-  work instead of replacing it with a terminal planning error.
-- A FAIL/RISK finding must identify a concrete defect in a named file/function/
-  symbol/authority/coupling, or a concrete smaller existing extension seam that
-  satisfies the same requirements. Generic concerns without that evidence are
-  not findings.
-- Do NOT mark RISK on `minimalism` just because you would have done it
-  differently. Flag RISK only when you can name the specific existing seam,
-  duplication, or coupling and explain the smaller alternative. Diff size,
-  file count, line count, unfamiliarity, and stylistic preference alone are not
-  findings.
-- Do NOT penalise missing tests, `VERSION` bumps, `README.md` changelog rows,
-  or `docs/ARCHITECTURE.md` updates — the plan has no code yet. Focus on design
-  correctness and elegance, not commit hygiene. Commit-gate reviewers handle
-  those at commit time.
-
-Reviewers must emit exactly one `PLAN_FINDINGS_JSON` block and end with exactly
-one of `AGGREGATE: GREEN`, `AGGREGATE: REVIEW_REQUIRED`, or
-`AGGREGATE: REVISE_PLAN`.
+- Do not name files, functions or modules as a finding unless naming them is what breaks a spec id;
+  a file-level observation without a `breaks` id is a note.
+- Do not penalise missing tests, version bumps, changelog rows or doc updates — there is no code
+  yet, and the commit gate reviews those at commit time.
+- Do not require the plan to specify what can safely be decided while doing the work. "Unspecified"
+  is only a finding when leaving it open is expensive to reverse.
+- A plan with no file paths at all (a trip, a deck, a research question) is a first-class subject:
+  the same questions apply, and repository conventions are irrelevant to it.
 
 ---
 

@@ -253,7 +253,7 @@ def _image_payload_from_base64(image_base64: str, mime: str) -> Dict[str, str]:
 
 _VLM_NO_VISION_MODEL_MSG = (
     "⚠️ VLM_NO_VISION_MODEL: image analysis is unavailable — neither the active "
-    "model nor any configured vision slot (light/heavy/main/fallback) accepts image "
+    "model nor any configured vision slot (vision/light/main/fallback) accepts image "
     "input. Do NOT retry the image. Instead inspect the page as TEXT/DOM "
     "(browse_page output='html' or 'text') and the console/network for errors, or "
     "switch_model to a vision-capable model, or ask the owner to configure one."
@@ -262,21 +262,17 @@ _VLM_NO_VISION_MODEL_MSG = (
 
 def _vision_capable_slot_candidates(client: Any, ctx: Any = None) -> List[str]:
     """Configured models that may serve a VLM sub-call, most-local/cheapest first
-    (active task model -> light -> heavy -> main -> fallback chain). Reviewer/scope slots
+    (active task model -> vision -> light -> main -> fallback chain). Reviewer/scope slots
     are deliberately NOT poached. De-duplicated, order-preserving, empties dropped."""
     out: List[str] = [
         str(getattr(ctx, "active_model", "") or getattr(ctx, "task_model_override", "") or "").strip(),
     ]
     try:
-        # Resolve the light + heavy slots through their configured accessors (P7), which
-        # fall back to Main when the slot is empty (the v6.39 role-model default), instead
-        # of a bare env read that would yield nothing for an unset slot.
-        from ouroboros.config import get_heavy_model, get_light_model, get_vision_model
+        from ouroboros.config import get_light_model, get_vision_model
         out.append(str(get_vision_model() or "").strip())
         out.append(str(get_light_model() or "").strip())
-        out.append(str(get_heavy_model() or "").strip())
     except Exception:
-        out.append(str(os.environ.get("OUROBOROS_MODEL_HEAVY", "") or "").strip())
+        pass
     try:
         out.append(str(client.default_model() or "").strip())
     except Exception:
@@ -304,7 +300,7 @@ def _resolve_vlm_model(client: Any, requested_model: str = "", *, ctx: Any = Non
     available. An explicit requested model is honored ONLY if it actually supports
     vision (else "" -> the caller surfaces a typed capability gap, never a blind 404
     that the loop then bangs on). Otherwise route to the first vision-capable
-    configured slot (active -> light -> heavy -> main -> fallback) — a gemini light/main
+    configured slot (active -> vision -> light -> main -> fallback) — a gemini light/main
     is vision-capable, so this usually succeeds without any new model slot."""
     from ouroboros.provider_models import supports_vision
     requested = str(requested_model or "").strip()
@@ -711,7 +707,7 @@ def get_tools() -> List[ToolEntry]:
                         },
                         "model": {
                             "type": "string",
-                            "description": "VLM model to use. Empty uses the active/vision slot resolution (OUROBOROS_MODEL_VISION empty->Main, then light/heavy/main/fallback candidates).",
+                            "description": "VLM model to use. Empty uses the active/vision slot resolution (OUROBOROS_MODEL_VISION empty->Main, then light/main/fallback candidates).",
                         },
                     },
                     "required": [],
@@ -759,7 +755,7 @@ def get_tools() -> List[ToolEntry]:
                         },
                         "model": {
                             "type": "string",
-                            "description": "VLM model to use. Empty uses the active/vision slot resolution (OUROBOROS_MODEL_VISION empty->Main, then light/heavy/main/fallback candidates).",
+                            "description": "VLM model to use. Empty uses the active/vision slot resolution (OUROBOROS_MODEL_VISION empty->Main, then light/main/fallback candidates).",
                         },
                     },
                     "required": ["prompt"],

@@ -16,6 +16,7 @@ import logging
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
+from ouroboros.review_cycles import REASON_REVIEW_CYCLES_EXHAUSTED
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_execution_id
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
@@ -25,7 +26,7 @@ from ouroboros.context import build_user_content
 from ouroboros.context_budget import ContextReclaimRequest
 from ouroboros.context_compaction import compact_tool_history_llm, context_reclaim_transcript_sha256
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
-from ouroboros.utils import estimate_tokens, truncate_review_artifact
+from ouroboros.utils import estimate_tokens, sanitize_tool_result_for_log, truncate_review_artifact
 from ouroboros.usage_accounting import (
     BudgetExceeded,
     PhysicalAttemptContext,
@@ -75,45 +76,11 @@ class _CompactionRoundContext:
     emit_progress: Callable[[str], None]
 
 
-def _provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
-    detail = " ".join(str(accumulated_usage.get("_last_llm_error") or "").split()).strip()
-    if not detail:
-        return ""
-    return f" Last provider error: {detail}"
-
-
-def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
-    """Explain whether retrying later is likely to help."""
-    kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
-    if kind == "subscription_window_exhausted":
-        reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
-        when = f" It resets at {reset_at}." if reset_at else ""
-        return (
-            " The subscription window for the delegated route is spent. This is "
-            f"TRANSIENT, not a billing refusal — waiting cures it.{when} Retrying is "
-            "scheduled against that reset time, not the ordinary short backoff."
-        )
-    if kind in {"quota_exhausted", "auth_error", "request_too_large", "bad_request", "context_overflow"}:
-        guidance = {
-            "quota_exhausted": "The provider rejected the request for quota/billing reasons; retrying the same request will not help until the key/account limit changes.",
-            "auth_error": "The provider rejected authentication/authorization; retrying the same request will not help until the configured key or provider access is fixed.",
-            "request_too_large": "The provider rejected the request size/output-token shape; retrying the same request will not help without reducing context/output demand or changing model capacity.",
-            "bad_request": "The provider rejected the request shape; retrying the same request will not help until the transcript/tool payload is fixed.",
-            "context_overflow": "The context overflowed the model window; retrying the same request will not help without reducing context or changing model capacity.",
-        }.get(kind, "Retrying the same provider request will not help until the underlying request/account issue changes.")
-        return f" {guidance}"
-    detail = str(accumulated_usage.get("_last_llm_error") or "").lower()
-    if "prefill" in detail or "conversation must end with a user message" in detail:
-        return (
-            " This looks like a client-side transcript-shape error, not a "
-            "provider outage; retrying the same input will not help."
-        )
-    if "provider returned incomplete response" in detail or "finish_reason=null" in detail:
-        return (
-            " The provider returned incomplete responses repeatedly; this may "
-            "be transient, but it can also indicate malformed client input."
-        )
-    return " If background consciousness is running, it will retry when the provider recovers."
+from ouroboros.agent_notices import (  # noqa: E402
+    _nanny_burn_phrase, _nanny_finalization_message, _nanny_metered_since_delegate_activity,
+    _provider_failure_hint, _provider_recovery_hint,
+)
+from ouroboros.context_fit import _restore_context_fit_usage, _snapshot_context_fit_usage  # noqa: E402
 
 
 def _handle_text_response(
@@ -122,9 +89,10 @@ def _handle_text_response(
     accumulated_usage: Dict[str, Any],
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Handle LLM response without tool calls (final response)."""
-    if content and content.strip():
-        llm_trace["reasoning_notes"].append(content.strip())
-    return (content or ""), accumulated_usage, llm_trace
+    safe_content = sanitize_tool_result_for_log(content or "")
+    if safe_content.strip():
+        llm_trace["reasoning_notes"].append(safe_content.strip())
+    return safe_content, accumulated_usage, llm_trace
 
 
 def _skill_names_touched_by_trace(llm_trace: Dict[str, Any]) -> List[str]:
@@ -209,34 +177,9 @@ def _force_plan_decision(
 
 
 def _force_plan_reminder(decision: Dict[str, Any]) -> str:
-    outcome = str(decision.get("outcome") or "")
-    if decision.get("reviewer_slots_degraded"):
-        return (
-            "[SWARM_INITIATIVE] Blocking plan review still has an unavailable reviewer slot. "
-            "Re-call plan_task with the exact unchanged plan and no review_disposition; the "
-            "existing scout wave will be reused while the reviewer panel retries. Continue "
-            "analysis and non-mutating preparation, but do not begin implementation before "
-            "review closes or a real task-wide rail fires."
-        )
-    if outcome == "REVIEW_REQUIRED":
-        return (
-            "[SWARM_INITIATIVE] Blocking plan review remains REVIEW_REQUIRED. Re-call "
-            "plan_task with a complete review_disposition as the only field, naming the "
-            "latest fingerprint, then continue; do not resend the plan or rerun reviewers."
-        )
-    if outcome == "REVISE_PLAN":
-        return (
-            "[SWARM_INITIATIVE] Blocking plan review requires a revised plan. Change the "
-            "plan text and call plan_task for the new fingerprint. Continue analysis and "
-            "non-mutating preparation, but do not begin implementation before review closes "
-            "or a real task-wide rail fires."
-        )
-    return (
-        "[SWARM_INITIATIVE] Call plan_task with a concrete plan, goal, and appropriate "
-        "context_level. If review infrastructure is unavailable, continue analysis and "
-        "non-mutating preparation, but do not begin implementation before review closes "
-        "or a real task-wide rail fires."
-    )
+    from ouroboros.owner_hurry import plan_review_reminder
+
+    return plan_review_reminder(decision)
 
 
 def _force_plan_disclosure(
@@ -248,39 +191,15 @@ def _force_plan_disclosure(
     # Normal finalization reuses the reducer projection that already decided
     # this exact candidate. The trace copy is presentation-only and cannot grant
     # permission; forced rails recompute with their explicit rail input.
+    from ouroboros.owner_hurry import plan_review_disclosure
+
     projected = llm_trace.get("force_plan_decision")
     decision = (
         projected
         if not forced_reason and isinstance(projected, dict)
         else _force_plan_decision(ctx, llm_trace, hard_rail=forced_reason)
     )
-    if not decision.get("required") or decision.get("status") == "closed":
-        return ""
-    outcome = str(decision.get("outcome") or "")
-    if decision.get("status") == "rail_degraded":
-        rail_reason = str(forced_reason or decision.get("reason") or "task_rail")
-        detail_value = outcome
-        if decision.get("reviewer_slots_degraded"):
-            detail_value = f"{detail_value or 'open'}; reviewer availability incomplete"
-        detail = f" ({detail_value})" if detail_value else ""
-        subject = (
-            "Blocking plan review"
-            if decision.get("enforcement") == "blocking"
-            else "Plan review"
-        )
-        return (
-            f"\n\n⚠️ {subject} remained open{detail} when the task-wide "
-            f"rail `{rail_reason}` required best-effort finalization."
-        )
-    if decision.get("allow"):
-        detail = outcome or "unavailable"
-        if decision.get("reviewer_slots_degraded"):
-            detail += " with a reviewer availability gap"
-        return (
-            f"\n\n⚠️ Plan review remained {detail}; work proceeded under the "
-            "owner-selected advisory enforcement."
-        )
-    return ""
+    return plan_review_disclosure(decision, forced_reason)
 
 
 def _swarm_handoff_attempt(ctx: Any) -> Dict[str, Any]:
@@ -320,9 +239,7 @@ def _check_budget_limits(
                 return router_result
             tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
             suffix = (
-                _force_plan_disclosure(
-                    tool_ctx, trace, forced_reason="budget_exhausted",
-                )
+                _force_plan_disclosure(tool_ctx, trace, forced_reason="budget_exhausted")
                 if tool_ctx is not None else ""
             )
             # This early rejection is a forced sink like every other: nothing
@@ -355,9 +272,7 @@ def _check_budget_limits(
 
     if cost_ceiling is None or cost_ceiling.state != task_pacing.COST_CEILING_ACTIVE:
         return None
-    tree_info = _loop_tree_accounting(
-        refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC,
-    )
+    tree_info = _loop_tree_accounting(refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC)
     tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
     deciding, spend_basis = task_pacing.resolve_deciding_spend(
         tree_cost_usd=tree_cost,
@@ -469,9 +384,7 @@ def _loop_tree_accounting(
         if scope is None or not scope.root_task_id or scope.root_limit_usd is None:
             return None
         if refresh:
-            return refresh_root_accounting(
-                scope.drive_root, scope.root_task_id, max_age_sec=max_age_sec,
-            )
+            return refresh_root_accounting(scope.drive_root, scope.root_task_id, max_age_sec=max_age_sec)
         return last_root_accounting(scope.root_task_id)
     except Exception:
         log.debug("Tree accounting telemetry unavailable", exc_info=True)
@@ -763,9 +676,7 @@ def _begin_task_acceptance_fence(ctx: Any, task_id: str) -> tuple[bool, Any]:
     admission_agent = getattr(ctx, "owner_message_admission_agent", None)
     if admission_lock is not None and admission_agent is not None:
         with admission_lock:
-            ctx._task_acceptance_owner_generation = int(
-                getattr(admission_agent, "_owner_message_generation", 0) or 0
-            )
+            ctx._task_acceptance_owner_generation = int(getattr(admission_agent, "_owner_message_generation", 0) or 0)
     existing = getattr(ctx, "_task_acceptance_fence_token", None)
     if existing is not None:
         inspect = getattr(ctx, "inspect_acceptance_fence", None)
@@ -1089,22 +1000,6 @@ def _task_acceptance_subtree_snapshot(
             or getattr(ctx, "budget_drive_root", "")
             or drive_root
         ))
-        audit_only_task_ids: set[str] = set()
-        try:
-            from ouroboros.task_results import (
-                load_plan_review_state,
-                plan_review_audit_only_task_ids,
-            )
-
-            audit_only_task_ids = set(plan_review_audit_only_task_ids(
-                load_plan_review_state(status_root, str(task_id))
-            ))
-        except Exception:
-            # Missing/corrupt planning evidence must never hide a live child.
-            log.debug(
-                "Unable to load audit-only planning scouts for acceptance",
-                exc_info=True,
-            )
         rows = find_child_tasks(
             status_root,
             parent_task_id=str(task_id),
@@ -1117,8 +1012,6 @@ def _task_acceptance_subtree_snapshot(
             if not isinstance(row, dict):
                 continue
             row_task_id = str(row.get("task_id") or row.get("id") or "")
-            if row_task_id in audit_only_task_ids:
-                continue
             status = str(row.get("status") or "unknown")
             projected = {
                 "task_id": row_task_id,
@@ -1142,7 +1035,6 @@ def _task_acceptance_subtree_snapshot(
             }
             for row in (getattr(ctx, "_task_acceptance_queue_descendants", None) or [])
             if isinstance(row, dict)
-            and str(row.get("task_id") or "") not in audit_only_task_ids
         ]
         return (
             not queue_rows and all(row["status"] in SETTLED_STATUSES for row in compact),
@@ -1866,6 +1758,7 @@ def _apply_task_acceptance_result(
         estimated_sec=task_pacing.acceptance_review_estimate_sec(
             ctx.tools._ctx, passes_done=ctx.passes_done + 1,
         ),
+        ctx=ctx.tools._ctx,
     )
     if dialogue_terminal:
         # v6.74.0 (A5): a reviewer quorum judged the dialogue no longer
@@ -1964,7 +1857,7 @@ def _apply_task_acceptance_result(
     if capsule and open_obligations:
         _set_acceptance_decision(ctx.llm_trace, {
             "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
-            "reason": "open_obligations",
+            "reason": pass_reason if pass_reason == REASON_REVIEW_CYCLES_EXHAUSTED else "open_obligations",
             "source": "task_acceptance_review",
             "rationale": (
                 f"Improvement gates exhausted ({pass_reason or 'passes spent'}) with "
@@ -1981,6 +1874,7 @@ def _apply_task_acceptance_result(
         _set_acceptance_decision(ctx.llm_trace, {
             "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
             "reason": (
+                pass_reason if pass_reason == REASON_REVIEW_CYCLES_EXHAUSTED else
                 "improvement_window_closed"
                 if (not ctx.passes_done and pass_reason)
                 else "capsule_spent"
@@ -2458,20 +2352,6 @@ def _adopt_fallback_route(
     return fallback_model, fallback_use_local, context_fit_plan, active_context_mode
 
 
-def _snapshot_context_fit_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: value for key, value in usage.items() if key.startswith("_context_")}
-
-
-def _restore_context_fit_usage(
-    usage: Dict[str, Any],
-    snapshot: Dict[str, Any],
-) -> None:
-    for key in tuple(usage):
-        if key.startswith("_context_"):
-            usage.pop(key, None)
-    usage.update(snapshot)
-
-
 def _run_cross_model_fallback_chain(
     *, llm, ctx, tools, messages, active_model, active_use_local, tool_schemas,
     active_effort, max_retries, drive_logs, task_id, round_idx, event_queue,
@@ -2590,11 +2470,11 @@ def _load_direct_child_results(
     task_id: str,
     root_task_id: str,
 ) -> list[Dict[str, Any]]:
-    """Read direct children while excluding planning scouts retained for audit only."""
+    """Read this task's direct children (plan review spawns none)."""
 
     from ouroboros.task_status import find_child_tasks
 
-    children = [
+    return [
         row for row in find_child_tasks(
             pathlib.Path(status_root),
             parent_task_id=task_id,
@@ -2603,22 +2483,6 @@ def _load_direct_child_results(
             scope="direct",
         )
         if isinstance(row, dict)
-    ]
-    try:
-        from ouroboros.task_results import (
-            load_plan_review_state,
-            plan_review_recorded_panel_task_ids,
-        )
-
-        audit_only = set(plan_review_recorded_panel_task_ids(
-            load_plan_review_state(pathlib.Path(status_root), task_id)
-        ))
-    except Exception:
-        # Corrupt/unavailable planning evidence must not hide generic children.
-        audit_only = set()
-    return [
-        row for row in children
-        if str(row.get("task_id") or row.get("id") or "") not in audit_only
     ]
 
 
@@ -2893,24 +2757,6 @@ def _note_nanny_delegate_activity(
     ctx._nanny_reminder_mark = None
 
 
-def _nanny_metered_since_delegate_activity(ctx: Any) -> Tuple[int, float]:
-    """(rounds, dollars) this task's OWN metered loop has spent since the last
-    delegate-verb call — zero before the first round is marked."""
-    progress = getattr(ctx, "_nanny_metered_progress", None)
-    progress = progress if isinstance(progress, dict) else {}
-    baseline = getattr(ctx, "_nanny_delegate_baseline", None)
-    baseline = baseline if isinstance(baseline, dict) else {}
-    try:
-        rounds = max(0, int(progress.get("round") or 0) - int(baseline.get("round") or 0))
-    except (TypeError, ValueError):
-        rounds = 0
-    try:
-        cost = max(0.0, float(progress.get("cost") or 0.0) - float(baseline.get("cost") or 0.0))
-    except (TypeError, ValueError):
-        cost = 0.0
-    return rounds, cost
-
-
 def _nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
     """The measured burn plus whether the proportional reminder is due THIS round.
 
@@ -2954,11 +2800,6 @@ def _nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
     if rounds_since_fire >= NANNY_REMINDER_ROUNDS or cost_since_fire >= NANNY_REMINDER_USD:
         return rounds, cost, True
     return rounds, cost, False
-
-
-def _nanny_burn_phrase(rounds: int, cost: float) -> str:
-    return (f"{rounds} of your own metered LLM rounds (~${cost:.2f})" if cost > 0
-            else f"{rounds} of your own metered LLM rounds")
 
 
 def _maybe_inject_nanny_economics_reminder(
@@ -3305,13 +3146,7 @@ def _drain_incoming_messages(
     _owner_msg_seen: set,
     owner_ctx: Any = None,
 ) -> Dict[str, Any]:
-    """Inject owner messages received during task execution.
-
-    Returns typed control signals drained from the mailbox (currently
-    ``{"finalize_now": reason}`` when the supervisor opened a finalization
-    grace window); control entries are routed structurally, never injected
-    as owner prose.
-    """
+    """Injects dialogue; returns typed controls."""
     controls: Dict[str, Any] = {}
     while not incoming_messages.empty():
         try:
@@ -3338,17 +3173,23 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, drain_owner_entries
-        for entry in drain_owner_entries(drive_root, task_id=task_id, seen_ids=_owner_msg_seen):
+        from ouroboros.owner_mailbox import (
+            KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_ROUTING_DECISION,
+            KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_task_message,
+            drain_owner_entries,
+        )
+
+        if owner_ctx:
+            owner_ctx._loop_mailbox_seen_ids = _owner_msg_seen
+        attempt = getattr(owner_ctx, "task_attempt", None) or (1 if owner_ctx is not None else None)
+        for entry in drain_owner_entries(drive_root, task_id, _owner_msg_seen, attempt):
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
                 text = str(entry.get("text") or "deadline")
                 controls["finalize_now"] = text
                 first_line = text.splitlines()[0].strip() if text else ""
                 if first_line == REASON_OWNER_REQUESTED_FINALIZATION:
-                    # Owner-stop budget starts at DELIVERY (1=A): stamp the drain
-                    # so the custody sweep budgets the final turn from here, not
-                    # the button press. First drain wins; fail-soft.
+                    # Owner-stop budget starts at delivery; first drain wins.
                     _mark_owner_stop_control_drained(owner_ctx, drive_root, task_id)
                 continue
             if kind == KIND_HURRY:
@@ -3360,14 +3201,23 @@ def _drain_incoming_messages(
                 apply_latch(owner_ctx, entry, event_queue=event_queue)
                 controls["hurry"] = str(entry.get("msg_id") or "hurry")
                 continue
+            if kind == KIND_ROUTING_DECISION:
+                continue  # its own waiting tool reads it (owner_mailbox states why)
             dmsg = entry.get("text") or ""
+            if kind == KIND_TASK_MESSAGE:
+                deliver_task_message(entry, task_id, event_queue, lambda text: _append_or_merge_user_message(messages, text))
+                acknowledge_transcript_entry(drive_root, task_id, entry)
+                continue
             _record_owner_directive(
                 owner_ctx,
                 source="owner_mailbox",
                 content=dmsg,
                 msg_id=str(entry.get("msg_id") or ""),
             )
-            _append_or_merge_user_message(messages, _owner_marked_content(dmsg))
+            from ouroboros.client_surface import noted_owner_text
+
+            _append_or_merge_user_message(messages, _owner_marked_content(noted_owner_text(owner_ctx, entry, dmsg)))
+            acknowledge_transcript_entry(drive_root, task_id, entry)
             if event_queue is not None:
                 try:
                     event_queue.put_nowait({
@@ -3990,6 +3840,7 @@ def _replace_delivery_candidate(
     *,
     control: str,
 ) -> DeliveryCandidate:
+    full_text = sanitize_tool_result_for_log(full_text)
     previous_candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(previous_candidate, DeliveryCandidate):
         _supersede_delivery_acceptance_binding(
@@ -4833,7 +4684,7 @@ def _enforce_swarm_actions(
     reminder = _force_plan_reminder(decision)
     _append_or_merge_user_message(messages, reminder)
     llm_trace["reasoning_notes"].append(reminder)
-    emit_progress("Swarm plan-review action required before final response.")
+    emit_progress("Plan-review action required before final response.")
     return True
 
 
@@ -5341,7 +5192,9 @@ def _forced_fallback_result(
     )
     candidate = _current_delivery_candidate(ctx, llm_trace)
     if candidate is not None:
-        composed = _compose_delivery_suffix(candidate.full_text, suffix)
+        composed = sanitize_tool_result_for_log(
+            _compose_delivery_suffix(candidate.full_text, suffix)
+        )
         if composed != candidate.full_text:
             candidate = _publish_model_forced_candidate(
                 ctx, llm_trace, composed, reason_code,
@@ -5395,7 +5248,7 @@ def _forced_fallback_result(
             )
             return candidate.full_text, ctx.accumulated_usage, llm_trace
 
-    composed = _compose_delivery_suffix(fallback_text, suffix)
+    composed = sanitize_tool_result_for_log(_compose_delivery_suffix(fallback_text, suffix))
     candidate = _publish_model_forced_candidate(
         ctx, llm_trace, composed, reason_code,
     )
@@ -5574,10 +5427,11 @@ def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
             f"\nNOTE: this task's delegated run(s) settled WITHOUT success ({settled} "
             "run(s)). State that failure and its impact honestly in your answer."
         )
-    if any(str(c.get("tool") or "") == "delegate_start"
-           for c in (llm_trace.get("tool_calls") or []) if isinstance(c, dict)):
-        # The trace shows a dispatch the durable rows have not recorded — never
-        # accuse over evidence that is behind the task's own actions.
+    if evidence.get("delegate_start_attempted") or any(
+        str(c.get("tool") or "") == "delegate_start"
+        for c in (llm_trace.get("tool_calls") or []) if isinstance(c, dict)
+    ):
+        # A durable or current-trace start attempt is not a refusal to delegate.
         return ""
     return (
         "\nNOTE: this task was dispatched onto the delegated substrate "
@@ -5846,129 +5700,20 @@ def _visible_round_text(content: Any) -> str:
 
 
 def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_trace: Dict[str, Any]) -> None:
-    """Emit the round's progress bubble: the visible assistant text, or — for a pure tool-call round
-    with no visible text — readable reasoning the provider already returned. The reasoning fallback
-    is DISPLAY-ONLY: emitted to the UI bubble but NOT recorded in ``reasoning_notes`` (which feeds
-    build_trace_summary / task summaries) and never appended to the transcript, so it cannot leak out
-    of the display path into the durable trace or back to a provider. Gated by OUROBOROS_REASONING_SUMMARY."""
+    """Emit redacted progress safely to users.
+
+    Visible text is retained in ``reasoning_notes``. Provider reasoning stays
+    display-only; the native message and transcript remain unchanged.
+    """
     visible_text = _visible_round_text(content)
     if visible_text:
-        emit_progress(visible_text)
-        llm_trace["reasoning_notes"].append(visible_text)
+        safe_text = sanitize_tool_result_for_log(visible_text)
+        emit_progress(safe_text)
+        llm_trace["reasoning_notes"].append(safe_text)
     elif str(os.environ.get("OUROBOROS_REASONING_SUMMARY", "auto")).strip().lower() != "off":
         display_reasoning = LLMClient.extract_display_reasoning(msg)
         if display_reasoning:
-            emit_progress(display_reasoning)
-
-
-def _nanny_finalization_message(
-    tools: ToolRegistry, drive_root: pathlib.Path, task_id: str,
-    trace_attempted: bool = False,
-) -> str:
-    """The honest nanny reminder for a harness-dispatched child at finalization —
-    or '' when no reminder is deserved.
-
-    F4 (2026-08-10 saga): the old reminder accused children whose delegated runs
-    CRASHED of "choosing" not to delegate, and fired even when the delegate verbs
-    were policy-hidden. Two structural facts fix both: the task's own visible
-    toolset, and durable custody evidence (delegate_custody.
-    task_execution_evidence), which spans the WHOLE task — per-execution
-    llm_trace resets on continuation. `trace_attempted` is the third fact: a
-    delegate_start in THIS execution's trace. It must not suppress the failure
-    message (triad finding on e84475f2: delegate, run dies, finish by hand,
-    finalize — all inside ONE execution), only the accusation when custody has
-    no rows yet (a pending/uncustodied start is an attempt, not a choice)."""
-    try:
-        if "delegate_start" not in set(tools.available_tools()):
-            return ""  # the verbs are invisible here; "you chose not to" would be false
-    except Exception:
-        log.debug("nanny nudge: toolset visibility check failed", exc_info=True)
-    evidence: Dict[str, Any] = {}
-    try:
-        from ouroboros.delegate_custody import custody_root, task_execution_evidence
-
-        # Split-root fix (2026-08-10 amendments): custody WRITES land on the
-        # CANONICAL (budget) root, but this read used the loop's drive_root —
-        # a split-root subagent's child drive has no custody rows, leaving
-        # the nanny blind. Resolve the SAME root the writers use; the passed
-        # drive_root stays the fallback (e.g. unit-test stubs).
-        try:
-            evidence_root = custody_root(tools._ctx)
-        except Exception:
-            evidence_root = drive_root
-        evidence = task_execution_evidence(evidence_root, str(task_id or ""))
-    except Exception:
-        log.debug("nanny nudge: custody evidence read failed", exc_info=True)
-    if evidence.get("delegated_runs_succeeded"):
-        # The route WAS used and worked — but "used once" is not a permanent
-        # license: the poltergeist children each ran ONE successful $0 run,
-        # then co-built for tens of opus rounds while this early return kept
-        # the nudge silent. Silence is now proportional to the measured burn
-        # since the last delegated-run activity.
-        rounds, cost = _nanny_metered_since_delegate_activity(tools._ctx)
-        from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
-
-        if rounds < NANNY_REMINDER_ROUNDS and cost < NANNY_REMINDER_USD:
-            return ""
-        return (
-            "⚠️ NANNY_METERED_OVERRUN: your delegated run(s) succeeded, but you have "
-            f"since spent {_nanny_burn_phrase(rounds, cost)} with no delegated-run "
-            "activity. A successful run is verified and integrated, not rebuilt. If "
-            "the remaining work is substantive, delegate it (a new delegate_start); "
-            "if you are wrapping up, keep the wrap-up short and account for the "
-            "metered spend honestly in your result."
-        )
-    started = int(evidence.get("delegated_runs_started") or 0)
-    if not started and (evidence.get("evidence_read_failed") or not evidence):
-        # Zero attempts is an ACCUSATION and needs positively-established
-        # evidence: an unreadable custody log (or a failed read above) proves
-        # nothing (scope finding on a5e59bdf).
-        return ""
-    if not started and trace_attempted:
-        # A start this execution's trace saw but custody has no row for: pending
-        # settlement or an uncustodied start. An attempt either way — neither
-        # accusation fits, and the wait/cancel path owns its own disclosure.
-        return ""
-    settled = int(evidence.get("delegated_runs_settled") or 0)
-    failure_states = [str(s) for s in (evidence.get("delegated_run_failure_states") or [])]
-    pending = max(0, started - settled)
-    if pending:
-        # PENDING ≠ FAILED (sol review on b49f8192): a STARTED row with no
-        # settlement may still be executing — calling it failed invites a
-        # duplicate run, and finalizing over it orphans the result. Takes
-        # precedence over the failed message: with a run in flight, "retry"
-        # is wrong even when an earlier sibling died (still a fact below).
-        failed_note = (
-            f" {len(failure_states)} earlier run(s) already ended: {', '.join(failure_states)}."
-            if failure_states else ""
-        )
-        return (
-            "⚠️ NANNY_DELEGATED_RUN_PENDING: you routed work onto the delegated "
-            f"substrate and {pending} delegated run(s) have started but not "
-            "settled — they may still be executing. Do not finalize over an "
-            "in-flight delegated run (its result would be orphaned) and do not "
-            "start a duplicate: wait for or check it (delegate_wait) before "
-            "finalizing, or cancel it (delegate_cancel) and say so." + failed_note
-        )
-    if started:
-        states = ", ".join(failure_states) or "settled without a recorded terminal state"
-        return (
-            "⚠️ NANNY_DELEGATED_RUN_FAILED: you DID route work onto the delegated "
-            f"substrate ({started} run(s) started), but none succeeded — your "
-            f"delegated run(s) ended: {states}. Do not finalize as if delegation "
-            "was never attempted: either retry it (delegate_start / delegate_wait) "
-            "or state in your final answer that the delegated run failed and why "
-            "the remaining work ran on metered API tokens."
-        )
-    return (
-        "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
-        "substrate (executor=harness), but you are finalizing with ZERO "
-        "delegate_start calls — the work would end up billed to metered API "
-        "tokens the parent asked to avoid. Either delegate the remaining work "
-        "now (delegate_start / delegate_wait), or finalize with an explicit "
-        "statement of WHY delegation was not used (route refused, work shape "
-        "unsuited, deadline) so your parent sees the substrate decision."
-    )
+            emit_progress(sanitize_tool_result_for_log(display_reasoning))
 
 
 def _maybe_inject_finalization_nudges(
@@ -5983,14 +5728,12 @@ def _maybe_inject_finalization_nudges(
         return False
     if (getattr(tools._ctx, "_nanny_route_dispatched", False)
             and not getattr(tools._ctx, "_nanny_finalization_injected", False)):
-        # Nanny postcondition (owner decision, 2026-08-07): a child dispatched
-        # onto the delegated substrate must not finalize as if that decision
-        # never existed. One structural fact, one re-loop; the child may still
-        # delegate OR finalize with a typed reason — never a hard gate (P5).
-        # A delegate_start in THIS trace rides into the message decision
-        # (triad, e84475f2), where custody evidence separates a failed run
-        # (NANNY_DELEGATED_RUN_FAILED) from a pending attempt (no message).
-        # Suppression cases live in _nanny_finalization_message.
+        # Nanny postcondition (owner 2026-08-07): a harness-dispatched child
+        # must not finalize as if that decision never existed. One structural
+        # fact, one re-loop; it may still delegate OR finalize with a typed
+        # reason — never a hard gate (P5). A delegate_start in THIS trace rides
+        # into the message decision (triad, e84475f2); suppression cases live
+        # in _nanny_finalization_message.
         _trace_attempted = any(
             str(c.get("tool") or "") == "delegate_start"
             for c in (llm_trace.get("tool_calls") or [])
@@ -6005,14 +5748,19 @@ def _maybe_inject_finalization_nudges(
                 messages.append({"role": "assistant", "content": content})
             _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{_nanny_msg}")
             # Owner decision (2026-08-15): no owner-chat progress line — the
-            # model sees the [SYSTEM REMINDER], the trace keeps the durable
-            # text, and the typed task_checkpoint carries observability.
+            # trace + typed task_checkpoint carry observability.
+            _code = _nanny_msg.split(":", 1)[0].replace("⚠️", "").strip()
             _emit_checkpoint_event(
                 getattr(tools._ctx, "event_queue", None), task_id,
                 getattr(tools._ctx, "drive_logs", None),
                 {"checkpoint_kind": "nanny_finalization_nudge",
-                 "nanny_code": _nanny_msg.split(":", 1)[0].replace("⚠️", "").strip()},
+                 "nanny_code": _code},
             )
+            # B3: durable worker stamp that the nudge was really INJECTED (the
+            # ctx flag is set even on suppression); read back at completion.
+            from ouroboros.delegate_evidence import record_nanny_nudge_stamp
+
+            record_nanny_nudge_stamp(tools._ctx, task_id, _code)
             llm_trace["reasoning_notes"].append(_nanny_msg)
             return True
     finalization_msg = _skill_finalization_message(drive_root, llm_trace)
@@ -6287,6 +6035,7 @@ def _measure_round_main_fit(
         rendered_mode=rendered_mode,
         round_id=_context_fit_round_id(ctx),
         automatic_pass_used=automatic_pass_used,
+        reasoning_effort=ctx.active_effort,
     )
     _remember_main_fit(ctx, disposition)
     return disposition
@@ -6694,7 +6443,7 @@ def _cleanup_loop_resources(
     stateful_executor: Any,
     ctx: _LoopExitContext,
 ) -> None:
-    """Release executor, task services, and mailbox after every loop exit."""
+    """Release attempt-scoped executors, services, and delegated runs."""
     if stateful_executor:
         try:
             from ouroboros.tools.browser import cleanup_browser
@@ -6725,14 +6474,6 @@ def _cleanup_loop_resources(
         release_task_runs(custody_root(ctx.tools._ctx), ctx.task_id)
     except Exception:
         log.debug("Failed to release delegated runs for task %s", ctx.task_id, exc_info=True)
-    try:
-        from ouroboros.owner_mailbox import cleanup_task_mailbox
-
-        cleanup_task_mailbox(ctx.drive_root, ctx.task_id)
-    except Exception:
-        log.debug("Failed to cleanup task mailbox", exc_info=True)
-
-
 def _service_identity_projection(service: Dict[str, Any]) -> Dict[str, Any]:
     """Bounded identity used to deduplicate idempotent teardown observations."""
 
@@ -6896,7 +6637,7 @@ def run_llm_loop(
     initial_effort: str = "medium",
     drive_root: Optional[pathlib.Path] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Run the LLM-with-tools loop and return final text, usage, and trace."""
+    """Run the tool loop."""
     ctx = tools._ctx
     ctx._delivery_candidate = None
     ctx._delivery_candidate_revision = 0
@@ -6923,10 +6664,6 @@ def run_llm_loop(
         active_context_mode = _preferred_context_mode
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
-    # Published as a live reference so blocking tools (wait_task/wait_tasks/
-    # delegate_wait) can read RECORDED per-send facts — e.g. the APPLIED
-    # prompt-cache TTL (`_last_prompt_cache_ttl`) behind the cache-horizon
-    # disclosure — without a second, route-derived predictor.
     tools._ctx._accumulated_usage = accumulated_usage
     max_retries = 3
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
@@ -6949,6 +6686,7 @@ def run_llm_loop(
     )
     _owner_msg_seen: set = set()
     MAX_ROUNDS = _resolve_loop_max_rounds()
+    MAX_ROUNDS = min(MAX_ROUNDS, int(getattr(ctx, "inline_max_rounds", MAX_ROUNDS)))
     round_idx = 0
     limit_ctx: Optional[_RoundLimitContext] = None
     try:
@@ -6976,8 +6714,10 @@ def run_llm_loop(
                 _sanitized = LLMClient.sanitize_reasoning_on_model_switch(messages, _prev_active_model, active_model)
                 if _sanitized is not messages:
                     messages[:] = _sanitized
-            ctx.active_context_mode = active_context_mode  # switch_model re-binds the fit plan from this round's mode
-            ctx.active_model = active_model  # publish the round's REAL model (incl. switch_model / per-task override) so tools (native screenshot vision-routing) don't read the stale global OUROBOROS_MODEL env
+            ctx.active_context_mode = active_context_mode
+            ctx.active_model = active_model
+            ctx.active_effort = active_effort
+            ctx.active_use_local = active_use_local
 
             # One forced-wrap-up context per round: consumed by the round-limit
             # path and the supervisor finalize_now control path below.
@@ -7079,7 +6819,7 @@ def run_llm_loop(
             )
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
-            if msg is None:
+            if msg is None and not bool(getattr(ctx, "exact_model_route", False)):
                 (
                     msg,
                     active_model,
@@ -7093,19 +6833,22 @@ def run_llm_loop(
                     event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
                     emit_progress=emit_progress, context_fit_plan=context_fit_plan,
                     active_context_mode=active_context_mode)
-                if msg is None:
-                    # Provider-death: salvage the useful workspace state like the
-                    # forced rails do, but terminalize as an infra failure — an
-                    # outage interrupts the task, it never completes it.
-                    text, accumulated_usage, forced_trace = _handle_provider_unavailable(limit_ctx)
-                    _merge_finalization_trace(llm_trace, forced_trace)
-                    return text, accumulated_usage, llm_trace
+            if msg is None:
+                # Exact actor routes skip generic substitution and fail as infrastructure.
+                text, accumulated_usage, forced_trace = _handle_provider_unavailable(limit_ctx)
+                _merge_finalization_trace(llm_trace, forced_trace)
+                return text, accumulated_usage, llm_trace
+
+            from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
 
             tool_calls = msg.get("tool_calls") or []
+            tools._ctx._request_wire_custom_receipts = accumulated_usage.pop(
+                CUSTOM_RECEIPTS_USAGE_KEY,
+                (),
+            )
             content = msg.get("content")
             _latch_final_answer_marker(llm_trace, content, current_tool_calls=tool_calls)
-            # F12: EVERY LLM response marks metered nanny progress (expensive
-            # no-tool rounds count); the delegate BASELINE moves post-tools only.
+            # Every metered response counts as nanny progress.
             _note_nanny_delegate_activity(tools._ctx, round_idx, accumulated_usage, [])
             if not tool_calls:
                 final_result = _no_tool_final_answer(

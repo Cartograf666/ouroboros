@@ -40,7 +40,6 @@ def _search_wall_clock_sec() -> float:
     Python fallback in tools/core.py shares the SAME budget from one start time so
     the WHOLE search_code call is bounded, not each stage. Overridable for slow hosts.
     """
-    from ouroboros.config import get_search_code_wall_sec
 
     return get_search_code_wall_sec()
 
@@ -276,3 +275,19 @@ def format_search_result(
     if deadline_hit:
         header += " — stopped at the time budget (results may be incomplete)"
     return header + "\n\n" + "\n".join(rendered)
+
+
+# This search's own wall-clock budget, read where the search runs. The DEFAULT
+# stays in config (the SSOT for runtime values); only the reader moved.
+def get_search_code_wall_sec() -> float:
+    """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
+    directory walk and the batched rg loop so a scan over a very large root cannot run
+    unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    raw = (os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "")
+           or str(SETTINGS_DEFAULTS.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45")))
+    try:
+        return max(5.0, float(raw))
+    except (TypeError, ValueError):
+        return 45.0

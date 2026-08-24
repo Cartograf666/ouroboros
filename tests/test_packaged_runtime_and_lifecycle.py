@@ -219,6 +219,8 @@ def test_a_restart_with_a_failed_dependency_install_pauses_and_discloses(
     monkeypatch.setattr(launcher, "_shutdown_event", threading.Event())
     monkeypatch.setattr(launcher, "_cleanup_recorded_server_process", lambda reason: None)
     monkeypatch.setattr(launcher, "_kill_stale_runtime_ports", lambda port: None)
+    # The per-generation stray sweep must never signal a real process from a test.
+    monkeypatch.setattr(launcher, "_reap_same_install_strays", lambda reason: [])
     monkeypatch.setattr(
         launcher, "_cleanup_recorded_server_group_for_pid", lambda pid, reason: None,
     )

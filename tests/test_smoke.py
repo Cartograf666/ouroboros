@@ -104,10 +104,15 @@ EXPECTED_TOOLS = [
     # v6.102 read-only second-opinion CLI consultation (ouroboros/tools/antigravity.py).
     "antigravity_ask",
     "compact_context", "set_tool_timeout", "request_restart",
-    "promote_to_stable", "schedule_subagent", "integrate_subagent_patch", "compare_subagent_patches",
+    "promote_to_stable", "schedule_subagent", "schedule_followup",
+    "configure_presence", "initiate_presence",
+    "integrate_subagent_patch", "compare_subagent_patches",
     # C1: the explicit acceptance seam for a delegated run's captured patch —
     # a first-class tool, so the registry contract must name it.
     "integrate_delegated_patch", "cancel_task",
+    # The owner's per-task execution allocation: proposed by the agent, answered
+    # by the owner, and only then turned into children via plan_item_id.
+    "propose_execution_plan",
     "peek_task", "discard_child_result", "override_delegation_constraint",
     "request_deep_self_review", "chat_history", "update_scratchpad",
     "send_user_message", "update_identity", "toggle_evolution",
@@ -128,7 +133,7 @@ EXPECTED_TOOLS = [
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
     "journal_read", "journal_write", "workpad_read", "workpad_write",
     "promote_chat_to_task", "route_to_project", "list_projects", "steer_task",
-    "ensure_project_scope",
+    "ensure_project_scope", "schedule_followup",
     "memory_map", "memory_update_registry",
     "plan_task", "recent_tasks", "task_acceptance_review", "verify_and_record", "web_search",
     "start_service", "service_status", "service_logs", "stop_service",
@@ -418,6 +423,14 @@ def test_no_env_dumping():
     assert len(violations) == 0, "Dangerous env dumping:\n" + "\n".join(violations)
 
 
+# The `size_ratchet` lane below BLOCKS only in official-repository CI (a
+# dedicated `pytest tests/ -m size_ratchet` step in quick-test and full-test);
+# default local runs exclude the marker and surface the same validator
+# findings as warnings via check_worktree_readiness and codebase_health.
+# Canonical lane description: docs/DEVELOPMENT.md "Pytest marker lanes".
+
+
+@pytest.mark.size_ratchet
 def test_no_oversized_modules():
     """Principle 7: exact-path debt is the only exception to the hard gate."""
     from ouroboros.review import GIANT_PATHS, MAX_MODULE_LINES, iter_gated_modules
@@ -431,12 +444,32 @@ def test_no_oversized_modules():
     assert len(violations) == 0, f"Oversized modules (>{max_lines} lines):\n" + "\n".join(violations)
 
 
+@pytest.mark.size_ratchet
 def test_size_ratchet_manifest_matches_live_tree():
     """Exact module/function/band/byte debt matches the untruncated candidate tree."""
     from ouroboros.review import validate_size_ratchet
 
     errors = validate_size_ratchet(REPO)
     assert not errors, "Size-ratchet manifest violations:\n" + "\n".join(errors)
+
+
+@pytest.mark.size_ratchet
+def test_size_ratchet_transition_against_explicit_base():
+    """Official CI enforces the pairwise base-vs-tip shrink-only transition.
+
+    CI exports ``OURO_SIZE_RATCHET_BASE_REF`` (PR base SHA / push
+    ``event.before``); without it the check degrades to the tip's parent
+    manifest — the merge-aware local semantics. An all-zeros base (new-branch /
+    tag push) degrades the same way (never a skip), while manifest exactness
+    stays enforced by ``test_size_ratchet_manifest_matches_live_tree``.
+    """
+    from ouroboros.review import validate_size_ratchet_transition_against_base
+
+    base_ref = os.environ.get("OURO_SIZE_RATCHET_BASE_REF") or None
+    errors = validate_size_ratchet_transition_against_base(REPO, base_ref)
+    assert not errors, (
+        f"Size-ratchet pairwise transition violations (base={base_ref or 'HEAD-parent'}):\n" + "\n".join(errors)
+    )
 
 
 def test_js_module_gate_buckets_and_grandfathering():
@@ -505,6 +538,7 @@ def _get_function_sizes():
     return [(item.path, item.qualname, item.line_count) for item in iter_gated_functions(REPO)]
 
 
+@pytest.mark.size_ratchet
 def test_no_extremely_oversized_functions():
     """No function exceeds the hard gate."""
     from ouroboros.review import FUNCTION_DEBT, MAX_FUNCTION_LINES
@@ -618,12 +652,25 @@ def test_no_module_defines_the_same_top_level_name_twice():
     import ast
     import collections
     import pathlib
+    import subprocess
 
     root = pathlib.Path(__file__).resolve().parents[1]
+    # ASK GIT what this repo authors, instead of walking the filesystem behind an
+    # exclusion list. The list was already wrong twice over: a packaged install
+    # keeps a 1.1 GB bundled CPython at `python-standalone/`, and `.claude/worktrees/`
+    # holds whole extra checkouts of this same repo — so the sweep reported
+    # `enum.py: Enum defined 2x` from the standard library and every finding
+    # twice from the worktree copy. Both are gitignored, and so is the next one
+    # nobody has added yet; a list of exclusions has to keep growing, while the
+    # tracked set is exactly the question this test is asking (BIBLE P2).
+    tracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "*.py"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split("\0")
     offenders = []
-    for path in sorted(root.rglob("*.py")):
-        parts = set(path.parts)
-        if parts & {".git", "node_modules", "venv", ".venv", "build", "dist"}:
+    for rel in sorted(name for name in tracked if name):
+        path = root / rel
+        if not path.is_file():
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))

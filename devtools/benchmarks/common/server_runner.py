@@ -34,7 +34,11 @@ if __package__ in {None, ""}:
 from devtools.benchmarks.common.manifests import runtime_attestation
 from devtools.benchmarks.common.secrets import isolated_credential_grants  # noqa: F401 (re-export)
 from ouroboros.context_mode_compat import normalize_context_mode_compat
-from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS, provider_credential_plan
+from ouroboros.provider_models import (
+    ALL_PROVIDER_CREDENTIAL_KEYS,
+    LEGACY_MODEL_SETTING_KEYS,
+    provider_credential_plan,
+)
 from ouroboros.platform_layer import (
     kill_pid_tree,
     subprocess_new_group_kwargs,
@@ -52,12 +56,17 @@ STALE_INHERITED_ENV_KEYS = (
     "OUROBOROS_SERVER_HOST", "OUROBOROS_SERVER_PORT", "OUROBOROS_HOST_SERVICE_PORT",
     "OUROBOROS_APP_ROOT", "OUROBOROS_REPO_DIR", "OUROBOROS_DATA_DIR", "OUROBOROS_SETTINGS_PATH",
     "OUROBOROS_URL", "OUROBOROS_MANAGED_BY_LAUNCHER",
+    # The launcher-exported presentation posture describes the OPERATOR's desktop
+    # process; an isolated benchmark server is a headless web process and must
+    # not inherit "desktop_window".
+    "OUROBOROS_PRESENTATION",
     # The parent-pinned runtime-mode baseline is exported to subprocesses and is PREFERRED
     # over settings.json (config.initialize_runtime_mode_baseline / get_runtime_mode), so an
     # inherited value would boot the isolated server in the LIVE mode instead of its own
     # advanced sandbox — strip it so the sanitized settings win.
     "OUROBOROS_BOOT_RUNTIME_MODE",
     "USE_LOCAL_MAIN", "USE_LOCAL_CODE", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+    "USE_LOCAL_CONSCIOUSNESS", "OUROBOROS_REVIEWER_SLOTS",
     # Owner/control SECRETS must never leak into the isolated server's env (untrusted
     # benchmark tasks run here). Provider creds are loaded from the sanitized settings.json.
     "GITHUB_TOKEN", "GITHUB_REPO", "OUROBOROS_NETWORK_PASSWORD",
@@ -75,12 +84,18 @@ _ISO_SETTINGS_ALLOW_PREFIX = ("OUROBOROS_MODEL", "OUROBOROS_EFFORT", "LOCAL_MODE
 # see _grant_provider_credentials. Deliberately NOT a `*_API_KEY` pattern either: a custom
 # skill secret could be named `<x>_API_KEY` and must NOT be copied.
 _ISO_SETTINGS_ALLOW_EXACT = frozenset({
+    "OUROBOROS_SUBAGENTS",
+    "OUROBOROS_REVIEWER_SLOTS",
     "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
     # Review policy knobs (non-secret): must propagate so settings.json's task-acceptance
     # self-review config is honored by isolated benchmark servers (else it silently
     # falls back to the "auto" default and the end-of-task review never runs).
     "OUROBOROS_TASK_REVIEW_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
+    # Shared paid review-cycle ceiling (non-secret): bench templates pin it to
+    # "unlimited" for methodology comparability; a live-settings pin must forward
+    # into isolated bench servers the same way the other review knobs do.
+    "OUROBOROS_REVIEW_MAX_CYCLES",
     "CLAUDE_CODE_MODEL", "CLAUDE_AGENT_SDK_MODEL",
     # One-window false provenance tombstone: it travels with an explicit Low so
     # the isolated run keeps owner-Low/P3 semantics. Legacy true is normalized.
@@ -132,6 +147,8 @@ def build_isolated_settings(live_cfg: dict, **overrides) -> dict:
     out: dict = {}
     for key, value in (live_cfg or {}).items():
         ks = str(key)
+        if ks in LEGACY_MODEL_SETTING_KEYS:
+            continue
         if ks in ALL_PROVIDER_CREDENTIAL_KEYS:
             continue  # gated below on the declared slots, never copied wholesale
         if ks in _ISO_SETTINGS_ALLOW_EXACT or ks.startswith(_ISO_SETTINGS_ALLOW_PREFIX):

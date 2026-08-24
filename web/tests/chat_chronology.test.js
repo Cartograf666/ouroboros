@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    chatMediaMessageKey,
+    durableChatMediaUrl,
     insertTimelineNode,
+    isNonTerminalMediaHistoryRow,
     rawTimestampEpoch,
 } from '../modules/chat.js';
 import { normalizeLogTs } from '../modules/log_events.js';
@@ -115,4 +118,24 @@ test('log timestamps include the date outside today', () => {
     const older = normalizeLogTs('2025-07-18T10:00:00Z', now);
     assert.doesNotMatch(today, /2026/);
     assert.match(older, /2025/);
+});
+
+test('durable chat media accepts only the closed task-artifact URL shape', () => {
+    const good = `/api/tasks/task-1/artifacts/chat-media-${'a'.repeat(64)}.png`;
+    assert.equal(durableChatMediaUrl(good), good);
+    assert.equal(durableChatMediaUrl('/api/files/content?path=secret'), '');
+    assert.equal(durableChatMediaUrl(`/api/tasks/task-1/artifacts/${'a'.repeat(64)}.png`), '');
+});
+
+test('media replay dedup key is stable across live base64 and durable history URL', () => {
+    const common = { type: 'photo', ts: '2026-08-21T00:00:00Z', caption: 'shot', mime: 'image/png' };
+    const live = { ...common, image_base64: 'aGVsbG8=' };
+    const replay = { ...common, msg_type: 'photo', download_url: `/api/tasks/t/artifacts/chat-media-${'b'.repeat(64)}.png` };
+    assert.equal(chatMediaMessageKey(live), chatMediaMessageKey(replay));
+});
+
+test('URL-less media history rows cannot finalize a live task card', () => {
+    assert.equal(isNonTerminalMediaHistoryRow({ system_type: 'photo', task_id: 'running' }), true);
+    assert.equal(isNonTerminalMediaHistoryRow({ system_type: 'video', task_id: 'running' }), true);
+    assert.equal(isNonTerminalMediaHistoryRow({ system_type: 'task_summary', task_id: 'done' }), false);
 });

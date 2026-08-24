@@ -43,6 +43,8 @@ from ouroboros.event_bus import get_global_event_bus
 from ouroboros.extension_companion import CompanionDescriptor, get_global_supervisor, is_server_process
 from ouroboros.extension_ui_validation import (
     _assert_ws_message_type,
+    WIDGET_FRAME_MAX_HEIGHT,
+    WIDGET_FRAME_MIN_HEIGHT,
     validate_settings_schema as _validate_settings_schema,
     validate_ui_render as _validate_ui_render,
 )
@@ -245,6 +247,7 @@ def _validate_child_ui_descriptor(skill_name: str, item: Dict[str, Any]) -> Dict
     span = _widget_span_from_render(render)
     item["span"] = span
     item["grid_span"] = span
+    item.update(_widget_geometry_from_render(render))
     return item
 
 
@@ -539,6 +542,21 @@ def _widget_span_from_render(render: Dict[str, Any]) -> int:
     return 2 if value >= 2 else 1
 
 
+def _widget_geometry_from_render(render: Dict[str, Any]) -> Dict[str, int]:
+    """Promote normalized framed geometry into the host tab descriptor."""
+    geometry: Dict[str, int] = {}
+    for key in ("height", "max_height"):
+        value = render.get(key)
+        if value is None:
+            continue
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            continue
+        geometry[key] = max(WIDGET_FRAME_MIN_HEIGHT, min(numeric, WIDGET_FRAME_MAX_HEIGHT))
+    return geometry
+
+
 def set_ws_broadcaster(broadcaster: Callable[[dict], None] | None) -> None:
     """Install the host WebSocket broadcaster used by PluginAPI.send_ws_message."""
     global _ws_broadcaster
@@ -794,6 +812,7 @@ class PluginAPIImpl:
                 "render": validated_render,
                 "span": span,
                 "grid_span": span,
+                **_widget_geometry_from_render(validated_render),
                 "ui_host_pending": True,
             }, "ui_tabs", "ui tab")
 
@@ -1411,6 +1430,14 @@ def _apply_deps_block(state: Dict[str, Any], drive_root: pathlib.Path, skill: Lo
     return state
 
 
+def _apply_durable_extension_health(
+    state: Dict[str, Any], drive_root: pathlib.Path, skill: LoadedSkill
+) -> Dict[str, Any]:
+    from ouroboros.extension_health import apply_companion_failure_to_runtime_state
+
+    return apply_companion_failure_to_runtime_state(state, drive_root, skill.name)
+
+
 def runtime_state_for_skill_name(
     skill_name: str,
     drive_root: pathlib.Path,
@@ -1443,7 +1470,7 @@ def runtime_state_for_skill_name(
             "loaded_matches_current": False,
             "reason": "missing",
         }
-    return _apply_deps_block(
+    state = _apply_deps_block(
         _extension_runtime_state(
             skill,
             drive_root=pathlib.Path(drive_root),
@@ -1453,6 +1480,7 @@ def runtime_state_for_skill_name(
         pathlib.Path(drive_root),
         skill,
     )
+    return _apply_durable_extension_health(state, pathlib.Path(drive_root), skill)
 
 
 def runtime_state_for_loaded_skill(
@@ -1467,7 +1495,10 @@ def runtime_state_for_loaded_skill(
         drive_root=pathlib.Path(drive_root) if drive_root is not None else None,
         skills=skills,
     )
-    return _apply_deps_block(state, pathlib.Path(drive_root), skill) if drive_root is not None else state
+    if drive_root is None:
+        return state
+    root = pathlib.Path(drive_root)
+    return _apply_durable_extension_health(_apply_deps_block(state, root, skill), root, skill)
 
 
 def is_extension_live(

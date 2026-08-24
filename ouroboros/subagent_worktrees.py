@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.utils import atomic_write_json
-from ouroboros.config import DATA_DIR, get_subagent_projects_root, get_subagent_worktree_root
+from ouroboros.config import DATA_DIR, get_subagent_projects_root
 from ouroboros.retention import age_cutoff, get_gc_retention_days
 
 _REGISTRY_NAME = "subagent_worktrees.json"
@@ -998,3 +998,16 @@ def prune_orphans(
 def list_worktrees(data_dir: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Return registered worktree records (for UI / inspection)."""
     return _load_registry(data_dir)
+
+
+# The worktree root, read by the module that owns worktrees. Its only caller
+# was always this file; the getter simply lived a module away from it.
+def get_subagent_worktree_root() -> str:
+    """Filesystem root for acting self_worktree checkouts (outside repo/ and data/)."""
+    from ouroboros.config import SETTINGS_DEFAULTS as _SETTINGS_DEFAULTS
+
+    raw = str(
+        os.environ.get("OUROBOROS_SUBAGENT_WORKTREE_ROOT", "")
+        or _SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_WORKTREE_ROOT", "")
+    ).strip()
+    return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "subagent_worktrees"))

@@ -91,13 +91,18 @@ const HARNESS_CHIP_ICON = {
     codex: '◇',
     claude: '✳',
     cursor: '▸',
+    agy: '✦',
 };
 
 // Presentation names only, never behavior: the route id stays the opaque
 // Claudexor spelling; the owner knows the `claude` harness as the Claude Code
-// product, so that is what the chip prints.
+// product, so that is what the chip prints. `agy` earns an entry for a stronger
+// reason than polish: unlike the others its id is not a word the owner has ever
+// seen, so without one the chip would print a three-letter abbreviation for a
+// product called Antigravity.
 const HARNESS_CHIP_NAME = {
     claude: 'Claude Code',
+    agy: 'Antigravity',
 };
 
 export function executorChip(evt) {
@@ -1046,11 +1051,15 @@ export function summarizeChatLiveEvent(evt) {
         const unavailable = evt.cost_accounting_status === 'unavailable';
         const ownCost = unavailable ? 'cost unavailable' : formatLogMoney(accountedUpperBound(evt));
         const subtreeCost = unavailable ? '' : formatLogMoney(accountedUpperBoundWithChildren(evt));
+        // A cost checkpoint is bookkeeping, never the task's conclusion: only
+        // the settled task_done resolves the card. On the blocking lane this
+        // frame precedes task_done; treating it as terminal closed the card
+        // early, and a live card mid-"Finalizing…" must absorb it quietly.
         return chatView({
-            phase: unavailable ? 'warn' : 'done',
-            headline: unavailable ? 'Cost accounting unavailable' : 'Done',
+            phase: unavailable ? 'warn' : 'usage',
+            headline: unavailable ? 'Cost accounting unavailable' : 'Cost finalized',
             visible: false,
-            terminal: true,
+            terminal: false,
             meta: [ownCost, subtreeCost ? `subtree=${subtreeCost}` : ''].filter(Boolean),
             dedupeKey: key('task-cost-finalized', evt.post_task_status || ''),
         });

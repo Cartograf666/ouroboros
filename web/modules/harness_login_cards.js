@@ -25,19 +25,23 @@
 //   * `full`    — exactly what Settings renders today: link/device code,
 //                 the optional paste-code entry, the live state line, the
 //                 verdict + the engine's own sentence, the collapsed Advanced
-//                 terminal fallback, and Close.
-//   * `compact` — Connect + progress + verified state + retry only, for a
-//                 wizard step. Disclosed residual: the paste-code entry and
-//                 the Advanced terminal fallback are NOT rendered in compact,
-//                 so a claude login whose localhost callback cannot complete
-//                 (browser on another device) has no finishing path in that
-//                 mode; the onboarding phase decides whether to keep it that
-//                 way or opt into `full`.
+//                 terminal fallback (or an explicit external continuation),
+//                 and Close.
+//   * `compact` — Connect + progress + verified state + retry, for a wizard
+//                 step. The optional paste-code entry and the delayed Advanced
+//                 fallback stay full-only. Any available attach command is
+//                 rendered directly in compact, while an explicitly selected
+//                 external-terminal continuation is direct in BOTH modes, so
+//                 neither mode strands the completion path.
 //
 // Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { accountLoginConfirmed, claudexorStatus } from './claudexor_status_store.js';
+import {
+    accountLoginConfirmed,
+    claudexorStatus,
+    familyLabel,
+} from './claudexor_status_store.js';
 import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
 
 const JOB_POLL_MS = 3000;
@@ -46,6 +50,14 @@ export const JOB_POLL_GIVE_UP_FAILURES = 10;
 
 export const LOGIN_CARD_FULL = 'full';
 export const LOGIN_CARD_COMPACT = 'compact';
+
+export const TERMINAL_TRANSPORT_ERROR_CODES = Object.freeze([
+    'terminal_transport_unavailable',
+    'terminal_transport_unsupported',
+    'terminal_transport_probe_failed',
+    'terminal_transport_failed',
+]);
+const TERMINAL_TRANSPORT_ERRORS = new Set(TERMINAL_TRANSPORT_ERROR_CODES);
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
@@ -63,6 +75,45 @@ export function nextJobPollDelay(consecutiveFailures) {
         delayMs: Math.min(JOB_POLL_MS * 2 ** failures, JOB_POLL_MAX_DELAY_MS),
         giveUp: false,
     };
+}
+
+export function normalizeProfileName(raw) {
+    // The ENGINE's registration contract is the authority: a profile id must
+    // match ^[a-z0-9][a-z0-9_-]{0,63}$ (Claudexor profile-registration slug).
+    // Lowercase, map every other character to '-', strip separators the slug
+    // may not START with, cap at the engine's 64, and return '' for anything
+    // that still cannot satisfy the contract (e.g. a name with no ASCII
+    // alphanumerics at all) — an empty result makes the dialog/card ask again
+    // instead of submitting a name the engine would refuse. Lives with the
+    // login card; `harness_accounts.js` re-exports the established path.
+    const mapped = String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+    const slug = mapped.replace(/^[-_]+/, '').slice(0, 64);
+    return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(slug) ? slug : '';
+}
+
+export function profileNameSubmission(raw) {
+    // The same loop-until-stable rule `promptProfileName` (Add account)
+    // applies: a submitted name STARTS a login only when it already IS its
+    // normalized form; otherwise the normalized spelling is handed back,
+    // editable, with a note — never rewritten silently. Pure for node tests.
+    const typed = String(raw || '').trim();
+    const normalized = normalizeProfileName(typed);
+    if (!normalized) {
+        return { profile: '', normalized: '',
+            note: 'Enter a name that starts with a lowercase letter or digit — '
+                + 'letters, digits, "-" and "_", at most 64 characters.' };
+    }
+    if (normalized !== typed) {
+        return { profile: '', normalized,
+            note: `"${typed}" will be saved as "${normalized}" — edit the name or press the button again to continue.` };
+    }
+    return { profile: normalized, normalized, note: '' };
+}
+
+export function attachShellLabel(shell) {
+    if (shell === 'powershell') return 'PowerShell';
+    if (shell === 'posix') return 'POSIX shell';
+    return 'your terminal shell';
 }
 
 export function deviceCodeDisclosure(envelope) {
@@ -88,12 +139,36 @@ export function deviceCodeDisclosure(envelope) {
 // owner rejected terminal-first login outright. Pure for node tests.
 export function loginCardFace(active) {
     if (!active) return 'none';
+    if (active.needsProfile) return 'name';
     if (active.error) return 'error';
     if (active.verdict?.kind === 'recovery') return 'recovery';
     if (active.verdict?.kind === 'reconciled') return 'reconciled';
     if (active.verdict?.kind === 'unavailable') return 'unavailable';
     if (deviceCodeDisclosure(active.envelope || {})) return 'device';
     return 'progress';
+}
+
+function durableTerminalTransportError(active) {
+    const code = active?.envelope?.job?.nativeCommand?.errorCode;
+    return typeof code === 'string' && TERMINAL_TRANSPORT_ERRORS.has(code) ? code : '';
+}
+
+export function externalTerminalActionAvailable(active) {
+    if (!active || active.transport === 'client_pty' || active.attachCommand) return false;
+    const problemCode = String(active.problemCode || '');
+    const actions = Array.isArray(active.requiredActions) ? active.requiredActions : [];
+    if (TERMINAL_TRANSPORT_ERRORS.has(problemCode)) {
+        return actions.includes('use_external_terminal');
+    }
+    return Boolean(durableTerminalTransportError(active));
+}
+
+export function loginRetryAvailable(active) {
+    const code = String(active?.problemCode || '') || durableTerminalTransportError(active);
+    if (code !== 'terminal_transport_unavailable'
+        && code !== 'terminal_transport_unsupported') return true;
+    const actions = Array.isArray(active?.requiredActions) ? active.requiredActions : [];
+    return actions.includes('retry_setup_login');
 }
 
 // How long the card waits for the engine to disclose a sign-in link before
@@ -270,6 +345,20 @@ export async function confirmLoginLive(harness, profileId, {
     return { confirmed: false, stale: false, payload };
 }
 
+export function resolvedJobProfileId(envelope) {
+    // The profile a login job REALLY targets, read off the job's own record.
+    // On a legacy engine a default login carries `profileId: null` — the
+    // empty-string address the native pseudo-row answers to. On a unified
+    // engine (plan §K.4) the engine resolves a default login onto its
+    // bootstrap registry row and the job record names it, so the verify-race
+    // must ask about THAT row: no row with the empty id exists there, and an
+    // unresolved '' address would report every successful default login as
+    // unconfirmed. A named login's job names the same profile the card
+    // started with, so adopting the job's answer is safe on both engines.
+    const raw = envelope?.job?.profileId;
+    return typeof raw === 'string' ? raw : '';
+}
+
 export function pollResponseApplies(captured, current) {
     // Whether a poll answer may still be written onto the card. It belongs to
     // the job it was captured for (`captured === current`: the card may have
@@ -293,6 +382,42 @@ export function jobStateSummary(envelope) {
     const terminal = ['succeeded', 'failed', 'cancelled', 'timed_out',
         'interrupted_unknown', 'not_supported'].includes(state);
     return { state, phase, terminal, succeeded: state === 'succeeded' };
+}
+
+// A short vendor paste window, said out loud. Antigravity's sign-in code
+// expires 60 seconds after the link opens — the vendor's own limit
+// (`AGY_LOGIN_WINDOW_MS`, "no flag to extend") — and the card used to run that
+// clock in total silence: no countdown while it ran, and a bare "timed out"
+// once it had. Two live sign-ins died on it before anyone could see why.
+//
+// Only a NARROW deadline is announced. Every job carries one, and a routine
+// several-minute budget is not news; a minute is, because it changes what the
+// owner should do next (have the browser tab ready before clicking).
+export const NARROW_LOGIN_WINDOW_MS = 150_000;
+
+export function loginDeadlineNote(envelope, nowMs) {
+    const summary = jobStateSummary(envelope || {});
+    if (summary.terminal) return '';
+    const job = envelope?.job;
+    const deadline = Date.parse(String(job?.deadlineAt || ''));
+    const started = Date.parse(String(job?.startedAt || ''));
+    if (!Number.isFinite(deadline)) return '';
+    // The WINDOW decides whether this is worth saying, not the time left: a
+    // roomy job that happens to be nearly spent must not start shouting.
+    const window = Number.isFinite(started) ? deadline - started : NaN;
+    if (Number.isFinite(window) && window > NARROW_LOGIN_WINDOW_MS) return '';
+    const left = Math.round((deadline - Number(nowMs)) / 1000);
+    if (!Number.isFinite(left)) return '';
+    if (left <= 0) return 'The sign-in window has closed — start again.';
+    return `About ${left}s left to paste the code — this vendor's window is short.`;
+}
+
+export function loginTimeoutHelp(envelope) {
+    // The typed timeout, EXPLAINED rather than merely named, beside the verdict
+    // so a second attempt is an informed one.
+    if (String(envelope?.job?.outcome?.reason || '') !== 'timed_out') return '';
+    return 'The sign-in code expires about a minute after the link opens. '
+        + 'Start again and keep this window open — the code goes in the field here.';
 }
 
 export const LOGIN_CUSTODY_RELEASED = 'released';
@@ -398,7 +523,27 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         `<h4>Connect ${escapeHtml(active.harness)}${active.profile ? ` (${escapeHtml(active.profile)})` : ''}</h4>`];
     if (face === 'error') {
         bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);
-        bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
+        if (loginRetryAvailable(active)) {
+            bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
+        }
+    } else if (face === 'name') {
+        // The engine refused to CREATE the default login and said why — its
+        // sentence is the honest source of the reason and is shown verbatim.
+        // The card turns that dead end into the action the refusal asks for:
+        // name an account (same validation the Add-account dialog runs) and
+        // start the NAMED login through the same standard flow.
+        bits.push(`<div class="settings-inline-note" data-tone="error" data-login-engine-said>${escapeHtml(active.needsProfile.message)}</div>`);
+        bits.push(`
+            <div class="harness-code-entry" data-profile-name-entry>
+                <label for="harness-profile-name-input">Name for the ${escapeHtml(active.needsProfile.familyLabel || active.harness)} account (e.g. work, backup). Lowercase letters, digits, "-" and "_" — anything else becomes "-".</label>
+                <div class="harness-code-entry-row">
+                    <input type="text" id="harness-profile-name-input" data-profile-name-input autocomplete="off" spellcheck="false"
+                        placeholder="account name" value="${escapeHtml(active.profileNameValue || '')}">
+                    <button type="button" class="btn btn-primary" data-profile-name-submit>Add account &amp; connect</button>
+                </div>
+                ${active.profileNameNote ? `<div class="settings-inline-status" data-tone="muted" data-profile-name-note>${escapeHtml(active.profileNameNote)}</div>` : ''}
+            </div>
+        `);
     } else if (face === 'device') {
         // LINK-FIRST: the prominent action is opening the disclosed sign-in
         // URL, with an explicit copy affordance (the macOS-app card pattern).
@@ -410,7 +555,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         bits.push(href ? `
             <div class="harness-signin-actions">
                 <a class="btn btn-primary" data-open-signin href="${href}" target="_blank" rel="noopener">Open sign-in link</a>
-                <button type="button" class="settings-ghost-btn" data-copy-signin-link>Copy link</button>
+                <button type="button" class="btn btn-default" data-copy-signin-link>Copy link</button>
             </div>
         ` : `
             <div class="settings-inline-note" data-tone="error" data-unsafe-signin-link>
@@ -424,7 +569,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
                 <div class="harness-device-code">
                     <p>Enter this one-time code on that page:</p>
                     <div class="harness-code" data-device-code>${escapeHtml(disclosure.code)}</div>
-                    <button type="button" class="settings-ghost-btn" data-copy-device-code>Copy code</button>
+                    <button type="button" class="btn btn-default" data-copy-device-code>Copy code</button>
                 </div>
             `);
         }
@@ -436,11 +581,17 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     // card, a snapshot that still reads pending — a poll response captured
     // before the job settled — must not print "Waiting for the sign-in link…"
     // underneath "Connected.".
-    if (face !== 'error' && !active.verdict && !active.confirming) {
+    if (face !== 'error' && face !== 'name' && !active.verdict && !active.confirming) {
         const line = active.preparingRuntime
             ? 'Installing or checking Claudexor…'
             : loginStatusLine(active.envelope || {});
         if (line) bits.push(`<div class="settings-inline-status" data-tone="muted" data-login-state>${escapeHtml(line)}</div>`);
+        // Beside it, the clock — but only when the vendor's window is short
+        // enough to change what the owner should do (see loginDeadlineNote).
+        const deadline = loginDeadlineNote(active.envelope || {}, nowMs);
+        if (deadline) {
+            bits.push(`<div class="settings-inline-status" data-tone="warn" data-login-deadline>${escapeHtml(deadline)}</div>`);
+        }
     }
     // Shape 2: the ALWAYS-VISIBLE paste-code entry for a job whose disclosure
     // flow is `oauth_url_input`. Claude's CLI prompts for the code only when
@@ -457,7 +608,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
                 <div class="harness-code-entry-row">
                     <input type="text" id="harness-code-input" data-login-code-input autocomplete="off" spellcheck="false"
                         placeholder="sign-in code" value="${escapeHtml(active.inputValue || '')}"${active.inputSent ? ' disabled' : ''}>
-                    <button type="button" class="settings-ghost-btn" data-login-code-submit${busy ? ' disabled' : ''}>${active.inputBusy ? 'Sending…' : (active.inputSent ? 'Code sent' : 'Submit code')}</button>
+                    <button type="button" class="btn btn-default" data-login-code-submit${busy ? ' disabled' : ''}>${active.inputBusy ? 'Sending…' : (active.inputSent ? 'Code sent' : 'Submit code')}</button>
                 </div>
                 ${active.inputError ? `<div class="settings-inline-note" data-tone="error">${escapeHtml(active.inputError)}</div>` : ''}
                 ${active.inputSent ? `<div class="settings-inline-status" data-tone="muted">${escapeHtml(active.inputNote || 'Code sent — finishing the sign-in…')}</div>` : ''}
@@ -499,7 +650,8 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     // A settled non-success verdict in COMPACT mode still offers the retry the
     // mode promises; in full mode the account row's own Connect button is the
     // retry, exactly as today.
-    if (compact && (active.verdict?.kind === 'failure' || active.verdict?.kind === 'unconfirmed')) {
+    if (compact && loginRetryAvailable(active)
+        && (active.verdict?.kind === 'failure' || active.verdict?.kind === 'unconfirmed')) {
         bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
     }
     // …and beside that verdict, the engine's own explanation. The two verdict
@@ -516,24 +668,59 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         if (detail) {
             bits.push(`<div class="settings-inline-note" data-login-detail>${escapeHtml(detail)}</div>`);
         }
+        // "agy login timed_out." names the outcome without explaining it. The
+        // owner's next attempt should know the clock is a vendor minute.
+        const help = loginTimeoutHelp(active.envelope || {});
+        if (help) {
+            bits.push(`<div class="settings-inline-note" data-login-timeout-help>${escapeHtml(help)}</div>`);
+        }
+    }
+    if (externalTerminalActionAvailable(active)) {
+        bits.push(`
+            <div class="settings-inline-note" data-login-external-action>
+                This sign-in cannot use the in-app terminal transport on this host.
+            </div>
+            <button type="button" class="btn btn-primary" data-login-external-terminal>Continue in external terminal</button>
+        `);
+    }
+    // An explicit external-terminal continuation exposes its usable command
+    // immediately in both render modes; compact also exposes any attach-capable
+    // job directly because it has no Advanced wrapper. This is inert copy-paste
+    // text for the labelled shell, never an embedded terminal.
+    const directExternal = !!active.attachCommand && !summary.terminal
+        && (active.transport === 'client_pty' || compact);
+    if (directExternal) {
+        const commandLabel = attachShellLabel(active.attachShell);
+        bits.push(`
+            <div class="harness-external-terminal" data-login-external-command>
+                <p>Continue this sign-in in your own terminal (outside Ouroboros).</p>
+                <p><strong>Command for ${escapeHtml(commandLabel)}:</strong></p>
+                <pre class="harness-attach-command" data-attach-command>${escapeHtml(active.attachCommand)}</pre>
+                <button type="button" class="btn btn-default" data-copy-attach>Copy command</button>
+            </div>
+        `);
     }
     // The demoted attach fallback: a collapsed Advanced affordance, only when
     // due (engine predates the disclosure modes, or no link within the
     // window) and only while the job can still be attached.
-    if (!compact && !summary.terminal && attachFallbackDue(active, nowMs)) {
+    if (!compact && !directExternal && !summary.terminal && attachFallbackDue(active, nowMs)) {
+        const commandLabel = attachShellLabel(active.attachShell);
         bits.push(`
             <details class="harness-advanced" data-login-advanced${active.advancedOpen ? ' open' : ''}>
                 <summary>Advanced: sign in from your own terminal</summary>
                 <p>${active.engineDegraded
-        ? 'This engine cannot host the sign-in in the app yet. Run this in your own terminal (outside Ouroboros); the card follows the progress automatically:'
+        ? (active.setupLoginSource === 'legacy_global_operation'
+            ? 'This older agent service exposes only a global sign-in capability, not a per-agent host guarantee. Run this in your own terminal (outside Ouroboros); the card follows the progress automatically:'
+            : 'This agent uses an external terminal for sign-in on this host. Run this outside Ouroboros; the card follows the progress automatically:')
         : 'No sign-in link arrived yet. You can run this in your own terminal (outside Ouroboros) instead; the card follows the progress automatically:'}</p>
+                <p><strong>Command for ${escapeHtml(commandLabel)}:</strong></p>
                 <pre class="harness-attach-command" data-attach-command>${escapeHtml(active.attachCommand)}</pre>
-                <button type="button" class="settings-ghost-btn" data-copy-attach>Copy command</button>
+                <button type="button" class="btn btn-default" data-copy-attach>Copy command</button>
             </details>
         `);
     }
     if (!compact) {
-        bits.push('<button type="button" class="settings-ghost-btn" data-login-dismiss>Close</button>');
+        bits.push('<button type="button" class="btn btn-default" data-login-dismiss>Close</button>');
     }
     bits.push('</div>');
     return bits.join('');
@@ -546,13 +733,17 @@ export function preserveCardFocus(host, swap, doc = typeof document === 'undefin
     // three seconds. The focused entry and its selection are captured across
     // the swap and restored onto the element that replaced it.
     const prior = doc ? doc.activeElement : null;
-    const keep = Boolean(prior && host.contains?.(prior)
-        && prior.hasAttribute?.('data-login-code-input'));
+    // The paste-code field AND the name-the-account field share the fate: a
+    // re-render (poll tick, or the name face redrawing its normalization note)
+    // replaces the input mid-typing.
+    const marker = ['data-login-code-input', 'data-profile-name-input']
+        .find((attr) => prior && host.contains?.(prior) && prior.hasAttribute?.(attr));
+    const keep = Boolean(marker);
     const start = keep ? prior.selectionStart : null;
     const end = keep ? prior.selectionEnd : null;
     swap();
     if (!keep) return;
-    const next = host.querySelector?.('[data-login-code-input]');
+    const next = host.querySelector?.(`[${marker}]`);
     if (!next || next.disabled) return;
     next.focus?.();
     if (typeof next.setSelectionRange === 'function' && start !== null) {
@@ -669,7 +860,13 @@ export function createLoginCardController({
             // transient note and settles the real verdict. _startLocked stops
             // polling itself once the previous job is terminal or provably
             // cancelled.
-            start(active.harness, active.profile);
+            start(active.harness, active.profile, active.transport);
+        });
+        hostEl.querySelector('[data-login-external-terminal]')?.addEventListener('click', () => {
+            // This is a NEW job through the same serialized release/custody
+            // guard as every other start. Never mutate the active job into a
+            // different transport and never auto-fallback.
+            start(active.harness, active.profile, 'client_pty');
         });
         hostEl.querySelector('[data-copy-signin-link]')?.addEventListener('click', () => {
             const disclosure = deviceCodeDisclosure(active.envelope || {});
@@ -691,6 +888,12 @@ export function createLoginCardController({
         codeInput?.addEventListener('keydown', (event) => {
             if (event.key === 'Enter') { event.preventDefault(); submitCodeFromCard(active); }
         });
+        const nameInput = hostEl.querySelector('[data-profile-name-input]');
+        nameInput?.addEventListener('input', () => { active.profileNameValue = nameInput.value; });
+        nameInput?.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') { event.preventDefault(); submitProfileNameFromCard(active); }
+        });
+        hostEl.querySelector('[data-profile-name-submit]')?.addEventListener('click', () => submitProfileNameFromCard(active));
         hostEl.querySelector('[data-login-code-submit]')?.addEventListener('click', () => submitCodeFromCard(active));
         hostEl.querySelector('[data-login-reconcile]')?.addEventListener('click', () => reconcile(active));
         hostEl.querySelector('[data-login-dismiss]')?.addEventListener('click', () => close(active));
@@ -832,11 +1035,13 @@ export function createLoginCardController({
             return Promise.resolve(ctl.detachedStatus);
         }
         const active = ctl.active;
-        if (active?.error && !active.jobId
+        if ((active?.error || active?.needsProfile) && !active.jobId
             && (expected === undefined || expected === active)) {
             // A create that produced no usable identity has nothing this card
-            // can address with DELETE. Preserve the unknown status, but keep
-            // the existing Close affordance usable through honest local detach.
+            // can address with DELETE. A typed refusal carries absent=true and
+            // detaches as released; an untyped discovery/transport failure
+            // preserves unknown. Either way the existing Close affordance is
+            // usable through honest local detach.
             const result = detach();
             onSettled();
             return Promise.resolve(result);
@@ -898,6 +1103,23 @@ export function createLoginCardController({
         });
     }
 
+    function submitProfileNameFromCard(active) {
+        // The "name the account" face's submit: the same validation loop the
+        // Add-account dialog runs (`promptProfileName`) — a name normalization
+        // would rewrite is shown back, editable, before any login starts. A
+        // stable name starts the NAMED login through the one standard start
+        // path (create → poll → verdict), which replaces this face.
+        if (!active?.needsProfile || ctl.active !== active || ctl.disposed) return;
+        const answer = profileNameSubmission(active.profileNameValue);
+        if (!answer.profile) {
+            if (answer.normalized) active.profileNameValue = answer.normalized;
+            active.profileNameNote = answer.note;
+            render();
+            return;
+        }
+        start(active.harness, answer.profile, active.transport);
+    }
+
     async function submitCodeFromCard(active) {
         // Double-submit guard: one POST in flight at a time, and an accepted
         // code is final — the button stays disabled after success.
@@ -941,7 +1163,7 @@ export function createLoginCardController({
         render();
     }
 
-    function start(harness, profile) {
+    function start(harness, profile, transport = '') {
         if (!harness || ctl.disposed) return Promise.resolve();
         // Duplicate starts are COALESCED, not merely serialized. The queue
         // guaranteed order, and order made an ordinary double-click into
@@ -955,9 +1177,9 @@ export function createLoginCardController({
         // classify this 53 KB module as binary, and `grep` then answers with
         // SILENCE instead of "no match", so a reviewer looking for a symbol
         // in here concludes it does not exist. Same key, same collisions.
-        const key = `${harness}\u0000${profile || ''}`;
+        const key = `${harness}\u0000${profile || ''}\u0000${transport || ''}`;
         if (ctl.pendingStart && ctl.pendingStart.key === key) return ctl.pendingStart.promise;
-        const promise = withLoginTransition(() => _startLocked(harness, profile));
+        const promise = withLoginTransition(() => _startLocked(harness, profile, transport));
         const clear = () => {
             if (ctl.pendingStart && ctl.pendingStart.promise === promise) ctl.pendingStart = null;
         };
@@ -968,7 +1190,7 @@ export function createLoginCardController({
         return promise;
     }
 
-    async function _startLocked(harness, profile) {
+    async function _startLocked(harness, profile, transport = '') {
         // Re-read after the queue wait: a shutdown may have been queued ahead of
         // this start, and a disposed controller must not create a job nobody
         // will ever poll or cancel.
@@ -1013,11 +1235,14 @@ export function createLoginCardController({
         // server/engine decide the hosting (loginFlow rides only for codex).
         const body = { harness, login_flow: 'device_auth' };
         if (profile) body.profile_id = profile;
+        if (transport === 'client_pty') body.transport = transport;
         ctl.active = {
-            harness, profile, jobId: '', envelope: null, absent: false, custodyStatus: '',
-            attachCommand: '', error: '',
+            harness, profile, transport, jobId: '', envelope: null, absent: false, custodyStatus: '',
+            attachCommand: '', attachShell: '', setupLoginSource: '', error: '',
+            problemCode: '', requiredActions: [],
             startedAtMs: now(), engineDegraded: false,
             inputValue: '', inputBusy: false, inputSent: false, inputError: '', inputNote: '',
+            needsProfile: null, profileNameValue: '', profileNameNote: '',
             verdict: null, confirming: false, advancedOpen: false, preparingRuntime: true,
         };
         const active = ctl.active;
@@ -1030,7 +1255,44 @@ export function createLoginCardController({
             });
             const data = await resp.json().catch(() => null);
             if (ctl.active !== active) return;
-            if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
+            if (!resp.ok) {
+                const actions = Array.isArray(data?.required_actions)
+                    ? data.required_actions.map(String) : [];
+                const problemCode = typeof data?.code === 'string' ? data.code : '';
+                active.problemCode = problemCode;
+                active.requiredActions = actions;
+                if (problemCode) {
+                    // A typed daemon refusal before a durable job was returned
+                    // proves this client owns no setup custody. Generic
+                    // discovery/transport failures carry no code and remain
+                    // honestly unknown.
+                    active.absent = true;
+                    active.custodyStatus = LOGIN_CUSTODY_RELEASED;
+                }
+                if (resp.status === 400 && !profile
+                    && problemCode === 'credential_profile_required'
+                    && actions.includes('add_named_account')) {
+                    // The engine's typed verdict, not harness identity, family
+                    // emptiness, status alone or prose, selects the name face.
+                    // A named create and every unrelated 400/409 stay ordinary
+                    // errors. The refusal also
+                    // proves no job exists (the daemon answered the create with
+                    // a refusal), so custody is honestly absent/released.
+                    active.preparingRuntime = false;
+                    active.needsProfile = {
+                        message: String(data?.error || `HTTP ${resp.status}`),
+                        // The engine's display name ("Antigravity"), resolved
+                        // at detection where the store is at hand — the pure
+                        // renderer must not reach for a global (raw id is the
+                        // no-payload fallback).
+                        familyLabel: familyLabel(harness, store?.snapshot || null) || String(harness || ''),
+                    };
+                    releaseStatusPolling();
+                    render();
+                    return;
+                }
+                throw new Error(data?.error || `HTTP ${resp.status}`);
+            }
             // A 2xx is not a created job. Without a job id there is nothing to
             // poll, nothing to cancel and nothing to report: the card used to
             // accept such an answer and sit "Starting the sign-in…" forever,
@@ -1043,6 +1305,8 @@ export function createLoginCardController({
             active.jobId = jobId;
             active.envelope = data;
             active.attachCommand = String(data.attach_command || '');
+            active.attachShell = String(data.attach_shell || '');
+            active.setupLoginSource = String(data.setup_login_source || '');
             // An engine that predates the disclosure modes never sends a link;
             // the demoted Advanced fallback may show right away (still collapsed).
             active.engineDegraded = data.disclosure_native === false
@@ -1196,7 +1460,15 @@ export function createLoginCardController({
         // — briefly re-polled, is the judge.
         active.confirming = true;
         render();
-        const check = await confirmLoginLive(active.harness, active.profile || '', {
+        // The row address: the profile the card started with, upgraded to the
+        // job's OWN resolved profile when the engine names one — a unified
+        // engine resolves a default login onto its bootstrap registry row, and
+        // only that row can confirm it (resolvedJobProfileId). On a legacy
+        // engine the job carries null for a default login and the address
+        // stays the empty string, byte-identical to today.
+        const rowAddress = active.profile
+            || resolvedJobProfileId(active.envelope || {}) || '';
+        const check = await confirmLoginLive(active.harness, rowAddress, {
             store,
             isStale: () => ctl.active !== active,
         });
@@ -1209,7 +1481,7 @@ export function createLoginCardController({
         // the newest committed snapshot is judged with the same predicate
         // before "unconfirmed" may be said.
         const confirmed = check.confirmed
-            || accountLoginConfirmed(store?.snapshot, active.harness, active.profile || '');
+            || accountLoginConfirmed(store?.snapshot, active.harness, rowAddress);
         // An exhausted window is not a failure verdict: the job's own read was
         // already judged unproven, and the account row often appears a tick after
         // the bounded re-poll gives up. Say that, and say where to look.
@@ -1259,6 +1531,10 @@ export function createLoginCardController({
         render,
         dispose,
         detach,
+        // The name-the-account face's submit seam (the card's own input/button
+        // wiring calls the same function); exposed for node tests, which have
+        // no DOM to click through.
+        submitProfileName: () => submitProfileNameFromCard(ctl.active),
         get active() { return ctl.active; },
         get disposed() { return ctl.disposed; },
         get mode() { return mode; },

@@ -92,11 +92,13 @@ class HostServiceContext:
         bridge_getter: Optional[Callable[[], Any]] = None,
         tool_schemas_getter: Optional[Callable[[], list[dict[str, Any]]]] = None,
         ws_broadcaster_getter: Optional[Callable[[], Callable[[dict], None]]] = None,
+        presence_runner: Optional[Callable[..., Any]] = None,
     ):
         self.data_dir = pathlib.Path(data_dir)
         self.bridge_getter = bridge_getter or self._default_bridge
         self.tool_schemas_getter = tool_schemas_getter or self._default_tool_schemas
         self.ws_broadcaster_getter = ws_broadcaster_getter or self._default_ws_broadcaster
+        self.presence_runner = presence_runner or self._default_presence_runner
         self.rate_limiter = _RateLimiter()
         self._inflight: Dict[str, int] = defaultdict(int)
         self._inflight_lock = threading.Lock()
@@ -123,6 +125,17 @@ class HostServiceContext:
         from ouroboros.gateway.ws import broadcast_ws_sync
 
         return broadcast_ws_sync
+
+    def _default_presence_runner(self, **kwargs: Any) -> Any:
+        from ouroboros.presence_runner import run_presence_turn
+        from supervisor.workers import REPO_DIR, get_event_q
+
+        return run_presence_turn(
+            repo_dir=pathlib.Path(REPO_DIR),
+            drive_root=self.data_dir,
+            event_queue=get_event_q(),
+            **kwargs,
+        )
 
     @property
     def skills_state_dir(self) -> pathlib.Path:
@@ -361,6 +374,189 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         ctx._leave_inflight(skill_name)
 
 
+def _presence_staged_files(
+    ctx: HostServiceContext,
+    skill_name: str,
+    value: Any,
+) -> tuple[pathlib.Path, ...]:
+    if value in (None, []):
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("staged_files must be a list of paths")
+    state_root = (ctx.skills_state_dir / skill_name).resolve(strict=False)
+    files = []
+    for index, raw in enumerate(value):
+        # Keep the host boundary responsible only for request shape and source
+        # confinement.  Missing/non-file inputs and the staging limit belong to
+        # the existing canonical staging owner, which emits the complete typed
+        # ordinal manifest before Presence can call the model.
+        path = pathlib.Path(str(raw or "")).expanduser().resolve(strict=False)
+        try:
+            path.relative_to(state_root)
+        except ValueError as exc:
+            raise ValueError(f"staged_files[{index}] is outside this skill's state") from exc
+        files.append(path)
+    return tuple(files)
+
+
+async def _api_presence_turn(request: Request) -> JSONResponse:
+    """Run one non-owner event under a host-resolved reviewed profile ceiling."""
+
+    ctx: HostServiceContext = request.app.state.host_service_context
+    try:
+        skill_name, token_payload = ctx.authenticate_token_payload(
+            request.headers.get("x-skill-token", "")
+        )
+        ctx.require_permission(skill_name, token_payload, "presence")
+    except HostServiceAuthError as exc:
+        return _json_error(str(exc), 403)
+    if not ctx.rate_limiter.allow(f"{skill_name}:presence"):
+        return _json_error("rate limit exceeded", 429)
+    if not ctx._enter_inflight(skill_name):
+        return _json_error("too many in-flight presence requests", 429)
+    from ouroboros.presence_admission import PresenceAdmissionError, admit_presence_turn
+    from ouroboros.presence_runner import PresenceTurnError, PresenceTurnEvent
+
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict) or set(payload) - {"binding_id", "event", "staged_files"}:
+            return _json_error("invalid presence payload", 400)
+        event_payload = payload.get("event")
+        expected = {
+            "source_event_id", "provider", "account_id", "conversation_id", "thread_id",
+            "conversation_key", "actor", "conversation", "message", "text",
+        }
+        if not isinstance(event_payload, dict) or set(event_payload) != expected:
+            return _json_error("invalid presence event", 400)
+
+        from ouroboros.loop import _resolve_loop_max_rounds
+        admission = admit_presence_turn(
+            drive_root=ctx.data_dir,
+            authenticated_transport_skill=skill_name,
+            binding_id=str(payload.get("binding_id") or ""),
+            global_max_rounds=_resolve_loop_max_rounds(),
+        )
+        provider = str(event_payload.get("provider") or "").strip()
+        account_id = str(event_payload.get("account_id") or "").strip()
+        conversation_id = str(event_payload.get("conversation_id") or "").strip()
+        thread_id = str(event_payload.get("thread_id") or "").strip()
+        if (
+            provider != admission.origin.transport
+            or account_id != admission.origin.account_id
+            or (
+                admission.origin.conversation_id != "*"
+                and conversation_id != admission.origin.conversation_id
+            )
+            or (admission.origin.thread_id and thread_id != admission.origin.thread_id)
+        ):
+            return _json_error("presence event does not match its owner-created binding", 403)
+        event = PresenceTurnEvent(
+            source_event_id=str(event_payload["source_event_id"] or "").strip(),
+            provider=provider,
+            account_id=account_id,
+            conversation_id=conversation_id,
+            thread_id=thread_id,
+            # The transport authenticates provider facts, but it does not get
+            # to choose the concurrency/history identity. Derive that identity
+            # from the binding-checked origin facts above.
+            conversation_key=":".join((
+                provider,
+                account_id,
+                conversation_id,
+                thread_id or "0",
+            )),
+            actor=dict(event_payload["actor"]) if isinstance(event_payload["actor"], dict) else {},
+            conversation=(
+                dict(event_payload["conversation"])
+                if isinstance(event_payload["conversation"], dict)
+                else {}
+            ),
+            message=dict(event_payload["message"]) if isinstance(event_payload["message"], dict) else {},
+            text=str(event_payload["text"] or ""),
+        )
+        if not event.source_event_id or not event.conversation_key or not event.actor:
+            return _json_error("presence event is missing identity facts", 400)
+        result = await asyncio.to_thread(
+            ctx.presence_runner,
+            admission=admission,
+            event=event,
+            staged_files=_presence_staged_files(ctx, skill_name, payload.get("staged_files")),
+        )
+        return JSONResponse({
+            "ok": True,
+            "status": "completed",
+            "outcome": result.outcome,
+            "text": result.text,
+            "turn_ref": result.task_id,
+            "work_ref": result.work_ref,
+        })
+    except json.JSONDecodeError:
+        return _json_error("invalid json", 400)
+    except (PresenceAdmissionError, PresenceTurnError) as exc:
+        payload = {"ok": False, "error": str(exc), "code": exc.code, "field": exc.field}
+        attachment_manifest = getattr(exc, "attachment_manifest", None)
+        if isinstance(attachment_manifest, list):
+            payload["attachment_manifest"] = [
+                dict(row) for row in attachment_manifest if isinstance(row, dict)
+            ]
+        return JSONResponse(payload, status_code=409)
+    except (OSError, ValueError) as exc:
+        return _json_error(str(exc), 400)
+    except Exception as exc:
+        log.debug("Host service presence turn failed", exc_info=True)
+        return _json_error(str(exc), 500)
+    finally:
+        ctx._leave_inflight(skill_name)
+
+
+async def _api_presence_work(request: Request) -> JSONResponse:
+    """Return a correlated late result without exposing the general task API."""
+
+    ctx: HostServiceContext = request.app.state.host_service_context
+    try:
+        skill_name, token_payload = ctx.authenticate_token_payload(
+            request.headers.get("x-skill-token", "")
+        )
+        ctx.require_permission(skill_name, token_payload, "presence")
+    except HostServiceAuthError as exc:
+        return _json_error(str(exc), 403)
+    work_ref = str(request.path_params.get("work_ref") or "").strip()
+    binding_id = str(request.query_params.get("binding_id") or "").strip()
+    try:
+        from ouroboros.presence_bindings import load_presence_binding
+        from ouroboros.task_results import load_task_result
+
+        load_presence_binding(ctx.data_dir, skill_name, binding_id)
+        stored = load_task_result(ctx.data_dir, work_ref) or {}
+        metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
+        presence = metadata.get("presence") if isinstance(metadata.get("presence"), dict) else {}
+        if str(presence.get("binding_id") or "") != binding_id:
+            return _json_error("presence work reference not found", 404)
+        status = str(stored.get("status") or "")
+        if status not in {"completed", "failed", "cancelled"}:
+            return JSONResponse({"ok": True, "status": "pending", "work_ref": work_ref}, status_code=202)
+        outcome = str(metadata.get("presence_outcome") or "message")
+        if outcome not in {"message", "silent", "tool_delivered", "deferred"}:
+            outcome = "message"
+        return JSONResponse({
+            "ok": True,
+            "status": status,
+            "outcome": outcome,
+            "text": (
+                str(metadata.get("presence_result_text") or stored.get("result") or "")
+                if outcome in {"message", "deferred"}
+                else ""
+            ),
+            "work_ref": work_ref,
+        })
+    except Exception as exc:
+        code = str(getattr(exc, "code", ""))
+        if code:
+            return _json_error(str(exc), 404)
+        log.debug("Host service presence work lookup failed", exc_info=True)
+        return _json_error("presence work lookup failed", 500)
+
+
 async def _api_ws_message(request: Request) -> JSONResponse:
     """WS-out bridge: relay a namespaced extension WS event to browser clients.
 
@@ -454,6 +650,7 @@ def create_host_service_app(
     bridge_getter: Optional[Callable[[], Any]] = None,
     tool_schemas_getter: Optional[Callable[[], list[dict[str, Any]]]] = None,
     ws_broadcaster_getter: Optional[Callable[[], Callable[[dict], None]]] = None,
+    presence_runner: Optional[Callable[..., Any]] = None,
 ) -> Starlette:
     app = Starlette(
         routes=[
@@ -461,6 +658,8 @@ def create_host_service_app(
             Route("/tools/schemas", _api_tool_schemas, methods=["GET"]),
             Route("/chat/allocate-internal", _api_allocate_internal, methods=["POST"]),
             Route("/chat/inject", _api_chat_inject, methods=["POST"]),
+            Route("/presence/turn", _api_presence_turn, methods=["POST"]),
+            Route("/presence/work/{work_ref}", _api_presence_work, methods=["GET"]),
             Route("/ui/ws-message", _api_ws_message, methods=["POST"]),
             WebSocketRoute("/events", _ws_events),
         ]
@@ -470,6 +669,7 @@ def create_host_service_app(
         bridge_getter=bridge_getter,
         tool_schemas_getter=tool_schemas_getter,
         ws_broadcaster_getter=ws_broadcaster_getter,
+        presence_runner=presence_runner,
     )
     return app
 

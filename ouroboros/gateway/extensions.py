@@ -56,6 +56,45 @@ _CHILD_DISPATCH_BODY_CAP = 512 * 1024
 _OFFICIAL_HUB_VERIFIED_HINT_CACHE: dict[tuple[str, str], bool] = {}
 
 
+def _passive_submit_hub(
+    loaded: Any,
+    *,
+    github_token_configured: bool | None = None,
+    review_stale: bool | None = None,
+) -> dict[str, Any]:
+    """Project passive visibility/admission without running the scanner."""
+    from ouroboros.skill_publish_eligibility import (
+        PUBLISHABLE_SOURCES,
+        submit_hub_eligibility,
+    )
+
+    if bool(getattr(loaded, "identity_collision", False)):
+        return {
+            "visible": False,
+            "publication_ready": False,
+            "task_start_allowed": False,
+            "disabled": True,
+            "state": "hard_block",
+            "reason": "",
+        }
+    source = str(getattr(loaded, "source", "") or "")
+    if source.lower() in PUBLISHABLE_SOURCES and github_token_configured is None:
+        from ouroboros.tools.github import github_token_from_env_or_settings
+
+        github_token_configured = bool(github_token_from_env_or_settings())
+    return submit_hub_eligibility(
+        source=source,
+        review_status=loaded.review.status,
+        review_profile=getattr(loaded.review, "review_profile", "") or "",
+        review_stale=(
+            loaded.review.is_stale_for(loaded.content_hash)
+            if review_stale is None
+            else bool(review_stale)
+        ),
+        github_token_configured=bool(github_token_configured),
+    )
+
+
 async def _read_child_dispatch_body(request: Request) -> bytes:
     raw_length = request.headers.get("content-length")
     if raw_length:
@@ -105,22 +144,11 @@ def _review_fields(
     # resolves it ONCE and threads it in; a single-skill caller (None) resolves it lazily
     # and only when the source is publishable — never a per-skill settings.json read on a
     # native-heavy GET /api/extensions.
-    from ouroboros.skill_publish_eligibility import PUBLISHABLE_SOURCES, submit_hub_eligibility
-
-    if source.lower() not in PUBLISHABLE_SOURCES:
-        submit_hub = {"visible": False, "disabled": True, "reason": ""}
-    else:
-        if github_token_configured is None:
-            from ouroboros.tools.github import github_token_from_env_or_settings
-
-            github_token_configured = bool(github_token_from_env_or_settings())
-        submit_hub = submit_hub_eligibility(
-            source=source,
-            review_status=loaded.review.status,
-            review_profile=getattr(loaded.review, "review_profile", "") or "",
-            review_stale=stale,
-            github_token_configured=github_token_configured,
-        )
+    submit_hub = _passive_submit_hub(
+        loaded,
+        github_token_configured=github_token_configured,
+        review_stale=stale,
+    )
     return {
         "review_status": loaded.review.status,
         "review_stale": stale,
@@ -210,7 +238,11 @@ async def api_extensions_index(request: Request) -> JSONResponse:
 
         drive_root = _request_drive_root(request)
         repo_path = get_skills_repo_path()
-        await asyncio.to_thread(reconcile_stale_review_jobs, drive_root)
+        await asyncio.to_thread(
+            reconcile_stale_review_jobs,
+            drive_root,
+            repo_path=repo_path,
+        )
         payload = await asyncio.to_thread(_build_extensions_index, drive_root, repo_path)
         return JSONResponse(payload)
     except Exception as exc:
@@ -296,6 +328,7 @@ def _build_extensions_index(drive_root, repo_path):
         return datetime.fromtimestamp(min(stamps), tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
     from ouroboros.extension_health import read_extension_health
+    from ouroboros.gateway.presence_settings import presence_runtime_card_projection
     from ouroboros.skill_review_runner import skill_review_ui_projection
     from ouroboros.tools.github import github_token_from_env_or_settings
 
@@ -341,7 +374,10 @@ def _build_extensions_index(drive_root, repo_path):
                 "review_profile": "",
                 "official_hub_verified": False,
                 "owner_attestable": False,
-                "submit_hub": {"visible": False, "disabled": True, "reason": ""},
+                "submit_hub": _passive_submit_hub(
+                    s,
+                    github_token_configured=False,
+                ),
                 "conflict": None,
                 "desired_live": False,
                 "live_loaded": False,
@@ -377,6 +413,9 @@ def _build_extensions_index(drive_root, repo_path):
             "skill_review": skill_review_ui_projection(drive_root, s.name),
             "grants": grant_status_for_skill(drive_root, s),
         })
+        presence_runtime = presence_runtime_card_projection(drive_root, s)
+        if presence_runtime is not None:
+            entry["presence_runtime"] = presence_runtime
         if s.source == "clawhub":
             try:
                 prov = read_provenance(drive_root, s.name) or {}
@@ -1016,8 +1055,28 @@ def _skill_review_history_detail_sync(
         "raw_actor_records": degraded_actors,
         "error": error_note,
     }
+    markdown = render_skill_review_block(outcome, attempt_idx=attempt)
+    # Max-Review-Cycles accounting facts (Q16/Q17 auditability) ride the
+    # free-form markdown detail: the response contract
+    # (SkillReviewHistoryDetailResponse) is typed to exactly four fields, so
+    # adding response keys would need an api_types version bump — the rendered
+    # detail string is the additive channel. Legacy rows without the facts
+    # render nothing.
+    accounting = []
+    if record.get("paid"):
+        accounting.append("paid panel dispatch (counts toward Max Review Cycles)")
+    if record.get("replayed_from_ts"):
+        accounting.append(f"free replay of the {record.get('replayed_from_ts')} verdict")
+    if record.get("review_contract_fingerprint"):
+        accounting.append(
+            f"panel contract {str(record.get('review_contract_fingerprint'))[:12]}…"
+        )
+    if record.get("rebuttal_sha256"):
+        accounting.append(f"rebuttal sha256 {str(record.get('rebuttal_sha256'))[:12]}…")
+    if accounting:
+        markdown += "\n\n_Review accounting: " + "; ".join(accounting) + "._"
     return {
-        "markdown": render_skill_review_block(outcome, attempt_idx=attempt),
+        "markdown": markdown,
         "status": status,
         "content_hash": outcome["content_hash"],
         "job_status": str(record.get("job_status") or ""),

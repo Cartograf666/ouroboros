@@ -169,7 +169,9 @@ export const FACET_SUBJECT = {
 // Product names for the families a first run can bootstrap. They are used ONLY
 // until discovery answers with the engine's own `display_name`, and they are
 // trademarks rather than the generic label the Agents tab renamed away from.
-export const BOOTSTRAP_LABELS = { codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor' };
+export const BOOTSTRAP_LABELS = {
+    codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor', agy: 'Antigravity',
+};
 
 // THE family display name, for every surface that shows one. It lives with the
 // store because the store owns the payload this reads, and because two
@@ -302,6 +304,16 @@ export function statusUnavailableNote(readState, {
 
 const isObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 
+export function unifiedAccounts(payload) {
+    // Whether the engine behind this payload serves the UNIFIED account model
+    // (every account a named registry row; routing facts in `accountPools`).
+    // The fact is stamped server-side from the engine's own /v2/operations
+    // catalog (`get:account-pools` present — sprint plan §L.2); anything else —
+    // old engine, unreadable catalog, an older backend without the field —
+    // reads false, which is the fail-closed legacy rendering.
+    return payload?.unified_accounts === true;
+}
+
 export function statusPayloadValid(payload) {
     // The MINIMUM schema a status answer must satisfy before any facet is
     // derived from it. A 2xx is a transport fact, not a semantic one: a 200
@@ -331,18 +343,34 @@ export function accountRows(payload) {
     // camelCase maps an earlier draft invented. Fields are read exactly as the
     // Zod schema names them so the golden fixture and the wire agree.
     //
+    // DUAL-SHAPE (unified account model, sprint plan §L): a unified engine
+    // migrates every default CLI login into a named registry row, so ALL of
+    // its rows arrive as profile wrappers and `harnessAccounts` is emitted
+    // empty — no native pseudo-row is synthesized there. The synthesis below
+    // is additionally gated on the server-stamped `unified_accounts` fact so
+    // a unified engine that still emitted a compatibility row could not
+    // double-render the same account. A LEGACY engine keeps today's rule
+    // behavior-identical — a native pseudo-row per harness, addressed by the
+    // empty profile id — plus the additive fail-open `enabled` projection
+    // every row now carries.
+    //
     // Lives with the store because it is a projection OF the payload: the
     // accounts panel, the Subagents section and the login verify-race all read
     // it, and a second reader would be a second definition of "connected".
     const rows = [];
     const profiles = payload?.profiles?.profiles || [];
-    const harnessAccounts = payload?.profiles?.harnessAccounts || [];
+    const harnessAccounts = unifiedAccounts(payload)
+        ? [] : (payload?.profiles?.harnessAccounts || []);
     for (const native of Array.isArray(harnessAccounts) ? harnessAccounts : []) {
         rows.push({
             harness: String(native?.harness_id || ''),
             profile_id: '',
             kind: 'native',
             identity: native?.identity || {},
+            // Whether the default login participates in the engine's
+            // credential ladder. Absent (older engines) reads as enabled —
+            // the pre-toggle behavior, never a silent exclusion claim.
+            enabled: native?.native_credentials_enabled !== false,
             // Both engine schema versions declare this row
             // additionalProperties:false with NO status field, so presence
             // projects as local-store evidence — detected, liveness unproven.
@@ -360,10 +388,41 @@ export function accountRows(payload) {
             display_name: String(profile.display_name || ''),
             kind: 'profile',
             identity: wrapper?.identity || {},
+            // The one user-settable routing control the registry row carries.
+            // Absent reads as enabled (fail-open): an older payload without
+            // the field must not paint every account excluded from rotation.
+            enabled: profile.enabled !== false,
             status: wrapper?.status || {},
         });
     }
     return rows.filter((row) => row.harness);
+}
+
+export function nextUpAccount(payload, harness) {
+    // WHO an unpinned run of this harness would route to next — the DUAL-WIRE
+    // reader (one per app, same rule as accountRows): the unified engine's
+    // additive `profiles.accountPools` answers first; the legacy per-harness
+    // `harnessAccounts[].next_up` answers on engines that predate it. `null`
+    // means the payload carries no verdict for this harness (absence, never a
+    // synthesized "none"). The union is returned AS the wire spells it —
+    // {kind: profile|api_key_route|none|native|…} — and consumers must render
+    // an unknown kind fail-safe rather than crash: the legacy union and the
+    // pool union are both closed TODAY, but this reader outlives both.
+    const id = String(harness || '');
+    if (!id) return null;
+    const pools = payload?.profiles?.accountPools;
+    for (const pool of Array.isArray(pools) ? pools : []) {
+        if (String(pool?.harness_id || '') !== id) continue;
+        const verdict = pool?.next_up;
+        if (verdict && typeof verdict === 'object' && !Array.isArray(verdict)) return verdict;
+    }
+    const legacy = payload?.profiles?.harnessAccounts;
+    for (const row of Array.isArray(legacy) ? legacy : []) {
+        if (String(row?.harness_id || '') !== id) continue;
+        const verdict = row?.next_up;
+        if (verdict && typeof verdict === 'object' && !Array.isArray(verdict)) return verdict;
+    }
+    return null;
 }
 
 export function accountLoginConfirmed(payload, harness, profileId = '') {
@@ -802,12 +861,14 @@ export const SURFACE_ACTIVATION_EVENTS = ['ouro:page-shown', 'ouro:settings-subt
  * @param {Function} options.listener called with the store view on every settle
  * @param {string} options.elementId id of the element that IS this surface
  * @param {boolean} [options.includeModels] the activation read needs discovery
+ * @param {Function} [options.onActivate] optional owner-action override
  * @returns {Function} one disposer releasing the subscription and the listeners
  */
 export function bindStatusSurface(store, {
     listener = () => {},
     elementId = '',
     includeModels = false,
+    onActivate = null,
     doc = () => (typeof document === 'undefined' ? null : document),
     win = () => (typeof window === 'undefined' ? null : window),
     activationEvents = SURFACE_ACTIVATION_EVENTS,
@@ -824,7 +885,10 @@ export function bindStatusSurface(store, {
     if (target && typeof target.addEventListener === 'function') {
         // Activation is judged by the SAME predicate, so a tab that is not this
         // surface's tab costs nothing and this surface needs no name for its own.
-        const onActivated = () => { if (visible()) store.refresh({ includeModels }); };
+        const activationAction = typeof onActivate === 'function'
+            ? onActivate
+            : () => store.refresh({ includeModels });
+        const onActivated = () => { if (visible()) return activationAction(); };
         for (const name of activationEvents) {
             target.addEventListener(name, onActivated);
             disposers.push(() => target.removeEventListener(name, onActivated));
@@ -835,4 +899,20 @@ export function bindStatusSurface(store, {
             try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
         }
     };
+}
+
+/**
+ * Refresh with a bounded wait: resolve when the read settles OR after
+ * `beatMs`, whichever comes first — the refresh itself always runs to
+ * completion and notifies subscribers/surfaces when it lands. For callers on
+ * a user-facing critical path (the Settings Save flow) that want the settled
+ * snapshot when it is cheap (warm daemon) but must not wait out a cold
+ * daemon's wake-and-discover walk. The losing timer is cleared so a settled
+ * refresh leaves nothing holding a node test-runner's loop open.
+ */
+export function boundedStatusRefresh(store, { includeModels = true, beatMs = 2000 } = {}) {
+    const refresh = Promise.resolve(store.refresh({ includeModels })).catch(() => {});
+    let timer = null;
+    const beat = new Promise((resolve) => { timer = setTimeout(resolve, beatMs); });
+    return Promise.race([refresh, beat]).finally(() => { if (timer) clearTimeout(timer); });
 }

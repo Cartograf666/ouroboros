@@ -22,15 +22,22 @@ import {
     accountGroups,
     accountMetaLine,
     accountName,
+    confirmRemoveAccount,
     familyActionLabel,
     familyLabel,
     familyStatus,
     humanizeResetAt,
+    nextUpBadge,
+    quotaSubjectAliases,
     quotaSummary,
     removeAccount,
     removeAccountConfirmBody,
     rowActionLabel,
+    rowLoginAction,
+    loginStatusUnknown,
     serviceBannerLine,
+    setAccountEnabled,
+    vendorCredentialRetainedNotice,
 } from '../modules/harness_accounts.js';
 import { pinnedAccountWarning } from '../modules/reviewer_slots.js';
 
@@ -117,11 +124,13 @@ test('several accounts of one family are grouped, counted, and called equivalent
     // used to hang off the native row only.
     assert.equal(familyActionLabel(codex, payload()), 'Add account');
 
-    // The claude family in the same fixture has a failed vendor verification:
-    // the header says how many need attention rather than hiding it.
+    // Both claude rows are DISABLED in the fixture. That owner-authored state
+    // outranks their failed/empty verification: the header does not shout
+    // "need attention" and does not pretend the remedy is another sign-in.
+    // (An ENABLED failure keeps the family-level alarm; pinned below.)
     const claude = groups.find((g) => g.harness === 'claude');
-    assert.equal(claude.status.tone, 'error');
-    assert.match(claude.status.label, /of 2 need attention/);
+    assert.equal(claude.status.tone, 'muted');
+    assert.match(claude.status.label, /2 accounts · all disabled/);
 });
 
 test('one connected account reads as connected, not as a count', () => {
@@ -132,6 +141,10 @@ test('one connected account reads as connected, not as a count', () => {
     const cold = [{ harness: 'codex', profile_id: 'work', kind: 'profile', status: {} }];
     assert.deepEqual(familyStatus(cold, { accountsRead: 'ok' }),
         { tone: 'muted', label: '1 account · not signed in' });
+    const notRun = [{ harness: 'codex', profile_id: 'work', kind: 'profile',
+        status: { verification: 'not_run' } }];
+    assert.deepEqual(familyStatus(notRun, { accountsRead: 'ok' }),
+        { tone: 'muted', label: '1 account · not verified' });
 });
 
 test('"N accounts · rotating" counts only the accounts rotation can actually use', () => {
@@ -145,6 +158,117 @@ test('"N accounts · rotating" counts only the accounts rotation can actually us
     ];
     assert.deepEqual(familyStatus(mixed, { accountsRead: 'ok' }),
         { tone: 'ok', label: '1 of 2 connected' });
+});
+
+test('a disabled account is out of the rotation claim, and all-disabled is its own state', () => {
+    // Unified-accounts sprint: the header's "rotating" promise may only count
+    // accounts that are BOTH signed in and enabled. A disabled row is the
+    // owner's own exclusion — counting it over-promises the pool exactly the
+    // way counting a cold row used to.
+    const mixed = [
+        { harness: 'codex', profile_id: 'codex-default', kind: 'profile', enabled: true,
+          status: { verification: 'passed', verification_source: 'local_store' } },
+        { harness: 'codex', profile_id: 'work', kind: 'profile', enabled: false,
+          status: { verification: 'passed', verification_source: 'vendor' } },
+    ];
+    assert.deepEqual(familyStatus(mixed, { accountsRead: 'ok' }),
+        { tone: 'ok', label: '1 of 2 connected' });
+    // Every login healthy, every account disabled: saying "not signed in"
+    // would send the owner to a login that fixes nothing.
+    const allOff = mixed.map((row) => ({ ...row, enabled: false }));
+    assert.deepEqual(familyStatus(allOff, { accountsRead: 'ok' }),
+        { tone: 'muted', label: '2 accounts · all disabled' });
+    // Disabled rows are intentionally not probed by the engine. Their
+    // verification=not_run remains neutral but must not overwrite the owner's
+    // stronger structural state.
+    const allOffNotRun = allOff.map((row) => ({
+        ...row, status: { verification: 'not_run' },
+    }));
+    assert.deepEqual(familyStatus(allOffNotRun, { accountsRead: 'ok' }),
+        { tone: 'muted', label: '2 accounts · all disabled' });
+    // Once one row is enabled, that stronger all-disabled fact is gone and the
+    // unresolved probe remains honestly not verified.
+    const ambiguous = allOffNotRun.map((row, index) => ({
+        ...row, enabled: index === 0,
+    }));
+    assert.deepEqual(familyStatus(ambiguous, { accountsRead: 'ok' }),
+        { tone: 'muted', label: '2 accounts · not verified' });
+    // …and the metadata line states the exclusion in words on the row itself.
+    assert.match(accountMetaLine(allOff[0], payload()), /^disabled — excluded from rotation/);
+});
+
+test('a disabled account with a failed verification does not redden the family header', () => {
+    // The owner's own exclusion covers the alarm too: rotation ignores a
+    // disabled account whatever its verification says, and its row already
+    // shows the error in place — so the header must not shout "need
+    // attention" about an account the owner has already taken out of play.
+    const rows = [
+        { harness: 'codex', profile_id: 'work', kind: 'profile',
+          status: { verification: 'passed', verification_source: 'vendor' } },
+        { harness: 'codex', profile_id: 'old', kind: 'profile', enabled: false,
+          status: { verification: 'failed' } },
+    ];
+    assert.deepEqual(familyStatus(rows, { accountsRead: 'ok' }),
+        { tone: 'ok', label: '1 of 2 connected' });
+    // The SAME failure on an ENABLED account is rotation's problem and keeps
+    // the alarm.
+    const enabledFailure = rows.map((row) => ({ ...row, enabled: true }));
+    assert.deepEqual(familyStatus(enabledFailure, { accountsRead: 'ok' }),
+        { tone: 'error', label: '1 of 2 need attention' });
+});
+
+test('the Next up badge renders every wire kind fail-safe, unknown included', () => {
+    const base = { daemon: RUNNING, harnesses: [], quota: [] };
+    const withPool = (next_up) => ({ ...base,
+        profiles: { accountPools: [{ harness_id: 'codex', next_up }], harnessAccounts: [], profiles: [] } });
+    assert.equal(nextUpBadge(withPool({ kind: 'profile', profileId: 'codex-default' }), 'codex'),
+        'Next up: codex-default');
+    assert.equal(nextUpBadge(withPool({ kind: 'api_key_route' }), 'codex'),
+        'Next up: API key (no subscription capacity)');
+    assert.equal(nextUpBadge(withPool({ kind: 'none', reason: 'nothing routable' }), 'codex'), '');
+    // The legacy union, through the same dual-wire reader.
+    const legacy = { ...base, profiles: { harnessAccounts: [
+        { harness_id: 'codex', next_up: { kind: 'native', route: 'local_session' } },
+    ], profiles: [] } };
+    assert.equal(nextUpBadge(legacy, 'codex'), 'Next up: default account');
+    // FAIL-SAFE: an unknown future kind is a generic unknown, never a crash
+    // and never a guessed account (plan §E: old clients must degrade honestly).
+    assert.equal(nextUpBadge(withPool({ kind: 'quantum_pool' }), 'codex'), 'Next up: unknown');
+    assert.equal(nextUpBadge(withPool({ kind: 'profile' }), 'codex'), 'Next up: unknown');
+    // No verdict, or an accounts read that did not land: no badge — a stale
+    // routing claim dressed as current is the lie the facets exist to stop.
+    assert.equal(nextUpBadge(base, 'codex'), '');
+    assert.equal(nextUpBadge(withPool({ kind: 'profile', profileId: 'x' }), 'codex',
+        { accountsRead: 'failed' }), '');
+});
+
+test('the migrated default row may inherit the LEGACY quota subject, exactly once', () => {
+    // Unified migration window (plan §K.3): the quota journal is not
+    // rewritten, so right after migration the row's fresh window can still be
+    // keyed by the legacy ''/null subject. The alias applies ONLY to the
+    // reserved `<harness>-default` row on a unified payload, and an
+    // exact-keyed reading always wins.
+    const unified = { unified_accounts: true };
+    const row = { harness: 'claude', profile_id: 'claude-default', kind: 'profile' };
+    assert.deepEqual(quotaSubjectAliases(row, unified), ['']);
+    assert.deepEqual(quotaSubjectAliases({ ...row, profile_id: 'work' }, unified), []);
+    assert.deepEqual(quotaSubjectAliases(row, {}), [], 'legacy engines get no alias');
+
+    const legacyKeyed = [{ subject: { harness: 'claude', subject_id: '' }, freshness: 'fresh',
+        constraints: [{ used_ratio: 0.5, resets_at: '2026-08-09T14:00:00Z' }] }];
+    const now = Date.parse('2026-08-09T12:00:00Z');
+    const inherited = quotaSummary(legacyKeyed, 'claude', 'claude-default',
+        { nowMs: now, fallbackSubjectIds: [''] });
+    assert.match(inherited.label, /^50% used/);
+    // The exact subject wins the moment a re-keyed reading exists.
+    const reKeyed = [...legacyKeyed,
+        { subject: { harness: 'claude', subject_id: 'claude-default' }, freshness: 'fresh',
+          constraints: [{ used_ratio: 0.2, resets_at: '2026-08-09T14:00:00Z' }] }];
+    assert.match(quotaSummary(reKeyed, 'claude', 'claude-default',
+        { nowMs: now, fallbackSubjectIds: [''] }).label, /^20% used/);
+    // No alias, no inheritance: another named row never borrows the window.
+    assert.equal(quotaSummary(legacyKeyed, 'claude', 'work', { nowMs: now }).label,
+        'Usage unavailable');
 });
 
 test('the family button keeps its ADD intent even when the runtime needs repair', () => {
@@ -181,19 +305,58 @@ test('a row offers what it can actually do, and runtime work outranks it', () =>
     assert.equal(rowActionLabel(live, broken), 'Fix & connect');
 });
 
+test('an explicit auth probe failure does not turn into a re-login button', () => {
+    const unknown = {
+        harness: 'claude', profile_id: 'work', kind: 'profile',
+        status: { availability: 'unknown', verification: 'not_run',
+            detail: 'auth-status probe failed: timeout' },
+    };
+    assert.equal(loginStatusUnknown(unknown), true);
+    assert.equal(rowActionLabel(unknown, payload()), 'Check status');
+    assert.deepEqual(rowLoginAction(unknown, payload()),
+        { label: 'Check status', refresh: true });
+    // The compatibility wire has no availability field, so an older engine's
+    // existing action stays unchanged.
+    const legacy = { ...unknown, status: { verification: 'not_run' } };
+    assert.equal(loginStatusUnknown(legacy), false);
+    assert.deepEqual(rowLoginAction(legacy, payload()),
+        { label: 'Sign in', refresh: false });
+    // Runtime repair remains actionable even while the row's auth probe is
+    // unknown: Connect must be able to install/update the pinned engine.
+    const broken = { daemon: { state: 'stale', runtime: { state: 'error' } } };
+    assert.deepEqual(rowLoginAction(unknown, broken),
+        { label: 'Fix & connect', refresh: false });
+});
+
+test('the unknown-status refresh action preserves recovery for every profile harness', () => {
+    for (const harness of ['claude', 'codex', 'cursor', 'agy']) {
+        const row = {
+            harness, profile_id: 'work', kind: 'profile',
+            status: { availability: 'unknown', verification: 'not_run' },
+        };
+        assert.deepEqual(rowLoginAction(row, payload()),
+            { label: 'Check status', refresh: true }, harness);
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Row anatomy.
 // ---------------------------------------------------------------------------
 
-test('the default CLI login is a row like any other, with an honest caption', () => {
-    // Equivalence is layout-level: the native row uses the same two lines and
-    // the same actions. What differs is a CAPTION — and the caption is the
-    // truthful reason there is no Remove button on it.
+test('the legacy default row is named by who it is, never by a retired account TYPE', () => {
+    // Unified-accounts sprint: "Default CLI login" and "Managed by the X CLI"
+    // described a separate account type the unified model retired. A legacy
+    // pseudo-row is named by the identity the daemon observed — its email —
+    // and only an identity-less one falls back to the neutral "Default
+    // account". The caption is gone from the metadata line entirely.
     const native = { harness: 'codex', profile_id: '', kind: 'native', identity: {},
         status: { verification: 'passed', verification_source: 'local_store' } };
-    assert.equal(accountName(native), 'Default CLI login');
+    assert.equal(accountName(native), 'Default account');
+    assert.equal(accountName({ ...native, identity: { email: 'owner@example.com' } }),
+        'owner@example.com');
     const meta = accountMetaLine(native, payload({ harnesses: [{ id: 'codex' }] }));
-    assert.match(meta, /^Managed by the Codex CLI/);
+    assert.doesNotMatch(meta, /Managed by/);
+    assert.doesNotMatch(meta, /CLI/);
     // Removal is a NAMED-profile affordance: this app cannot honestly sign a
     // vendor CLI out, so it does not offer to.
     assert.equal(rowActionLabel(native, payload()), 'Sign in again');
@@ -215,7 +378,10 @@ test('the metadata line leads with humanized usage, never a raw ISO instant', ()
     }), { nowMs: now });
     assert.match(meta, /^38% used · resets in 2h/);
     assert.match(meta, /Max/);
-    assert.match(meta, /a@example\.com/);
+    // The email IS the row's name here (no display_name), so the metadata
+    // line does not repeat it.
+    assert.equal(accountName(row), 'a@example.com');
+    assert.doesNotMatch(meta, /a@example\.com/);
     assert.match(meta, /checked 10m ago/);
     assert.doesNotMatch(meta, /2026-08-09T/);
 });
@@ -517,26 +683,122 @@ test('a partial gap obeys the SAME fault precedence as a total one', () => {
 // Removal.
 // ---------------------------------------------------------------------------
 
+test('Remove consumes the non-input confirm boolean and performs the mutation once', async () => {
+    const calls = [];
+    const store = {
+        snapshot: { harnesses: [{ id: 'claude', display_name: 'Claude Code' }] },
+        refresh: async () => calls.push(['refresh']),
+    };
+
+    await confirmRemoveAccount('claude', 'work', {
+        dialogImpl: async (options) => {
+            assert.notEqual(options.input, true);
+            assert.equal(options.danger, true);
+            assert.equal(options.confirmLabel, 'Remove');
+            calls.push(['dialog']);
+            return true;
+        },
+        removeImpl: async (harness, profileId) => calls.push(['remove', harness, profileId]),
+        store,
+        renderImpl: () => calls.push(['render']),
+    });
+
+    assert.deepEqual(calls, [
+        ['dialog'],
+        ['remove', 'claude', 'work'],
+        ['refresh'],
+        ['render'],
+    ]);
+
+    for (const resolution of [false, undefined, null, { confirmed: true }]) {
+        const skipped = [];
+        await confirmRemoveAccount('claude', 'work', {
+            dialogImpl: async () => { skipped.push(['dialog']); return resolution; },
+            removeImpl: async () => skipped.push(['remove']),
+            store: { snapshot: store.snapshot, refresh: async () => skipped.push(['refresh']) },
+            renderImpl: () => skipped.push(['render']),
+        });
+        assert.deepEqual(skipped, [['dialog']],
+            `resolution ${JSON.stringify(resolution)} must stop after the dialog`);
+    }
+});
+
 test('removing a named account goes through the engine contract, and says so', () => {
     const calls = [];
+    const receipt = { profile: {
+        profile_id: 'work', harness_id: 'codex', display_name: 'Work',
+        credential_kind: 'config_dir_login',
+        isolation_locator: '/data/claudexor/profiles/codex-work', secret_ref: null,
+        enabled: true, created_at: null,
+    }, removed: true, credentialCleanup: 'config_dir_removed',
+        cleanupWarning: 'owned profile storage cleanup needs manual inspection',
+        vendorCredentialDisposition: {
+            owner: 'vendor', state: 'left_unchanged', scope: 'os_user',
+        } };
     const fetchImpl = async (url, init) => {
         calls.push([url, init.method]);
-        return { ok: true, json: async () => ({ ok: true }) };
+        return { ok: true, json: async () => receipt };
     };
     return removeAccount('codex', 'work', { fetchImpl }).then((answer) => {
-        assert.deepEqual(answer, { ok: true });
+        assert.deepEqual(answer, receipt);
         assert.deepEqual(calls, [['/api/claudexor/credential-profiles/codex/work', 'DELETE']]);
         // The confirmation states the two facts an owner needs before agreeing:
-        // nothing is deleted vendor-side, and a pinned reviewer row survives.
+        // vendor/OS sign-in may remain, and a pinned reviewer row or Delegation
+        // pin survives visibly instead of rerouting.
         const body = removeAccountConfirmBody('work', 'Codex');
-        assert.match(body, /Ouroboros deletes nothing on the Codex side/);
-        assert.match(body, /Reviewer rows pinned to this account stay visible/);
+        assert.match(body, /Vendor or OS credential storage may remain signed in/);
+        assert.match(body, /deletion receipt says when it was retained/);
+        assert.match(body, /Reviewer rows and a Delegation pin pointing at this account stay visible/);
     });
+});
+
+test('only the exact vendor left-unchanged disposition produces a retained warning', () => {
+    const receipt = {
+        profile: {
+            profile_id: 'work', harness_id: 'codex', display_name: 'Work',
+            credential_kind: 'config_dir_login',
+            isolation_locator: '/data/claudexor/profiles/codex-work', secret_ref: null,
+            enabled: true, created_at: null,
+        },
+        removed: true,
+        credentialCleanup: 'config_dir_removed',
+        vendorCredentialDisposition: {
+            owner: 'vendor', state: 'left_unchanged', scope: 'os_user',
+        },
+    };
+    const notice = vendorCredentialRetainedNotice(receipt, 'work', 'Codex');
+    assert.equal(notice, 'Removed "work" from Codex. Claudexor left vendor credential '
+        + 'storage for this OS user unchanged; the vendor account may still be signed in '
+        + 'outside Ouroboros.');
+    for (const changed of [
+        {},
+        { vendorCredentialDisposition: null },
+        { vendorCredentialDisposition: { ...receipt.vendorCredentialDisposition, owner: 'claudexor' } },
+        { vendorCredentialDisposition: { ...receipt.vendorCredentialDisposition, state: 'removed' } },
+        { vendorCredentialDisposition: { ...receipt.vendorCredentialDisposition, scope: 'profile' } },
+    ]) {
+        assert.equal(vendorCredentialRetainedNotice(changed, 'work', 'Codex'), '');
+    }
 });
 
 test('a refused removal is reported as a refusal, never as a removal', () => {
     const fetchImpl = async () => ({ ok: false, status: 409, json: async () => ({ error: 'in use' }) });
     return assert.rejects(() => removeAccount('codex', 'work', { fetchImpl }), /in use/);
+});
+
+test('the Enabled toggle is the engine PATCH contract, and a refusal changes nothing', async () => {
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+        calls.push([url, init.method, init.body]);
+        return { ok: true, json: async () => ({ ok: true, enabled: false }) };
+    };
+    const answer = await setAccountEnabled('codex', 'work', false, { fetchImpl });
+    assert.deepEqual(answer, { ok: true, enabled: false });
+    assert.deepEqual(calls, [['/api/claudexor/credential-profiles/codex/work', 'PATCH',
+        JSON.stringify({ enabled: false })]]);
+    const refuse = async () => ({ ok: false, status: 503, json: async () => ({ error: 'daemon_unreachable' }) });
+    await assert.rejects(() => setAccountEnabled('codex', 'work', true, { fetchImpl: refuse }),
+        /daemon_unreachable/);
 });
 
 test('a review row pinned to a removed account stays visible with ONE warning', () => {

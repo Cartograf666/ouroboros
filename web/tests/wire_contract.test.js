@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { accountRows } from '../modules/harness_accounts.js';
+import { nextUpAccount } from '../modules/claudexor_status_store.js';
 import { indexProfilesByHarness } from '../modules/reviewer_slots.js';
 
 const repoFile = (rel) => readFileSync(
@@ -103,8 +104,42 @@ test('both consumers of the credential-profiles wire read the SAME shape', () =>
         .sort();
     const index = indexProfilesByHarness(payload);
     const fromSlots = Object.entries(index)
-        .flatMap(([harness, ids]) => ids.map((id) => `${harness}/${id}`))
+        .flatMap(([harness, entries]) => entries.map((entry) => `${harness}/${entry.id}`))
         .sort();
     assert.ok(fromAccounts.length > 0, 'fixture carries no profile rows');
     assert.deepEqual(fromSlots, fromAccounts);
+});
+
+test('the UNIFIED wire shape feeds the same readers: all rows named, pools carry routing', () => {
+    // The second golden body — a unified engine's ControlCredentialProfilesResponse
+    // (frozen contract §L.1): the migrated default login is an ordinary
+    // registry row (reserved `<harness>-default` id), `harnessAccounts` is the
+    // empty compatibility key, and the routing verdict lives in the additive
+    // `accountPools`. Same two readers, no unified-specific branch in either.
+    const payload = {
+        unified_accounts: true,
+        profiles: JSON.parse(readFileSync(
+            fileURLToPath(new URL('./fixtures/credential_profiles_response_unified.json', import.meta.url)),
+            'utf-8',
+        )),
+    };
+    const rows = accountRows(payload);
+    assert.ok(rows.length > 0, 'fixture carries no rows');
+    assert.ok(rows.every((row) => row.kind === 'profile'),
+        'a unified payload synthesizes no native pseudo-rows');
+    // The migrated default is pinnable through the same index the reviewer
+    // rows read — the reviewer-side half of the unification.
+    const index = indexProfilesByHarness(payload);
+    assert.ok((index.codex || []).some((entry) => entry.id === 'codex-default'));
+    // The enabled projection reaches both consumers from one reader.
+    const byId = Object.fromEntries(rows.map((row) => [row.profile_id, row.enabled]));
+    assert.deepEqual(byId, { 'codex-default': true, koshak: false });
+    // …and the index carries the same fact, so the pin selects can label a
+    // disabled account instead of offering it bare.
+    const indexEnabled = Object.fromEntries(Object.values(index).flat()
+        .map((entry) => [entry.id, entry.enabled]));
+    assert.deepEqual(indexEnabled, byId);
+    // Routing rides the pool, read through the store's one dual-wire reader.
+    assert.deepEqual(nextUpAccount(payload, 'codex'),
+        { kind: 'profile', profileId: 'codex-default' });
 });

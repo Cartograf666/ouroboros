@@ -636,10 +636,25 @@ def test_submit_hub_eligibility_warnings_now_enabled():
     # THE desync fix: advisory-only warnings are publishable (was UI-disabled before)
     assert E(source="external", review_status="warnings", github_token_configured=True)["disabled"] is False
     assert E(source="external", review_status="clean", github_token_configured=True)["disabled"] is False
-    assert E(source="external", review_status="blockers", github_token_configured=True)["disabled"] is True
-    assert E(source="external", review_status="pending", github_token_configured=True)["disabled"] is True
-    assert E(source="external", review_status="clean", review_profile="owner_attested", github_token_configured=True)["disabled"] is True
-    assert E(source="external", review_status="clean", review_stale=True, github_token_configured=True)["disabled"] is True
+    for row in (
+        E(source="external", review_status="blockers", github_token_configured=True),
+        E(source="external", review_status="pending", github_token_configured=True),
+        E(
+            source="external",
+            review_status="clean",
+            review_profile="owner_attested",
+            github_token_configured=True,
+        ),
+        E(
+            source="external",
+            review_status="clean",
+            review_stale=True,
+            github_token_configured=True,
+        ),
+    ):
+        assert row["publication_ready"] is False
+        assert row["task_start_allowed"] is True
+        assert row["disabled"] is False
     assert "GITHUB_TOKEN" in E(source="external", review_status="clean")["reason"]
     assert E(source="native", review_status="clean", github_token_configured=True)["visible"] is False
 

@@ -189,6 +189,14 @@ class CompanionSupervisor:
             )
             self._runtimes[key] = runtime
             self._start_drainers(runtime)
+            try:
+                from ouroboros.extension_health import clear_companion_restart_exhausted
+
+                clear_companion_restart_exhausted(
+                    self.data_dir, descriptor.skill_name, descriptor.name,
+                )
+            except Exception:
+                log.debug("Failed to clear companion terminal health", exc_info=True)
             threading.Thread(
                 target=self._monitor_runtime,
                 args=(key, runtime),
@@ -222,6 +230,7 @@ class CompanionSupervisor:
         returncode = runtime.process.wait()
         descriptor = runtime.descriptor
         should_restart = False
+        restart_exhausted = False
         with self._lock:
             current = self._runtimes.get(key)
             if current is runtime and descriptor.restart_policy == "on_failure" and returncode != 0:
@@ -236,6 +245,7 @@ class CompanionSupervisor:
                     self._runtimes.pop(key, None)
                     should_restart = True
                 else:
+                    restart_exhausted = True
                     log.warning(
                         "companion %s/%s exceeded restart limit",
                         descriptor.skill_name,
@@ -243,6 +253,25 @@ class CompanionSupervisor:
                     )
             elif current is runtime:
                 self._runtimes.pop(key, None)
+        if restart_exhausted:
+            try:
+                from ouroboros.extension_health import record_companion_restart_exhausted
+
+                record_companion_restart_exhausted(
+                    self.data_dir,
+                    descriptor.skill_name,
+                    descriptor.name,
+                    returncode=returncode,
+                )
+            except Exception:
+                log.debug("Failed to persist companion terminal health", exc_info=True)
+            finally:
+                # Publish durable failure before the live snapshot loses the
+                # exited process. Readers that observe an empty snapshot can
+                # therefore already recover the terminal reason from health.
+                with self._lock:
+                    if self._runtimes.get(key) is runtime:
+                        self._runtimes.pop(key, None)
         self._write_runtime_snapshot()
         if should_restart:
             time.sleep(0.5)
@@ -252,6 +281,7 @@ class CompanionSupervisor:
                 log.warning("failed to restart companion %s/%s", descriptor.skill_name, descriptor.name, exc_info=True)
         if runtime.job_handle is not None:
             close_job(runtime.job_handle)
+
     def stop(self, skill_name: str, name: str, timeout_sec: float = 5.0) -> None:
         key = self._key(skill_name, name)
         with self._lock:

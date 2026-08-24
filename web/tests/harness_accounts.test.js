@@ -17,6 +17,8 @@ import {
     daemonAnswered,
     daemonStatusLine,
     destroyHarnessAccounts,
+    familyActionLabel,
+    familyHasDefaultLogin,
     initHarnessAccounts,
     normalizeProfileName,
     promptProfileName,
@@ -153,6 +155,11 @@ test('both verification statuses are honest: vendor is trusted, local is neutral
     assert.equal(local.label, 'Signed in — not verified live');
 
     assert.equal(verificationBadge({ status: {} }).label, 'Not signed in');
+    assert.deepEqual(verificationBadge({ status: { verification: 'not_run' } }),
+        { tone: 'muted', label: 'Not verified' });
+    assert.deepEqual(verificationBadge({ status: {
+        availability: 'unknown', verification: 'not_run',
+    } }), { tone: 'muted', label: 'Login status unknown' });
     assert.equal(verificationBadge({ status: { verification: 'failed', verification_source: 'vendor' } }).tone, 'error');
 });
 
@@ -329,9 +336,9 @@ test('Add account never touches window.prompt and asks through the in-house dial
 });
 
 test('a name normalization would change is shown back, editable, BEFORE any login starts', async () => {
-    // The owner types "Работа": the profile alphabet turns that into "------",
-    // and starting a login under that name silently is exactly the trap the
-    // prompt() flow had. The dialog re-opens with the normalized name visible
+    // The owner types "Работа": nothing slug-legal survives (engine contract
+    // ^[a-z0-9][a-z0-9_-]{0,63}$), and starting a login under a silently
+    // rewritten name is exactly the trap the prompt() flow had. The dialog re-opens with the normalized name visible
     // AND editable; only an explicit confirm of a stable name proceeds.
     const rounds = [];
     const answers = [
@@ -344,8 +351,11 @@ test('a name normalization would change is shown back, editable, BEFORE any logi
     } });
     assert.equal(name, 'work-2');
     assert.equal(rounds.length, 2);
-    assert.ok(rounds[1].body.includes('"Работа" will be saved as "------"'));
-    assert.equal(rounds[1].initialValue, '------');
+    // Under the engine slug contract (^[a-z0-9][a-z0-9_-]{0,63}$) nothing of
+    // "Работа" survives normalization: the dialog re-asks with the contract
+    // spelled out instead of offering an illegal all-separator name.
+    assert.ok(rounds[1].body.includes('"Работа" cannot become an account name'));
+    assert.equal(rounds[1].initialValue, '');
 
     // Accepting the shown normalized name as-is also works (one extra round).
     const folds = [];
@@ -357,9 +367,11 @@ test('a name normalization would change is shown back, editable, BEFORE any logi
     assert.equal(folds.length, 2);
     assert.equal(folds[1].initialValue, 'work');
 
-    // The normalization itself, pinned.
+    // The normalization itself, pinned to the ENGINE slug contract
+    // (^[a-z0-9][a-z0-9_-]{0,63}$): nothing slug-legal survives of "Работа",
+    // so it maps to '' and the dialog re-asks instead of offering '------'.
     assert.equal(normalizeProfileName(' Work '), 'work');
-    assert.equal(normalizeProfileName('Работа'), '------');
+    assert.equal(normalizeProfileName('Работа'), '');
     assert.equal(normalizeProfileName('a b/c'), 'a-b-c');
     assert.equal(normalizeProfileName('ok_name-1'), 'ok_name-1');
     assert.equal(normalizeProfileName(''), '');
@@ -1302,7 +1314,10 @@ test('each row projection is gated by ITS OWN facet, and a stale value says it i
     const fresh = accountRowFacts(row, payload, { accountsRead: 'ok', quotaRead: 'ok' });
     assert.equal(fresh.badge.tone, 'ok');
     assert.equal(fresh.badge.label, 'Verified live');
-    assert.equal(fresh.name, 'Default CLI login');
+    // Honest naming (unified-accounts sprint): the retired "Default CLI
+    // login" claimed a separate account TYPE; an identity-less legacy
+    // pseudo-row is simply the default account.
+    assert.equal(fresh.name, 'Default account');
     assert.equal(fresh.quota.exhausted, true);
     assert.match(fresh.quota.label, /^Limit reached/);
     assert.match(fresh.meta, /Limit reached/);
@@ -1371,6 +1386,28 @@ function mountSection() {
     };
     const win = { addEventListener() {}, removeEventListener() {} };
     return { elements, doc, win };
+}
+
+function mountInteractiveAccountsSection() {
+    const mounted = mountSection();
+    const loginButton = {
+        listeners: [],
+        addEventListener(type, fn) { loginButton.listeners.push([type, fn]); },
+    };
+    const row = {
+        dataset: { harness: 'claude', profile: 'work' },
+    };
+    loginButton.closest = () => row;
+    const groups = {
+        _html: '',
+        set innerHTML(value) { groups._html = String(value); },
+        get innerHTML() { return groups._html; },
+        querySelectorAll(selector) {
+            return selector === '[data-harness-login]' ? [loginButton] : [];
+        },
+    };
+    mounted.elements['harness-accounts-groups'] = groups;
+    return { ...mounted, loginButton };
 }
 
 function captureCardControls(element) {
@@ -1865,6 +1902,67 @@ test('the refresh button routes the click through the same predicate as its labe
     }
 });
 
+test('an unknown auth row refreshes status on the real click, never starts login', async () => {
+    const { elements, doc, win, loginButton } = mountInteractiveAccountsSection();
+    const priorDoc = globalThis.document;
+    const priorWin = globalThis.window;
+    const priorFetch = globalThis.fetch;
+    globalThis.document = doc;
+    globalThis.window = win;
+    const requests = [];
+    const snapshot = {
+        daemon: { state: 'running', engine_version: '3.3.13', runtime: { state: 'ready' } },
+        harnesses: [{ id: 'claude', display_name: 'Claude Code' }],
+        profiles: {
+            profiles: [{
+                profile: { harness_id: 'claude', profile_id: 'work', display_name: 'Work', enabled: true },
+                status: { availability: 'unknown', verification: 'not_run' },
+                identity: {},
+            }],
+            harnessAccounts: [],
+        },
+        quota: [],
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl: async (url, init = {}) => {
+            requests.push(`${init.method || 'GET'} ${url}`);
+            return fakeResponse(200, snapshot);
+        },
+        doc,
+    });
+    const originalRefresh = store.refresh.bind(store);
+    let refreshCalls = 0;
+    let refreshPromise;
+    store.refresh = (...args) => {
+        refreshCalls += 1;
+        refreshPromise = originalRefresh(...args);
+        return refreshPromise;
+    };
+    try {
+        assert.equal(await initHarnessAccounts({ store }), true);
+        await refreshPromise;
+        refreshCalls = 0;
+        requests.length = 0;
+        const click = loginButton.listeners
+            .filter(([type]) => type === 'click').map(([, fn]) => fn).at(-1);
+        assert.ok(click, 'the account row lost its login listener');
+        click();
+        await refreshPromise;
+        assert.equal(refreshCalls, 1, 'unknown status did not use the shared Refresh path');
+        assert.ok(requests.some((request) => request.startsWith('GET ')),
+            'Refresh did not re-read status');
+        assert.ok(requests.every((request) => !request.startsWith('POST /api/claudexor/login')),
+            'unknown status incorrectly started OAuth login');
+        assert.match(elements['harness-accounts-groups'].innerHTML, /Login status unknown/);
+    } finally {
+        destroyHarnessAccounts();
+        store.dispose();
+        globalThis.document = priorDoc;
+        globalThis.window = priorWin;
+        globalThis.fetch = priorFetch;
+    }
+});
+
 test('a login seen online is not un-seen by the re-check running out', () => {
     // Re-bound from the pre-store panel (which pinned its own settleVerdict) to
     // the shared controller the PR extracted: the bounded re-check can close a
@@ -1879,4 +1977,41 @@ test('a login seen online is not un-seen by the re-check running out', () => {
         'a positive confirmation no longer wins on its own');
     assert.match(body, /active\.verdict = confirmed/,
         'the monotone predicate does not decide the verdict');
+});
+
+test('a family with no default login asks for a name on its FIRST account', () => {
+    // Antigravity has no engine-default credential — the engine says so with a
+    // failing `default_credential` check. Connect there posts a login with no
+    // profileId, which the engine refuses by design, so the button did nothing
+    // at all. Such a family must ask for a name up front.
+    const payload = {
+        harnesses: [
+            { id: 'codex', display_name: 'Codex CLI', default_login_available: true },
+            { id: 'agy', display_name: 'Antigravity', default_login_available: false },
+        ],
+    };
+    const empty = (harness) => ({ harness, label: harness, rows: [], status: {} });
+    assert.equal(familyActionLabel(empty('agy'), payload), 'Add account');
+    assert.equal(familyActionLabel(empty('codex'), payload), 'Connect');
+    assert.equal(familyHasDefaultLogin('agy', payload), false);
+    assert.equal(familyHasDefaultLogin('codex', payload), true);
+});
+
+test('an absent or unreadable declaration keeps the Connect the panel always had', () => {
+    // Fail OPEN: an older backend that never projects the field, or a manifest
+    // nobody could read, must not turn every family into an add-a-name flow.
+    const empty = { harness: 'codex', label: 'Codex CLI', rows: [], status: {} };
+    assert.equal(familyActionLabel(empty, { harnesses: [{ id: 'codex' }] }), 'Connect');
+    assert.equal(familyActionLabel(empty, {}), 'Connect');
+    assert.equal(familyHasDefaultLogin('codex', {}), true);
+    assert.equal(familyHasDefaultLogin('unknown-family', { harnesses: [] }), true);
+});
+
+test('a family that already has accounts adds a named one either way', () => {
+    const populated = (harness) => ({
+        harness, label: harness, rows: [{ profile_id: 'default' }], status: {},
+    });
+    const payload = { harnesses: [{ id: 'agy', default_login_available: false }] };
+    assert.equal(familyActionLabel(populated('agy'), payload), 'Add account');
+    assert.equal(familyActionLabel(populated('codex'), payload), 'Add account');
 });

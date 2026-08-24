@@ -71,3 +71,90 @@ def test_visible_round_text_string_and_list_never_reprs():
     assert _visible_round_text([{"thought": True, "text": "pondering"}, {"text": "the answer"}]) == "the answer"
     assert _visible_round_text(None) == ""
     assert _visible_round_text({"type": "text"}) == ""
+
+
+def test_round_progress_redacts_secret_shaped_model_text_before_trace_and_emit():
+    from ouroboros.loop import _emit_round_progress
+
+    candidate = "sk-" + "A1" * 20
+    visible = f"Removing leaked credential {candidate} before retry."
+    progress = []
+    trace = {"reasoning_notes": []}
+
+    _emit_round_progress(visible, {}, progress.append, trace)
+
+    assert candidate not in progress[0]
+    assert candidate not in trace["reasoning_notes"][0]
+    assert "***REDACTED***" in progress[0]
+
+
+def test_final_text_response_redacts_before_delivery_and_trace():
+    from ouroboros.loop import _handle_text_response
+
+    candidate = "sk-" + "B2" * 20
+    content = f"I removed {candidate} from the payload."
+    trace = {"reasoning_notes": []}
+
+    delivered, _, updated = _handle_text_response(content, trace, {})
+
+    assert candidate not in delivered
+    assert candidate not in updated["reasoning_notes"][0]
+    assert "***REDACTED***" in delivered
+
+
+def test_round_and_final_prose_redact_all_observability_secret_classes():
+    from ouroboros.loop import _emit_round_progress, _handle_text_response
+
+    candidates = [
+        "ghp_" + "D4" * 20,
+        "Bearer " + "E5" * 16,
+        "eyJ" + "F6" * 8 + "." + "G7" * 8 + "." + "H8" * 8,
+        "https://example.test/?access_token=" + "I9" * 16,
+        "api_key = " + "J0" * 16,
+    ]
+    for candidate in candidates:
+        progress = []
+        trace = {"reasoning_notes": []}
+        content = f"Credential evidence: {candidate}"
+
+        _emit_round_progress(content, {}, progress.append, trace)
+        delivered, _, final_trace = _handle_text_response(content, {"reasoning_notes": []}, {})
+
+        assert candidate not in progress[0]
+        assert candidate not in trace["reasoning_notes"][0]
+        assert candidate not in delivered
+        assert candidate not in final_trace["reasoning_notes"][0]
+
+    ordinary = "Edited tool.py and completed a fresh review."
+    progress = []
+    trace = {"reasoning_notes": []}
+    _emit_round_progress(ordinary, {}, progress.append, trace)
+    delivered, _, final_trace = _handle_text_response(ordinary, {"reasoning_notes": []}, {})
+    assert progress == [ordinary]
+    assert trace["reasoning_notes"] == [ordinary]
+    assert delivered == ordinary
+    assert final_trace["reasoning_notes"] == [ordinary]
+
+
+def test_skill_review_projection_redacts_reviewer_secret_prose():
+    from ouroboros.skill_review import SkillReviewOutcome, render_skill_review_block
+
+    candidate = "sk-" + "C3" * 20
+    outcome = SkillReviewOutcome(
+        skill_name="redacted-review",
+        status="blockers",
+        content_hash="a" * 64,
+        reviewer_models=["fake/reviewer"],
+        findings=[{
+            "item": "secret_handling",
+            "verdict": "FAIL",
+            "severity": "critical",
+            "reason": f"Remove {candidate} from the payload.",
+            "model": "fake/reviewer",
+        }],
+    )
+
+    markdown = render_skill_review_block(outcome)
+
+    assert candidate not in markdown
+    assert "***REDACTED***" in markdown

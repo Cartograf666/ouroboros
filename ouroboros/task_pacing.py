@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from ouroboros.config import (
-    get_acceptance_max_improvement_passes,
     get_acceptance_reserve_pct,
     get_acceptance_review_est_sec,
     get_finalization_grace_sec,
@@ -33,6 +32,12 @@ from ouroboros.config import (
 )
 from ouroboros.contracts.task_contract import answer_protocol_active, normalize_budget_profile
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
+from ouroboros.review_cycles import (
+    REASON_REVIEW_CYCLES_EXHAUSTED,
+    emit_review_cycles_exhausted,
+    get_acceptance_max_improvement_passes,
+    review_max_cycles,
+)
 from ouroboros.utils import append_jsonl, iter_jsonl_objects, utc_now_iso
 
 
@@ -278,23 +283,26 @@ def effective_max_improvement_passes(
 ) -> Optional[int]:
     """The COUNT axis for improvement passes.
 
-    An explicit task-local cap always binds. Required+Blocking without one is
-    intentionally unbounded by a *local count* (deadline and global lifecycle
-    rails still apply). Other legacy policies retain their historical default."""
+    An explicit task-local cap always binds (owner "Hurry up" overlays 0).
+    Without one, the shared review-cycle cap binds under EVERY policy —
+    Required+Blocking included (owner decisions D10/D20): passes = cycles - 1
+    from ``OUROBOROS_REVIEW_MAX_CYCLES`` (``review_cycles.py``), ``None`` only
+    when that setting is ``unlimited``. Deadline and global lifecycle rails
+    apply on top. The one-minor ``until_deadline`` alias keeps its historical
+    meaning outside Required+Blocking: with a deadline the count axis is off."""
     cap = profile.get("max_improvement_passes")
     # An explicit task-local cap is authoritative under every policy, including
     # the one-minor ``until_deadline`` compatibility alias.
     if cap is not None:
         return max(0, int(cap))
-    # Required+Blocking has no implicit local count cap.  Deadline, global task
-    # rails and an explicitly supplied cap still stop it.
-    if required_blocking:
+    if (
+        not required_blocking
+        and profile.get("improvement_policy") == "until_deadline"
+        and has_deadline
+    ):
         return None
-    if profile.get("improvement_policy") == "until_deadline" and has_deadline:
-        return None
-    if cap is None:
-        cap = get_acceptance_max_improvement_passes()
-    return max(0, int(cap))
+    cap = get_acceptance_max_improvement_passes()
+    return None if cap is None else max(0, int(cap))
 
 
 def improvement_pass_allowed(
@@ -304,19 +312,32 @@ def improvement_pass_allowed(
     *,
     required_blocking: bool = False,
     estimated_sec: Optional[float] = None,
+    ctx: Any = None,
 ) -> Tuple[bool, str]:
     """Gate 2: one more improvement/obligation pass?
 
-    An explicit count cap and the deadline/reserve rail are independent. For
-    Required+Blocking with no explicit cap, only real system rails bound the
-    loop; ``adaptive`` stops early once the spendable window can no longer fit a
-    review comfortably (2× the estimate)."""
+    The count cap (task-local or the shared review-cycle cap) and the
+    deadline/reserve rail are independent; ``adaptive`` stops early once the
+    spendable window can no longer fit a review comfortably (2× the estimate).
+    Under Required+Blocking the SHARED cap (no task-local cap) exhausting is the
+    typed ``review_cycles_exhausted`` reason (owner D10/D27) and — when ``ctx``
+    is supplied — the typed escalation event; a task-local cap (owner hurry,
+    budget_profile) keeps the generic ``improvement_passes_exhausted``."""
     cap = effective_max_improvement_passes(
         profile,
         has_deadline=snapshot.has_deadline,
         required_blocking=required_blocking,
     )
     if cap is not None and passes_done >= cap:
+        if required_blocking and profile.get("max_improvement_passes") is None:
+            if ctx is not None:
+                emit_review_cycles_exhausted(
+                    getattr(ctx, "event_queue", None),
+                    getattr(ctx, "budget_drive_root", "") or getattr(ctx, "drive_root", ""),
+                    surface="task_acceptance", task_id=str(getattr(ctx, "task_id", "") or ""),
+                    cycles_paid=passes_done + 1, cap=cap + 1, enforcement="blocking",
+                )
+            return False, REASON_REVIEW_CYCLES_EXHAUSTED
         return False, "improvement_passes_exhausted"
     if not snapshot.has_deadline:
         return True, ""
@@ -758,9 +779,12 @@ def _acceptance_rails_line_inner(
             required_blocking=required_blocking,
         )
         if cap is None:
+            # None comes from either the unlimited shared cap or the non-RB
+            # ``until_deadline``+deadline alias path; only claim the former when true.
+            why = "review cycles unlimited; " if review_max_cycles() is None else ""
             parts.append(
                 f"review passes: {int(passes_done)} done, no local count cap "
-                "(deadline/budget rails bind)"
+                f"({why}deadline/budget rails bind)"
             )
         else:
             passes_part = f"review passes: {int(passes_done)}/{int(cap)}"

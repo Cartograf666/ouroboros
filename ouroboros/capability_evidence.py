@@ -35,7 +35,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.utils import (
+    atomic_write_json,
+    is_credential_header_name,
+    read_json_dict,
+    utc_now_iso,
+)
 
 log = logging.getLogger(__name__)
 
@@ -199,10 +204,6 @@ def confirms_at_least(
 def _canonical_headers(headers: Optional[Dict[str, Any]]) -> Tuple[Tuple[str, str], ...]:
     if not isinstance(headers, dict):
         return ()
-    credential_names = {
-        "authorization", "proxy-authorization", "api-key", "x-api-key",
-        "x-goog-api-key", "anthropic-api-key", "openai-api-key",
-    }
     # Credentials are dispatch authentication, not route capability identity.
     # Omitting both value and presence keeps key rotation (or late key loading)
     # from invalidating otherwise identical route evidence.  Non-secret beta /
@@ -210,7 +211,7 @@ def _canonical_headers(headers: Optional[Dict[str, Any]]) -> Tuple[Tuple[str, st
     return tuple(sorted(
         (str(k).lower(), str(v))
         for k, v in headers.items()
-        if str(k).lower() not in credential_names
+        if not is_credential_header_name(k)
     ))
 
 
@@ -315,16 +316,10 @@ def _age_seconds(ts: str) -> float:
 # It NEVER touches window records, so the BIBLE P3 ≥1M scope-review floor
 # evidence path is untouched. Value shape:
 #   {"ceiling": "<effort>", "observed_at": iso, "reason": "provider_rejected"}
-# KEYING (deliberate, r4 disclosure): the key is the NORMALIZED MODEL IDENTITY
-# (llm.normalize_model_identity — provider-scoped model id), NOT the full route
-# fingerprint the window evidence uses. Effort-level support is treated as a
-# MODEL property: a ceiling learned on one base_url applies to the model on all
-# routes. Coarser than per-route, and self-healing — the floor in llm.py keeps
-# a bad endpoint from poisoning below "low", and clamps are disclosed per call.
-# The ceiling is the highest effort a route ACCEPTED after a provider rejected a
-# higher one (learned by the reject-and-step-down walk in llm.py). Fail-open:
-# any error → no ceiling (send the requested effort). Owner-configured efforts are
-# still honored UP TO the learned real ceiling; clamping is disclosed in usage.
+# KEYING: this historical namespace uses NORMALIZED MODEL IDENTITY rather than
+# the exact route fingerprint used by current request-wire compatibility. It is
+# retained for diagnostics and upgrade regression compatibility only; production
+# request construction, scheduling, and recovery do not consult it as authority.
 
 def record_effort_ceiling(drive_root: Any, fingerprint: str, ceiling: str) -> None:
     """Persist the learned reasoning-effort ceiling. The key is the normalized
@@ -364,17 +359,12 @@ def get_effort_ceiling(drive_root: Any, fingerprint: str) -> str:
 
 
 # --- Learned reasoning-effort floors (v6.73.2) ----------------------------------
-# The VALUE-TOO-LOW mirror of effort_ceilings: some endpoints make reasoning
-# MANDATORY (e.g. Gemini's "Reasoning is mandatory for this endpoint and cannot
-# be disabled" 400 on effort "none"). llm.py learns a floor of "low" from such a
-# rejection and later calls clamp UP to it (disclosed per call as
-# reasoning_effort_clamped reason="learned_floor"). Same namespace design and
-# NORMALIZED-MODEL-IDENTITY keying as effort_ceilings/rejected_params.
-# LIFECYCLE ASYMMETRY (deliberate): ceilings are sticky (a model's max supported
-# effort is a stable model property), floors EXPIRE like rejected_params —
-# whether reasoning can be disabled is provider POLICY that changes; if the
-# provider later allows disabling it again, behavior self-heals after the TTL at
-# the cost of one reactive 400. Fail-open everywhere.
+# Historical VALUE-TOO-LOW mirror of effort_ceilings. Some endpoints make
+# reasoning mandatory, but current adaptation is exact-route, success-confirmed
+# request-wire evidence. These model-global rows remain diagnostic/read-compatible.
+# Historical lifecycle remains readable: ceilings are sticky, while floors expire
+# like rejected_params. Since normal dispatch ignores this namespace, expiry changes
+# diagnostic state only; exact-route request-wire evidence owns runtime self-healing.
 
 _EFFORT_FLOORS_TTL_SEC = 14 * 24 * 3600.0
 
@@ -498,6 +488,21 @@ MEASURED_DENSITY_SAFETY_FACTOR = 1.05
 _DENSITY_MEMO: Dict[str, Tuple[float, str]] = {}
 
 
+def _density_observation_seq(pair: Dict[str, Any]) -> int:
+    """Persisted insertion order for witnesses that share one clock tick."""
+    try:
+        return max(0, int(pair.get("observation_seq") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _density_recency_key(pair: Dict[str, Any]) -> Tuple[float, int]:
+    """Chronological key without letting the tie-breaker refresh witness TTL."""
+    observed = parse_deadline_ts(pair.get("observed_at"))
+    epoch = observed.timestamp() if observed is not None else float("-inf")
+    return epoch, _density_observation_seq(pair)
+
+
 def _density_of(prompt_chars: Any, prompt_tokens: Any) -> float:
     """Real tokens per chars/4 estimated token, or 0.0 when not measurable."""
     try:
@@ -546,7 +551,11 @@ def record_token_density(
                 and _density_of(pair.get("prompt_chars"), pair.get("prompt_tokens")) > 0
             ]
             route_pairs = [pair for pair in pairs if str(pair.get("route_fp") or "") == route]
-            newest = min(route_pairs, key=lambda pair: _age_seconds(str(pair.get("observed_at") or "")), default=None)
+            newest = max(
+                enumerate(route_pairs),
+                key=lambda item: (*_density_recency_key(item[1]), item[0]),
+                default=(0, None),
+            )[1]
             known = _density_of(
                 (newest or {}).get("prompt_chars"), (newest or {}).get("prompt_tokens"),
             )
@@ -558,24 +567,35 @@ def record_token_density(
                 _DENSITY_MEMO[memo_key] = (known, str(newest.get("observed_at") or ""))
                 return
             observed_at = utc_now_iso()
+            observation_seq = max(
+                (_density_observation_seq(pair) for pair in pairs), default=0,
+            ) + 1
             pairs.append({
                 "prompt_chars": int(prompt_chars or 0),
                 "prompt_tokens": int(prompt_tokens or 0),
                 "observed_at": observed_at,
+                "observation_seq": observation_seq,
                 "source": str(source or "dispatch_usage"),
                 "route_fp": route,
             })
-            densest = max(
-                pairs,
-                key=lambda pair: (
-                    _density_of(pair.get("prompt_chars"), pair.get("prompt_tokens")),
-                    str(pair.get("observed_at") or ""),
+            indexed_pairs = list(enumerate(pairs))
+            densest_index, densest = max(
+                indexed_pairs,
+                key=lambda item: (
+                    _density_of(item[1].get("prompt_chars"), item[1].get("prompt_tokens")),
+                    *_density_recency_key(item[1]),
+                    item[0],
                 ),
             )
-            newest_rest = sorted(
-                (pair for pair in pairs if pair is not densest),
-                key=lambda pair: str(pair.get("observed_at") or ""), reverse=True,
-            )[:_TOKEN_DENSITY_MAX_PAIRS - 1]
+            newest_rest = [
+                pair
+                for index, pair in sorted(
+                    indexed_pairs,
+                    key=lambda item: (*_density_recency_key(item[1]), item[0]),
+                    reverse=True,
+                )
+                if index != densest_index
+            ][:_TOKEN_DENSITY_MAX_PAIRS - 1]
             store[fp] = {"pairs": [densest, *newest_rest]}
             if _save(drive_root, data):
                 _DENSITY_MEMO[memo_key] = (density, observed_at)
@@ -630,10 +650,16 @@ def resolve_main_token_density(drive_root: Any, route_fp: str, model_id: str) ->
             if route and str(item[0].get("route_fp") or "") == route
         ]
         if route_pairs:
-            return min(route_pairs, key=lambda item: _age_seconds(str(item[0].get("observed_at") or "")))[1], "fresh_route_usage"
+            return max(
+                enumerate(route_pairs),
+                key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
+            )[1][1], "fresh_route_usage"
         model_pairs = _fresh_density_pairs(store, _normalized_density_model(model_id))
         if model_pairs:
-            return min(model_pairs, key=lambda item: _age_seconds(str(item[0].get("observed_at") or "")))[1], "fresh_model_usage"
+            return max(
+                enumerate(model_pairs),
+                key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
+            )[1][1], "fresh_model_usage"
     except Exception:
         pass
     return 1.0, "cold_estimate"

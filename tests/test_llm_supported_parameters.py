@@ -60,6 +60,10 @@ def _install_fake_response(monkeypatch, data: dict[str, Any]) -> dict[str, int]:
 class TestSupportedParametersFilter:
     def test_temperature_stripped_for_unsupported_model(self, monkeypatch):
         from ouroboros.llm import LLMClient
+        from ouroboros.request_wire_recovery import (
+            prepare_wire_payload_for_send,
+            request_wire_call_scope,
+        )
 
         _install_fake_response(monkeypatch, {
             "data": [{
@@ -74,18 +78,21 @@ class TestSupportedParametersFilter:
 
         client = LLMClient(api_key="test")
         target = client._resolve_remote_target("anthropic/claude-opus-4.6")
-        kwargs = client._build_remote_kwargs(
-            target=target,
-            messages=[{"role": "user", "content": "hi"}],
-            reasoning_effort="medium",
-            max_tokens=256,
-            tool_choice="auto",
-            temperature=0.2,
-            tools=None,
-        )
-        assert "temperature" not in kwargs, (
-            "temperature must be stripped when the model's supported_parameters omits it"
-        )
+        with request_wire_call_scope():
+            kwargs = client._build_remote_kwargs(
+                target=target,
+                messages=[{"role": "user", "content": "hi"}],
+                reasoning_effort="medium",
+                max_tokens=256,
+                tool_choice="auto",
+                temperature=0.2,
+                tools=None,
+            )
+            physical = prepare_wire_payload_for_send(
+                target, kwargs, api_surface="chat.completions"
+            )
+        assert kwargs["temperature"] == 0.2
+        assert "temperature" not in physical
 
     def test_temperature_kept_for_supported_model(self, monkeypatch):
         from ouroboros.llm import LLMClient
@@ -386,7 +393,8 @@ class TestSupportedParametersFilter:
             skip_capability_fetch=True,
         )
 
-        assert "temperature" not in kwargs
+        # Legacy model-global rows stay diagnostic and cannot mutate dispatch.
+        assert kwargs["temperature"] == 0.2
 
     def test_cache_fetched_at_most_once(self, monkeypatch):
         from ouroboros.llm import LLMClient

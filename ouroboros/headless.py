@@ -19,11 +19,11 @@ from hashlib import sha256
 from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ouroboros.contracts.task_constraint import normalize_task_constraint
+from ouroboros.post_task_checkpoint import project_replica_task_result_fields
 from ouroboros.task_results import (
-    TASK_COST_META_FIELDS,
     cancellation_blocks_child_result, load_task_result, validate_task_id, write_task_result,
 )
-from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -190,6 +190,35 @@ def _timestamp_from_result(result: Dict[str, Any], fallback: float) -> float:
     return fallback
 
 
+
+def _live_unpromoted_child_refs(
+    promotion: Any, expected_child: pathlib.Path,
+) -> List[Dict[str, Any]]:
+    if not isinstance(promotion, dict):
+        return []
+    try:
+        version = int(promotion.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return []
+    if version < 1:
+        return []
+    if str(promotion.get("status") or "") == "complete":
+        return []
+    child_root = expected_child.resolve(strict=False)
+    live: List[Dict[str, Any]] = []
+    for row in promotion.get("pending_refs") or []:
+        if not isinstance(row, dict) or not row.get("path"):
+            continue
+        try:
+            path = pathlib.Path(str(row["path"])).resolve(strict=False)
+            path.relative_to(child_root)
+        except (OSError, ValueError):
+            continue
+        if path.is_file():
+            live.append(dict(row))
+    return live
+
+
 def prune_headless_task_drives(
     parent_drive_root: pathlib.Path,
     *,
@@ -204,9 +233,19 @@ def prune_headless_task_drives(
     base = parent / HEADLESS_TASKS_DIR
     days = _resolve_retention_days(retention_days)
     cutoff = age_cutoff(days, now)
-    report: Dict[str, Any] = {"retention_days": days, "scanned": 0, "pruned": [], "skipped": [], "errors": []}
+    report: Dict[str, Any] = {
+        "retention_days": days,
+        "scanned": 0,
+        "pruned": [],
+        "skipped": [],
+        "errors": [],
+        "promotion_retry": {},
+    }
     if not base.is_dir():
         return report
+    from ouroboros.observability import retry_pending_child_ref_promotions
+
+    report["promotion_retry"] = retry_pending_child_ref_promotions(parent)
     for task_dir in sorted(base.iterdir()):
         if not task_dir.is_dir():
             continue
@@ -242,6 +281,16 @@ def prune_headless_task_drives(
             ).strip()
             if known_child and str(pathlib.Path(known_child).resolve(strict=False)) != expected_child:
                 report["skipped"].append({"task_id": task_id, "reason": "child_drive_mismatch"})
+                continue
+            live_unpromoted = _live_unpromoted_child_refs(
+                result.get("child_ref_promotion"), pathlib.Path(expected_child),
+            )
+            if live_unpromoted:
+                report["skipped"].append({
+                    "task_id": task_id,
+                    "reason": "child_refs_unpromoted",
+                    "pending_ref_count": len(live_unpromoted),
+                })
                 continue
             shutil.rmtree(task_dir)
             report["pruned"].append({"task_id": task_id, "path": str(task_dir)})
@@ -356,6 +405,18 @@ def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str) ->
         return False
     headless_base = parent / HEADLESS_TASKS_DIR / task_id
     task_drive_base = parent / TASK_DRIVES_DIR / task_id
+    try:
+        result = load_task_result(parent, task_id) or {}
+        promotion = result.get("child_ref_promotion")
+        if (
+            _live_unpromoted_child_refs(promotion, headless_base / "data")
+            or _live_unpromoted_child_refs(promotion, task_drive_base)
+        ):
+            return False
+    except Exception:
+        # Legacy/no-metadata cleanup behavior remains fail-soft. Newly produced
+        # valid metadata is parsed by the helper without raising.
+        pass
     bases = (headless_base, task_drive_base)
     removed = False
     for base in bases:
@@ -384,6 +445,15 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
     child_result = load_task_result(child_drive, task_id)
     if not isinstance(child_result, dict):
         return None
+    # Canonical terminal results must not retain child-local forensic/source
+    # pointers that the startup GC is about to delete. Promotion happens before
+    # the one atomic canonical result write; a live ref whose destination write
+    # was interrupted remains named in metadata so GC can retry safely.
+    from ouroboros.observability import promote_child_task_refs
+
+    child_result, ref_promotion = promote_child_task_refs(
+        pathlib.Path(parent_drive_root), child_drive, task_id, child_result,
+    )
     # W2 receipt-level handoff: the child's durable verify_and_record receipts ride
     # the SAME finalization copy-back as its artifacts (fail-soft, never blocks).
     _publish_child_verification_receipts(parent_drive_root, task_id, child_drive)
@@ -403,31 +473,7 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         for key, value in child_result.items()
         if key not in {"task_id", "status"}
     }
-    # The budget-drive result is the sole durable authority for the root
-    # post-task phase. A late child copy-back may enrich the result, but must not
-    # replace a terminal canonical marker with the child's stale running mirror.
-    existing_checkpoint = canonical_existing.get("root_phase_checkpoint")
-    existing_post_task = (
-        str(existing_checkpoint.get("post_task_synthesis") or "")
-        if isinstance(existing_checkpoint, dict) else ""
-    )
-    if existing_post_task in {"completed", "degraded"}:
-        child_checkpoint = payload.get("root_phase_checkpoint")
-        merged_checkpoint = dict(child_checkpoint) if isinstance(child_checkpoint, dict) else {}
-        # The child result owns the acceptance verdict.  The budget-drive copy
-        # only owns the terminal post-task marker, which can settle before this
-        # late copy-back.  Merging the whole parent checkpoint used to replace a
-        # real PASS/DEGRADED verdict with the parent's provisional
-        # ``not_required`` value.
-        merged_checkpoint["post_task_synthesis"] = existing_post_task
-        payload["root_phase_checkpoint"] = merged_checkpoint
-        # F2: the same terminal checkpoint finalized the parent-owned accounting
-        # (task_cost_finalized, exact subtree totals) on the canonical result; a
-        # late copy-back of the child drive's stale root-only cost must not
-        # overwrite it. total_rounds/prompt_tokens/completion_tokens ride the same
-        # finalized record but are not in TASK_COST_META_FIELDS — named explicitly.
-        for key in (*TASK_COST_META_FIELDS, "total_rounds", "prompt_tokens", "completion_tokens"):
-            payload.pop(key, None)
+    payload["child_ref_promotion"] = ref_promotion
     if isinstance(payload.get("artifacts"), list):
         payload["artifacts"] = _copy_child_artifacts_to_parent(
             parent_drive_root,
@@ -458,6 +504,7 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         parent_drive_root,
         task_id,
         child_status,
+        _field_projector=project_replica_task_result_fields,
         **payload,
     )
 
@@ -488,7 +535,7 @@ def _publish_child_verification_receipts(
             return  # shared-drive shape: already the canonical file
         tmp = dest.with_name(f"{dest.name}.tmp.{os.getpid()}")
         shutil.copy2(src, tmp)
-        os.replace(tmp, dest)
+        replace_atomic(tmp, dest)
     except Exception:
         log.warning("Failed to publish child receipts for task %s", task_id, exc_info=True)
 

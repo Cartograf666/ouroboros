@@ -122,11 +122,28 @@ class ContextFitPlan:
         self,
         mode: str,
         tools: Optional[List[Dict[str, Any]]],
+        *,
+        provider: str = "",
+        reasoning_effort: str = "",
     ) -> int:
         """Calibrated physical prompt projection after schemas are available."""
         projection = self.projection(mode)
+        if not (
+            str(provider or "").strip().lower() == "openai"
+            and str(reasoning_effort or "").strip().lower() not in {"", "none"}
+            and tools
+        ):
+            return int(
+                (projection.estimated_tokens + tool_schema_tokens(tools))
+                * projection.calibration_ratio
+            )
         return int(
-            (projection.estimated_tokens + tool_schema_tokens(tools))
+            estimate_context_prompt_tokens(
+                self.messages_for(mode),
+                tools,
+                provider=provider,
+                reasoning_effort=reasoning_effort,
+            )
             * projection.calibration_ratio
         )
 
@@ -198,12 +215,22 @@ def tool_schema_tokens(tools: Optional[List[Dict[str, Any]]]) -> int:
 def estimate_context_prompt_tokens(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
+    *,
+    provider: str = "",
+    reasoning_effort: str = "",
 ) -> int:
     """Estimate the complete inspectable context shape with bounded images."""
+    from ouroboros.anthropic_native_custody import (
+        context_custody_proxy,
+        custody_private_key,
+    )
     from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
+    from ouroboros.openai_chat_dispatch import direct_openai_context_projections
 
     def project(value: Any) -> Any:
         if isinstance(value, dict):
+            if any(custody_private_key(key) for key in value):
+                value = context_custody_proxy(value)
             if str(value.get("type") or "") in {"image", "image_url"}:
                 return {
                     "type": str(value.get("type") or "image"),
@@ -218,14 +245,19 @@ def estimate_context_prompt_tokens(
             return [project(item) for item in value]
         return value
 
-    serialized = json.dumps(
-        {"messages": project(messages), "tools": tools or []},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
+    projections = direct_openai_context_projections(
+        messages, tools, provider=provider, reasoning_effort=reasoning_effort,
     )
-    return max(0, int(estimate_tokens(serialized)))
+    return max(
+        int(estimate_tokens(json.dumps(
+            {"messages": project(projected_messages), "tools": projected_tools},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )))
+        for projected_messages, projected_tools in projections
+    )
 
 
 def _route_calibration_ratio(
@@ -259,6 +291,7 @@ def measure_main_fit(
     rendered_mode: Literal["max", "low"],
     round_id: str,
     automatic_pass_used: bool = False,
+    reasoning_effort: str = "",
 ) -> MainFitDisposition:
     """Measure one sealed Main candidate against owner target T and route W.
 
@@ -274,7 +307,12 @@ def measure_main_fit(
         drive_root = canonical_evidence_root()
     density, basis = resolve_main_token_density(drive_root, plan.route_fp, plan.model)
     density = float(density)
-    estimated_input = int(math.ceil(estimate_context_prompt_tokens(messages, tools) * density))
+    estimated_input = int(math.ceil(estimate_context_prompt_tokens(
+        messages,
+        tools,
+        provider=plan.provider,
+        reasoning_effort=reasoning_effort,
+    ) * density))
     reserve = int(plan.output_reserve_tokens or 0)
     total = estimated_input + reserve
     target = OWNER_LOW_TARGET_TOKENS if profile == "owner_low" else None
@@ -473,3 +511,21 @@ def build_context_fit_plan(
         max_projection=max_projection,
         low_projection=low_projection,
     )
+
+
+# The `_context_*` telemetry a fallback attempt must not leak between
+# candidates: snapshot before, restore after. Pure dict work over this
+# module's own key prefix, so it belongs here rather than in the loop that
+# happens to call it (moved from `loop.py` under the size ratchet).
+def _snapshot_context_fit_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in usage.items() if key.startswith("_context_")}
+
+
+def _restore_context_fit_usage(
+    usage: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> None:
+    for key in tuple(usage):
+        if key.startswith("_context_"):
+            usage.pop(key, None)
+    usage.update(snapshot)

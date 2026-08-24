@@ -171,6 +171,12 @@ review latency for wall-clock throughput — that is a DISCLOSED deviation from
 the record configuration and the run manifest carries the actual review mode;
 numbers from advisory rows must not be presented as the blocking-config record.
 
+Acceptance improvement passes are bounded by the owner's shared `OUROBOROS_REVIEW_MAX_CYCLES`
+(default 2, `unlimited` available) since 2026-08-15 — including under `required`+`blocking`,
+which had no local count cap before. This template carries no explicit value, so runs use the
+default; an exhausted cap terminates honestly with the typed `review_cycles_exhausted` reason.
+Runs from before that change are not comparable on this axis.
+
 ## Leaderboard submission
 
 Since ~2026-07-08 the official TB2.1 submission channel is the GitHub PR flow

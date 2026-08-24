@@ -1,15 +1,19 @@
 import {
-    accountedUpperBound,
-    accountedUpperBoundWithChildren,
     escapeHtmlAttr,
     escapeHtmlText as escapeHtml,
-    formatUsdWhole,
     renderMarkdown,
 } from './utils.js';
+import {
+    captureVisibleTimelineAnchor as captureAnchor,
+    restoreVisibleTimelineAnchor as restoreAnchor,
+} from './timeline_anchor.js';
+import { buildTimelineItemHtml, isLiveLineExpandable } from './live_timeline_item.js';
+import { initChatModelControl } from './chat_model_control.js';
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
+import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail } from './api_client.js';
 import {
     OWNER_STOP_DETAIL_MARKER,
@@ -38,82 +42,55 @@ import {
     taskControlBusy,
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-// Cost presentation moved to costs.js (its subject); re-exported here because
-// web/tests/cost_presentation.test.js imports these names from this module.
-import { rawTimestampEpoch } from './utils.js';
-export { rawTimestampEpoch };
-import {
-    headerBudgetPresentation, taskCostMeta, taskCostProjection,
-    mergeStickyCostMeta, clearStickyCardState, withTaskCostMeta,
-} from './costs.js';
-export {
-    headerBudgetPresentation, taskCostMeta, taskCostProjection,
-    mergeStickyCostMeta, clearStickyCardState, withTaskCostMeta,
-};
 import { renderSkillReviewDisclosure, wireSkillReviewDisclosure } from './skill_review_card.js';
 import {
     createHistoryResyncScheduler,
     createRebuildBatch,
+    insertTimelineNode,
     loadOlderControlState,
     nextQuotaEscalation,
 } from './chat_render_batch.js';
-import { initChatModelControl } from './chat_model_control.js';
+import {
+    COLLAPSED_ACTIVITY_MAX,
+    boundActivityPreview,
+    buildMessageKey,
+    clearStickyCardState,
+    computeDerivedChatStatus,
+    computeHydratedDirectActivities,
+    formatMsgTime,
+    headerBudgetPresentation,
+    isTerminalTaskDetail,
+    isTerminalTaskPhase,
+    liveLineRowToggleKey,
+    mergeStickyCostMeta,
+    partitionLocalEchoJournal,
+    projectCollapsedActivity,
+    rawTimestampEpoch,
+    reconcileHydratedDirectActivities,
+    reconnectBannerText,
+    routingAnnotationText,
+    taskCostMeta,
+    taskCostProjection,
+} from './chat_activity.js';
 
-// Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
-// lineKey to toggle for a click landing on `target`, or '' when the click must
-// NOT toggle (nested interactive element, or an active text selection inside
-// the line).
-export function liveLineRowToggleKey(target, selection = null) {
-    const line = target?.closest?.('.chat-live-line.expandable');
-    if (!line) return '';
-    if (target.closest('button, a, input, textarea, select, label, summary, [contenteditable="true"]')) return '';
-    if (selection && !selection.isCollapsed && line.contains(selection.anchorNode)) return '';
-    return (line.dataset && line.dataset.liveLineKey) || '';
-}
-
-/** Convert a raw source timestamp to sortable epoch milliseconds. */
-/**
- * Insert a top-level timeline node chronologically while keeping typing last.
- * Equal timestamps preserve arrival order; timestamp-free nodes append.
- */
-export function insertTimelineNode(messages, node, typing = null, { stickToBottom = false } = {}) {
-    const previousScrollTop = Number(messages?.scrollTop) || 0;
-    const previousScrollHeight = Number(messages?.scrollHeight) || 0;
-    const rawNodeTs = node?.dataset?.ts;
-    const nodeTs = rawNodeTs == null || rawNodeTs === '' ? NaN : Number(rawNodeTs);
-    let before = null;
-    if (Number.isFinite(nodeTs)) {
-        for (const child of Array.from(messages?.children || [])) {
-            if (child === node || child === typing) continue;
-            const rawChildTs = child?.dataset?.ts;
-            const childTs = rawChildTs == null || rawChildTs === '' ? NaN : Number(rawChildTs);
-            if (Number.isFinite(childTs) && childTs > nodeTs) {
-                before = child;
-                break;
-            }
-        }
-    }
-    let insertedAboveViewport = false;
-    if (
-        before
-        && !stickToBottom
-        && typeof before.getBoundingClientRect === 'function'
-        && typeof messages.getBoundingClientRect === 'function'
-    ) {
-        insertedAboveViewport = before.getBoundingClientRect().top <= messages.getBoundingClientRect().top;
-    }
-    if (before) messages.insertBefore(node, before);
-    else if (typing && typing.parentNode === messages) messages.insertBefore(node, typing);
-    else messages.appendChild(node);
-
-    const nextScrollHeight = Number(messages?.scrollHeight) || 0;
-    if (stickToBottom) {
-        messages.scrollTop = nextScrollHeight;
-    } else if (insertedAboveViewport) {
-        messages.scrollTop = previousScrollTop + Math.max(0, nextScrollHeight - previousScrollHeight);
-    }
-    return { before, insertedAboveViewport };
-}
+export {
+    COLLAPSED_ACTIVITY_MAX,
+    boundActivityPreview,
+    clearStickyCardState,
+    computeDerivedChatStatus,
+    computeHydratedDirectActivities,
+    headerBudgetPresentation,
+    insertTimelineNode,
+    isTerminalTaskDetail,
+    isTerminalTaskPhase,
+    liveLineRowToggleKey,
+    mergeStickyCostMeta,
+    projectCollapsedActivity,
+    rawTimestampEpoch,
+    reconcileHydratedDirectActivities,
+    taskCostMeta,
+    taskCostProjection,
+};
 
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_DRAFT_KEY = 'ouro_chat_draft';
@@ -126,32 +103,17 @@ const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 // mirrored into Main, but must still produce exactly one toast.
 const shownIncidentToastKeys = new Set();
 
-
-/**
- * Decide the collapsed activity line text (v6.82 P1), shared by root and
- * subagent cards. Root cards show the latest activity headline ONLY when a
- * coined name occupies the title — an unnamed card's title already shows the
- * activity, so the line is suppressed to avoid duplication. Subagent titles
- * keep the role·model·id identity, so their routed progress body always feeds
- * the line. A frame without new activity keeps `previous`, so finishing a card
- * never blanks its last activity. Geometry is owned by the two-line CSS clamp;
- * this character ceiling is only a defensive DOM/accessibility bound.
- */
-export const COLLAPSED_ACTIVITY_MAX = 240;
-
-export function boundActivityPreview(value = '') {
-    const candidate = String(value || '').replace(/\s+/g, ' ').trim();
-    if (candidate.length <= COLLAPSED_ACTIVITY_MAX) return candidate;
-    return candidate.slice(0, COLLAPSED_ACTIVITY_MAX - 1).trimEnd() + '…';
+export function durableChatMediaUrl(value) {
+    const url = String(value || '');
+    return /^\/api\/tasks\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\/artifacts\/chat-media-[0-9a-f]{64}\.(png|jpg|gif|webp|mp4|webm)$/.test(url) ? url : '';
 }
 
-export function projectCollapsedActivity({
-    isSubagent = false, suggestedName = '', headline = '', body = '', previous = '',
-} = {}) {
-    const current = boundActivityPreview(isSubagent ? body : headline);
-    const candidate = current || boundActivityPreview(previous);
-    if (!isSubagent && !String(suggestedName || '').trim()) return '';
-    return candidate;
+export function chatMediaMessageKey(msg) {
+    return [msg.msg_type || msg.type, String(msg.ts || ''), String(msg.caption || ''), String(msg.mime || '')].join('|');
+}
+
+export function isNonTerminalMediaHistoryRow(msg) {
+    return msg.system_type === 'photo' || msg.system_type === 'video';
 }
 
 /**
@@ -191,12 +153,20 @@ export async function confirmAndSendPanic(deps) {
     return false;
 }
 
-// v6.82 (P5): terminal card phases. 'cancelled' is a first-class terminal phase
-// so a force-cancelled root resolves its card instead of re-inflating.
-export function isTerminalTaskPhase(phase = '', terminal = false) {
-    return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
+function withTaskCostMeta(summary, payload, { replace = false, rawTs = '' } = {}) {
+    const projection = taskCostProjection(payload, rawTs);
+    // `replace` frames (task_done/task_cost_finalized) never keep the
+    // summarizer's own meta strings. Cost renders ONLY from the card's sticky
+    // record.costMeta (applyLiveCardState); summarizer-built `cost=` strings
+    // are dropped UNCONDITIONALLY — a frame without task-scope accounting
+    // evidence must show no money at all, not a bare per-call number.
+    const base = replace ? { ...summary, meta: [] } : summary;
+    const out = projection ? { ...base, costProjection: projection } : { ...base };
+    if (Array.isArray(out.meta) && out.meta.length) {
+        out.meta = out.meta.filter((entry) => !String(entry || '').startsWith('cost='));
+    }
+    return out;
 }
-
 
 function showTaskIncidentToast(msg) {
     const incident = String(msg?.task_incident || '').trim();
@@ -267,6 +237,7 @@ export function initChat(ctx) {
 
 export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
+    stateSnapshots,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
     asPanel = false, title = 'Chat', initialScrollState = null,
     // perf2 P4.2: app.js signal "a project panel is opening right now" — Main
@@ -361,9 +332,6 @@ export function createChatInstance({
                         <button class="chat-scroll-bottom-btn" id="chat-scroll-bottom" type="button" aria-label="Scroll to latest message" title="Scroll to latest message">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
                         </button>
-                        <button class="chat-stop-inline" id="chat-stop" type="button" title="Stop execution" style="display: none;">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
-                        </button>
                         <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
                     </div>
                 </div>
@@ -395,15 +363,9 @@ export function createChatInstance({
     const fileInput = byId('file-input');
     const attachmentPreview = byId('attachment-preview');
     const scrollBottomBtn = byId('scroll-bottom');
-    // The model control already carries the full `chat-model-control` ID in
-    // the main chat template. Passing that full ID through `byId()` would
-    // produce `chat-chat-model-control`, so the initializer would never run
-    // and the static "Checking…" placeholder would remain forever.
-    const modelControl = page.querySelector('.chat-model-control');
     let pendingAttachments = [];
     let attachmentsUploading = false;
     let nestedSubagentsExpanded = false;
-    let disposeModelControl = () => {};
 
     // Instance lifecycle (P3): destroy() flips this so rAF loops and late async
     // continuations become no-ops instead of touching a removed DOM subtree.
@@ -412,6 +374,11 @@ export function createChatInstance({
     const wsDisposers = [];
     const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));
 
+    // The main model selector. Main chat only: a project panel runs on the
+    // project's own model or inherits this slot, so offering the global choice
+    // there would let a panel silently repoint every other surface.
+    const modelControl = page.querySelector('.chat-model-control');
+    let disposeModelControl = () => {};
     if (modelControl) {
         disposeModelControl = initChatModelControl({
             root: modelControl,
@@ -662,6 +629,50 @@ export function createChatInstance({
     // suppresses the transient card while preserving the typed routing annotation
     // and any non-empty final conversational answer as separate UI roles.
     const ephemeralDecisionTaskIds = new Set();
+    // Server-confirmed in-flight direct/ephemeral/managed activities.
+    const activeDirectActivities = new Map();
+    // Local user submissions awaiting server confirmation (clientMessageId
+    // -> { clientMessageId, timestamp }).
+    const pendingSubmissions = new Map();
+    // Bounded conclusions block late root typing and stale state snapshots; reusable
+    // logical task slots are cleared whenever their cycle settles.
+    const concludedDirectActivities = new Map();
+    const CONCLUDED_ACTIVITY_LEDGER_MAX = 200;
+    // Retryable queue-loss candidates plus process-local single-flight reads.
+    const missingManagedTaskIds = new Set();
+    const managedTaskDetailReads = new Set();
+    // Owner rows kept until history confirms client_message_id.
+    const localEchoJournal = new Map();
+    const LOCAL_ECHO_JOURNAL_MAX = 50;
+
+    function recordLocalEcho(clientMessageId, text, ts) {
+        if (!clientMessageId) return;
+        localEchoJournal.set(clientMessageId, { clientMessageId, text, ts, annotation: null });
+        while (localEchoJournal.size > LOCAL_ECHO_JOURNAL_MAX) {
+            localEchoJournal.delete(localEchoJournal.keys().next().value);
+        }
+    }
+
+    function recordConcludedActivity(activityId) {
+        const aid = String(activityId || '').trim();
+        if (!aid) return;
+        missingManagedTaskIds.delete(aid);
+        concludedDirectActivities.delete(aid);
+        concludedDirectActivities.set(aid, Date.now());
+        while (concludedDirectActivities.size > CONCLUDED_ACTIVITY_LEDGER_MAX) {
+            const oldest = concludedDirectActivities.keys().next().value;
+            concludedDirectActivities.delete(oldest);
+        }
+    }
+    function recordTerminalActivity(taskId) {
+        const id = String(taskId || '').trim();
+        if (!id) return;
+        activeDirectActivities.delete(id);
+        missingManagedTaskIds.delete(id);
+        if (REUSABLE_TASK_IDS.has(id)) concludedDirectActivities.delete(id);
+        else recordConcludedActivity(id);
+    }
+    let lastTerminalAttention = false;
     // Finished task ids hidden from routine syncs until reload/reconnect rebuilds history.
     const retiredTaskIds = new Set();
     // The owner's last main-chat request, handed to the next live card it spawns so a
@@ -694,38 +705,6 @@ export function createChatInstance({
         return ephemeralDecisionTaskIds.has(taskId);
     }
 
-    function buildMessageKey(role, text, timestamp, opts = {}) {
-        if (opts.clientMessageId) return `client|${opts.clientMessageId}`;
-        if (role !== 'user' && !opts.isProgress && opts.taskId) {
-            return [
-                'task',
-                role,
-                opts.systemType || '',
-                opts.source || '',
-                opts.taskId,
-                text,
-            ].join('|');
-        }
-        if (!timestamp) return '';
-        return [
-            role,
-            opts.isProgress ? '1' : '0',
-            opts.systemType || '',
-            opts.source || '',
-            opts.senderLabel || '',
-            opts.senderSessionId || '',
-            opts.taskId || '',
-            timestamp,
-            text,
-        ].join('|');
-    }
-
-    function reconnectBannerText(reason = '') {
-        if (reason === 'sha-change') return '♻️ Restart complete';
-        if (reason) return '♻️ Reconnected';
-        return '';
-    }
-
     function readPendingReconnectBanner() {
         try {
             const url = new URL(window.location.href);
@@ -752,29 +731,6 @@ export function createChatInstance({
         if (messageKeyOrder.length > 2000) {
             const oldest = messageKeyOrder.shift();
             if (oldest) seenMessageKeys.delete(oldest);
-        }
-    }
-
-    function formatMsgTime(isoStr) {
-        if (!isoStr) return null;
-        try {
-            const d = new Date(isoStr);
-            if (isNaN(d)) return null;
-            const now = new Date();
-            const pad = n => String(n).padStart(2, '0');
-            const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-            const todayStr = now.toDateString();
-            const yesterday = new Date(now);
-            yesterday.setDate(now.getDate() - 1);
-            let short;
-            if (d.toDateString() === todayStr) short = hhmm;
-            else if (d.toDateString() === yesterday.toDateString()) short = `Yesterday, ${hhmm}`;
-            else short = `${months[d.getMonth()]} ${d.getDate()}, ${hhmm}`;
-            const full = `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} at ${hhmm}`;
-            return { short, full };
-        } catch {
-            return null;
         }
     }
 
@@ -833,8 +789,7 @@ export function createChatInstance({
                 if (data?.bg_consciousness_state?.detail) button.title = data.bg_consciousness_state.detail;
             }
         });
-        // Evolve/Consciousness now live inside the More menu; surface a small dot
-        // on the More summary so an active mode stays visible without opening it.
+        // Mark More while background mode is active in the menu.
         const moreSummary = headerActions?.querySelector('.chat-header-more > summary');
         if (moreSummary) {
             const anyActive = !!data?.evolution_enabled || !!data?.bg_consciousness_enabled;
@@ -851,17 +806,33 @@ export function createChatInstance({
         if (budgetFill) budgetFill.style.width = `${budget.fillPct}%`;
     }
 
+    function hydrateStateSnapshot(data, snapshotRequestedAt = Infinity, snapshotGeneration = 0) {
+        syncHeaderControlState(data);
+        const activities = Array.isArray(data?.active_chat_activities)
+            ? data.active_chat_activities
+            : data?.active_direct_turns;
+        if (Array.isArray(activities)) {
+            hydrateDirectActivities(activities, snapshotRequestedAt, snapshotGeneration);
+        }
+    }
+
     async function refreshHeaderControlState(force = false) {
         if (!force && state.activePage !== 'chat') return;
+        const request = stateSnapshots.begin();
         try {
             const resp = await apiFetch('/api/state', { cache: 'no-store' });
             if (!resp.ok) {
-                syncHeaderControlState({ accounting: { available: false } });
+                if (stateSnapshots.isCurrent(request)) {
+                    syncHeaderControlState({ accounting: { available: false } });
+                }
                 return;
             }
-            syncHeaderControlState(await resp.json());
+            const data = await resp.json();
+            stateSnapshots.apply(request, data);
         } catch {
-            syncHeaderControlState({ accounting: { available: false } });
+            if (stateSnapshots.isCurrent(request)) {
+                syncHeaderControlState({ accounting: { available: false } });
+            }
         }
     }
 
@@ -879,152 +850,11 @@ export function createChatInstance({
     }
 
     function captureVisibleTimelineAnchor(excludeNode = null) {
-        // The Load-older control is excluded like .typing-bubble [GPT#13]:
-        // anchoring must land on the first visible TIMESTAMPED node, or a
-        // Load-older restore would pin the button itself and drift the view.
-        const nodes = Array.from(messagesDiv.children).filter(
-            (node) => node !== excludeNode
-                && !excludeNode?.contains?.(node)
-                && !node.classList.contains('typing-bubble')
-                && !node.classList.contains('chat-load-older')
-        );
-        const messagesRect = messagesDiv.getBoundingClientRect();
-        const topNode = nodes.find((item) => {
-            const rect = item.getBoundingClientRect();
-            return rect.bottom > messagesRect.top && rect.top < messagesRect.bottom;
-        }) || null;
-        if (!topNode) return null;
-
-        // A live-card can span several screens while the reader is inside a
-        // child summary or timeline line. Preserve that visible boundary, not
-        // merely the root card whose own top may be far above the viewport.
-        let node = topNode;
-        if (topNode.classList.contains('chat-live-card')) {
-            const selector = [
-                '.chat-live-card',
-                '[data-live-summary-button]',
-                '[data-live-title]',
-                '[data-live-activity]',
-                '[data-live-meta]',
-                '.chat-live-actions',
-                '.chat-live-line',
-                '.chat-live-project-card-btn',
-            ].join(',');
-            const candidates = [topNode, ...topNode.querySelectorAll(selector)]
-                .map((candidate) => {
-                    let depth = 0;
-                    let parent = candidate === topNode ? null : candidate.parentElement;
-                    while (parent && topNode.contains(parent) && parent !== topNode) {
-                        depth += 1;
-                        parent = parent.parentElement;
-                    }
-                    return { node: candidate, rect: candidate.getBoundingClientRect(), depth };
-                })
-                .filter(({ node: candidate, rect }) => candidate.getClientRects().length
-                    && rect.width > 0
-                    && rect.height > 0
-                    && rect.bottom > messagesRect.top
-                    && rect.top < messagesRect.bottom);
-            const belowTop = candidates
-                .filter(({ rect }) => rect.top >= messagesRect.top)
-                .sort((a, b) => (a.rect.top - b.rect.top) || (b.depth - a.depth));
-            const crossing = candidates
-                .filter(({ rect }) => rect.top <= messagesRect.top && rect.bottom > messagesRect.top)
-                .sort((a, b) => b.depth - a.depth);
-            node = belowTop[0]?.node || crossing[0]?.node || topNode;
-        }
-
-        const cardChain = [];
-        let card = node.classList.contains('chat-live-card')
-            ? node
-            : node.closest?.('.chat-live-card');
-        while (card && messagesDiv.contains(card)) {
-            cardChain.push({
-                node: card,
-                taskId: card.dataset?.taskId || '',
-                offset: card.getBoundingClientRect().top - messagesRect.top,
-            });
-            card = card.parentElement?.closest?.('.chat-live-card') || null;
-        }
-
-        const ts = topNode.dataset?.ts || '';
-        const anchorRole = [
-            '[data-live-summary-button]',
-            '[data-live-title]',
-            '[data-live-activity]',
-            '[data-live-meta]',
-            '.chat-live-actions',
-            '.chat-live-project-card-btn',
-        ].find((candidate) => node.matches?.(candidate)) || '';
-        return {
-            node,
-            cardChain,
-            lineKey: node.matches?.('.chat-live-line') ? (node.dataset?.liveLineKey || '') : '',
-            anchorRole,
-            topNode,
-            clientMessageId: topNode.dataset?.clientMessageId || '',
-            ts,
-            ordinal: ts ? nodes.filter((item) => item.dataset?.ts === ts).indexOf(topNode) : -1,
-            offset: node.getBoundingClientRect().top - messagesRect.top,
-            topOffset: topNode.getBoundingClientRect().top - messagesRect.top,
-        };
+        return captureAnchor(messagesDiv, excludeNode);
     }
 
     function restoreVisibleTimelineAnchor(anchor) {
-        if (!anchor) return false;
-        const isRendered = (node) => {
-            if (!node?.isConnected || !messagesDiv.contains(node)) return false;
-            const rect = node.getBoundingClientRect();
-            return node.getClientRects().length > 0 && rect.width > 0 && rect.height > 0;
-        };
-        const restoreNode = (node, offset) => {
-            if (!isRendered(node)) return false;
-            const currentOffset = node.getBoundingClientRect().top
-                - messagesDiv.getBoundingClientRect().top;
-            messagesDiv.scrollTop += currentOffset - offset;
-            return true;
-        };
-
-        if (restoreNode(anchor.node, anchor.offset)) return true;
-
-        const cardChain = Array.isArray(anchor.cardChain) && anchor.cardChain.length
-            ? anchor.cardChain
-            : [];
-        const resolveCard = (entry) => {
-            if (isRendered(entry?.node)) return entry.node;
-            if (!entry?.taskId) return null;
-            const record = liveCardRecords.get(entry.taskId);
-            return isRendered(record?.root) ? record.root : null;
-        };
-        const ownerCard = resolveCard(cardChain[0]);
-        if (ownerCard && anchor.lineKey) {
-            const line = Array.from(ownerCard.querySelectorAll('.chat-live-line'))
-                .find((candidate) => candidate.dataset?.liveLineKey === anchor.lineKey
-                    && candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(line, anchor.offset)) return true;
-        }
-        if (ownerCard && anchor.anchorRole) {
-            const roleNode = Array.from(ownerCard.querySelectorAll(anchor.anchorRole))
-                .find((candidate) => candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(roleNode, anchor.offset)) return true;
-        }
-        for (const entry of cardChain) {
-            if (restoreNode(resolveCard(entry), entry.offset)) return true;
-        }
-
-        let node = isRendered(anchor.topNode) ? anchor.topNode : null;
-        if (!node && anchor.clientMessageId) {
-            node = Array.from(messagesDiv.children).find(
-                (item) => item.dataset?.clientMessageId === anchor.clientMessageId
-            ) || null;
-        }
-        if (!node && anchor.ts) {
-            const matches = Array.from(messagesDiv.children).filter(
-                (item) => item.dataset?.ts === anchor.ts
-            );
-            node = matches[anchor.ordinal] || matches[0] || null;
-        }
-        return restoreNode(node, anchor.topOffset ?? anchor.offset);
+        return restoreAnchor(messagesDiv, liveCardRecords, anchor);
     }
 
     function withStableViewport(mutate) {
@@ -1148,9 +978,7 @@ export function createChatInstance({
         const movedEarlier = stampNodeTimestamp(record.root, rawTs, { anchor: true });
         if (record.isSubagent) {
             const parent = liveCardRecords.get(record.parentGroupId);
-            const parentMoved = reanchorTaskCard(
-                parent, rawTs, { suppressDomInsert }, seen
-            );
+            const parentMoved = reanchorTaskCard(parent, rawTs, { suppressDomInsert }, seen);
             return movedEarlier || parentMoved;
         }
         if (!movedEarlier) return false;
@@ -1424,19 +1252,26 @@ export function createChatInstance({
         record.cancelRunBtn = btn;
     }
 
-    // Interim "Cancelling…" phase (phase A cancel redesign): the durable cancel
-    // intent is recorded and the supervisor is confirming the teardown — the
-    // card stays honestly LIVE (never an instant "Cancelled" lie) and resolves
-    // on the settled task_done: Cancelled, or Completed when the run finished
-    // first (completion wins). S3 (Q1): a pending SOFT stop shows "Finalizing…"
-    // instead — a bounded final turn is running before the same intent settles.
+    // Pending intent stays live until settled; soft stop shows Finalizing….
     function markLiveCardCancelPending(taskId = '', soft = false) {
         const record = liveCardRecords.get(String(taskId || '').trim());
         if (!record || record.finished || !record.phaseEl) return;
         record.cancelPendingPolicy = soft ? 'finalize' : 'immediate';
+        record.finalizingHold = false;  // owner cancel outranks the hold
         record.phaseEl.dataset.phase = 'working';
         record.phaseEl.textContent = soft ? 'Finalizing…' : 'Cancelling…';
         record.phaseEl.className = 'chat-live-phase working cancelling';
+    }
+
+    // Early final stays live while post-task synthesis runs.
+    function markLiveCardFinalizing(taskId = '') {
+        const record = liveCardRecords.get(String(taskId || '').trim());
+        if (!record || record.finished || !record.phaseEl) return;
+        if (record.cancelPendingPolicy) return;
+        record.finalizingHold = true;
+        record.phaseEl.dataset.phase = 'working';
+        record.phaseEl.textContent = 'Finalizing…';
+        record.phaseEl.className = 'chat-live-phase working finalizing';
     }
 
     // Snapshot / restore of the live phase element around the optimistic
@@ -1488,79 +1323,43 @@ export function createChatInstance({
         const priorPhase = captureLiveCardPhase(record);
         markLiveCardCancelPending(taskId, soft);
         try {
-            // Immediate: answered only after the teardown finished, so a resolved
-            // promise means the run is really down. Soft (Q1): a 202 arrives with
-            // the durable intent open while the bounded finalization runs — the
-            // card stays "Finalizing…". A refusal throws and is toasted below.
             await requestStop(taskId, action);
-            // Backend publication is fail-soft past the durable boundary, so a 200
-            // can arrive with the task_done event lost. Reconcile from the durable
-            // record through the same terminal seam replay uses — idempotent with
-            // a later event, so double resolution is harmless.
+            // Durable detail heals lost best-effort task_done publication
             try {
                 reconcileCancelCardFromDetail(record, taskId, await fetchTaskDetail(taskId));
             } catch {
                 // The card still resolves on its own frame if one arrives.
             }
-            // Immediate: the card resolves via the existing task_done frames and
-            // the button stays disabled until then. Soft: the hard escalation
-            // must stay REACHABLE during the wait (Q1), so re-enable the trigger
-            // (the pending menu offers only "Stop now").
+            // Soft stop keeps hard escalation reachable while finalizing.
             if (btn && !record.finished && record.cancelPendingPolicy === 'finalize') {
                 btn.disabled = false;
             }
         } catch (exc) {
-            // 404 = nothing live anymore (natural completion beat the cancel):
-            // graceful no-op, the card resolves on its own terminal frame.
             if (exc?.status === 404 || record.finished) {
-                // Completion-wins race: the run finished while the request was in
-                // flight, so there is nothing to cancel. RESYNC rather than leave a
-                // dead disabled button — the card resolves on its own terminal
-                // frame, and until then the action is simply no longer offered.
-                // `cancelableTaskIds` is the eligibility AUTHORITY — clearing the
-                // record flag alone left the button mounted and merely re-enabled.
+                // Completion won: remove the dead action, then reconcile detail.
                 cancelableTaskIds.delete(taskId);
                 record.cancelable = false;
                 syncCancelRunButton(record);
-                // REAL resync, not just button removal: 404 says the task is no
-                // longer live, but if its terminal frame was lost this card would
-                // sit "Working" forever. Ask the durable record and resolve the
-                // card through the same terminal seam replay uses.
                 try {
                     reconcileCancelCardFromDetail(record, taskId, await fetchTaskDetail(taskId));
                 } catch {
-                    // The card still resolves on its own frame if one arrives;
-                    // nothing worse than the pre-resync behavior.
+                    // A later terminal frame can still resolve the card.
                 }
                 return;
             }
             showToast(`Cancel failed: ${exc?.message || exc}`, 'error');
-            // GR3-10: reconcile the durable detail BEFORE touching the button —
-            // a non-404 failure can sit over a task whose durable record is
-            // already terminal (finish the card, button stays gone) or whose
-            // durable intent really is pending (keep the button disabled and
-            // the honest "Cancelling…"). Only a genuinely-live, non-pending
-            // task gets its prior phase restored and the button re-enabled.
+            // Reconcile durable truth before restoring any optimistic UI.
             let stored = null;
             try {
                 stored = await fetchTaskDetail(taskId);
-            } catch {
-                // Typed state unreachable — handled by the null guard below.
-            }
+            } catch {}
             if (stored === null) {
-                // GR4-5: the detail fetch itself failed, so NOTHING was proven —
-                // restoring the prior phase and re-enabling Cancel would assert
-                // "not pending" without evidence. Keep the pending presentation
-                // and the disabled button; the next reconcile/poll (or the
-                // task_done frame) resolves the card either way.
+                // Only a fetched, live, non-pending detail restores the button.
                 return;
             }
-            // The shared seam: pending keeps the interim, a terminal record
-            // finishes the card (same path replay uses).
             reconcileCancelCardFromDetail(record, taskId, stored);
             const stillPending = Boolean(taskCancelPending(stored));
             if (record.finished || stillPending) return;
-            // Only a fetched, live, non-pending detail restores the button.
             if (btn) btn.disabled = false;
             restoreLiveCardPhase(record, priorPhase);
             record.cancelPendingPolicy = '';
@@ -1847,9 +1646,7 @@ export function createChatInstance({
     }
 
     function getSubagentCardRecord(childId = '', parentId = '', role = '') {
-        return withStableViewport(() => getSubagentCardRecordMutation(
-            childId, parentId, role,
-        ));
+        return withStableViewport(() => getSubagentCardRecordMutation(childId, parentId, role));
     }
 
     function getSubagentCardRecordMutation(childId = '', parentId = '', role = '') {
@@ -1957,16 +1754,6 @@ export function createChatInstance({
         return record?.root?.isConnected ? withStableViewport(mutate) : mutate();
     }
 
-    function isLiveLineExpandable(item) {
-        return Boolean(
-            (item.fullHeadline && item.fullHeadline !== item.headline)
-            || (item.fullBody && item.fullBody !== item.body)
-            // P3: even when the preview equals the capped body, a server-truncated line
-            // with a fetch ref has MORE to show (the genuinely-full output on demand).
-            || (item.truncated && item.fullRef)
-        );
-    }
-
     function syncLiveCardToggle(record) {
         if (!record?.toggleEl) return;
         const expanded = record.root.dataset.expanded === '1';
@@ -2039,49 +1826,6 @@ export function createChatInstance({
         }
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
-
-    function buildTimelineItemHtml(item, record) {
-        const expandable = isLiveLineExpandable(item);
-        const expanded = expandable && record.expandedLineKeys.has(item.lineKey);
-        const displayHeadline = expanded && item.fullHeadline ? item.fullHeadline : item.headline;
-        // P3: when expanded, prefer the genuinely-full fetched output, then the capped
-        // fullBody, then the preview body. A server-truncated line shows the fetched full
-        // text in a bounded-scroll box so a huge research output never grows the chat.
-        const displayBody = expanded ? (item.fetchedFull || item.fullBody || item.body) : item.body;
-        const showingFetched = expanded && Boolean(item.fetchedFull);
-        const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull);
-        const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
-        const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
-        const headContent = `
-            <span class="chat-live-line-title">${isProgressLine ? renderMarkdown(displayHeadline) : escapeHtml(displayHeadline)}</span>
-            <span class="chat-live-line-repeat" ${item.count > 1 ? '' : 'hidden'}>${item.count > 1 ? `${item.count}x` : ''}</span>
-            ${item.ts ? `<span class="chat-live-line-time">${escapeHtml(item.ts)}</span>` : ''}
-        `;
-        const headHtml = expandable
-            ? `
-                <button
-                    type="button"
-                    class="chat-live-line-toggle"
-                    data-live-line-toggle="${escapeHtmlAttr(item.lineKey)}"
-                    aria-expanded="${expanded ? 'true' : 'false'}"
-                    ${displayBody ? `aria-controls="${escapeHtmlAttr(bodyId)}"` : ''}
-                >
-                    <span class="chat-live-line-head">${headContent}</span>
-                    <span class="chat-live-line-expand-label">${expanded ? 'Collapse' : ((item.truncated && item.fullRef) ? 'Show full' : 'Expand')}</span>
-                </button>
-            `
-            : `<div class="chat-live-line-head">${headContent}</div>`;
-        return `
-            <div
-                class="chat-live-line ${item.phase || 'working'}${expandable ? ' expandable' : ''}"
-                data-live-line-key="${escapeHtmlAttr(item.lineKey || '')}"
-                data-expanded="${expanded ? '1' : '0'}"
-            >
-                ${headHtml}
-                ${displayBody ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody)}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
-            </div>
-        `;
-    }
 
     function isTimelinePinnedToBottom(record) {
         const el = record?.timelineEl;
@@ -2247,6 +1991,12 @@ export function createChatInstance({
         if (record.root?.dataset?.projectCreated === '1') return;
         const nextPhase = summary.phase || '';
         if (record.finished && !isTerminalTaskPhase(nextPhase, summary.terminal)) {
+            // A late cost frame still settles the finished card's cost meta.
+            if (summary.costProjection) {
+                record.costMeta = mergeStickyCostMeta(record.costMeta, summary.costProjection);
+                if (_rebuildBatch) _rebuildBatch.touch(record);
+                else renderLiveCardMeta(record);
+            }
             return;
         }
 
@@ -2289,6 +2039,12 @@ export function createChatInstance({
         record.phaseEl.dataset.phase = activePhase;
         record.phaseEl.textContent = formatLiveCardPhaseLabel(activePhase);
         record.phaseEl.className = `chat-live-phase ${activePhase}`;
+        // Sticky hold: post-task frames must not repaint "Working".
+        if (record.finalizingHold && !record.finished && !record.cancelPendingPolicy) {
+            record.phaseEl.dataset.phase = 'working';
+            record.phaseEl.textContent = 'Finalizing…';
+            record.phaseEl.className = 'chat-live-phase working finalizing';
+        }
         // Cluster B: a coined project name takes the title slot; the live activity
         // headline still renders in the timeline lines below. Falls back to the
         // activity headline until the proactive namer has produced a name.
@@ -2424,14 +2180,16 @@ export function createChatInstance({
             }
             syncLiveCardToggle(record);
             if (drivesComposerStatus) {
-                setStatus(summary.phase === 'error' || summary.phase === 'timeout' ? 'error' : 'online', summary.phase === 'error' || summary.phase === 'timeout' ? 'Attention' : 'Online');
+                lastTerminalAttention = (summary.phase === 'error' || summary.phase === 'timeout');
+                syncChatStatus();
             }
         } else {
             setLiveCardTypingVisible(record, true);
             if (drivesComposerStatus) {
-                setStatus('thinking', 'Working...');
-            } else if (!hasActiveLiveCard() && statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-                setStatus('online', 'Online');
+                lastTerminalAttention = false;
+                syncChatStatus();
+            } else if (!hasActiveLiveCard()) {
+                syncChatStatus();
             }
         }
         if (summary.expandByDefault) {
@@ -2453,6 +2211,7 @@ export function createChatInstance({
         if (record.root?.dataset?.projectCreated === '1') return;
         const wasFinished = record.finished;
         record.finished = true;
+        record.finalizingHold = false;
         record.root.dataset.finished = '1';
         // A finished task can never be cancelled again; dropping the marker here
         // keeps the set from accumulating every task id of a long session (P3).
@@ -2472,10 +2231,8 @@ export function createChatInstance({
         }
         syncLiveCardToggle(record);
         if (activeLiveGroupId === record.groupId) activeLiveGroupId = '';
-        if (!hasActiveLiveCard()) {
-            setStatus(activePhase === 'error' || activePhase === 'timeout' ? 'error' : 'online',
-                      activePhase === 'error' || activePhase === 'timeout' ? 'Attention' : 'Online');
-        }
+        lastTerminalAttention = (activePhase === 'error' || activePhase === 'timeout');
+        syncChatStatus();
     }
 
     function appendTaskSummaryToLiveCard(msg, { suppressDomInsert = false } = {}) {
@@ -2562,6 +2319,21 @@ export function createChatInstance({
         });
     }
 
+    function learnSubagentLineage(msg) {
+        if (String(msg?.delegation_role || '').toLowerCase() !== 'subagent') return '';
+        const parentId = String(msg.parent_task_id || '').trim();
+        const childId = String(msg.subagent_task_id || msg.task_id || '').trim();
+        if (!parentId || !childId || parentId === childId) return '';
+        setSubagentParent(childId, {
+            parentId, role: String(msg.subagent_role || '').trim(), model: msg.model,
+        });
+        const event = String(msg.subagent_event || '').toLowerCase();
+        if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event)) {
+            subagentTerminalChildren.add(childId);
+        }
+        return childId;
+    }
+
     function summarizeSubagentCardFrame(evt, overrides = {}, rawTs = '') {
         const summary = summarizeChatLiveEvent({
             ...evt,
@@ -2573,20 +2345,16 @@ export function createChatInstance({
         return summary ? withTaskCostMeta(summary, evt, { rawTs }) : null;
     }
 
-    function updateLiveCardFromProgressMessage(msg) {
+    function updateLiveCardFromProgressMessage(msg, { grantCancelAuthority = true } = {}) {
         const taskId = msg?.task_id || activeLiveGroupId || '';
         const rawTs = msg?.ts || new Date().toISOString();
         if (registerEphemeralDecisionFrame(msg)) return;
         if (!taskId) return;
-        // P5: host-attested cancelable marker (live WS frames AND history replay
-        // via _PROGRESS_META_FIELDS). The supervisor stamps it ONLY on
-        // lineage-resolved non-subagent ROOTS, so the marker is the truth —
-        // re-deriving rootness from frame shape would wrongly reject a
-        // timeout-retry root (root_task_id names the ORIGINAL task while the
-        // endpoint cancels the current id). Direct-chat turns never carry it.
-        if (msg?.cancelable === true && msg?.task_id) markTaskCancelable(String(msg.task_id));
-        // Subagent lifecycle pings render as child cards linked to the parent;
-        // they must not update the parent card's terminal state.
+        // Mirrored progress never grants local Stop authority.
+        if (grantCancelAuthority && msg?.cancelable === true && msg?.task_id) {
+            markTaskCancelable(String(msg.task_id));
+        }
+        // Child lifecycle pings must not update the parent's terminal state.
         const lifecycleParent = String(msg?.parent_task_id || '').trim();
         if (
             msg?.subagent_event
@@ -2595,14 +2363,14 @@ export function createChatInstance({
         ) {
             return;
         }
-        // A known subagent child's own (non-lifecycle) progress stays on the child
-        // card so parallel work remains visible without expanding the parent.
+        // Keep a known child's own progress on its card.
         if (subagentChildParents.has(taskId)) {
             routeSubagentProgressToCard(taskId, msg);
             return;
         }
         // Progress messages are visible status; do not force-open completed replay.
         const taskState = getTaskUiState(taskId, true);
+        const restartReusable = taskState?.completed && REUSABLE_TASK_IDS.has(taskId);
         if (taskState && !taskState.completed) taskState.forceCard = true;
         const summary = summarizeChatLiveEvent({
             type: 'send_message',
@@ -2641,6 +2409,7 @@ export function createChatInstance({
         if (!summary) return;
         const presented = withTaskCostMeta(summary, msg, { rawTs });
         queueTaskLiveUpdate(presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs);
+        if (restartReusable) forceTaskCard(taskId, rawTs);
         // Cluster B: history progress recs carry the coined name (live progress does
         // not — the live path uses the separate `task_named` event). Apply it after the
         // card exists so a reload shows the same title.
@@ -2747,6 +2516,7 @@ export function createChatInstance({
         const text = String(msg?.content || msg?.text || '').trim();
         const rawTs = msg?.ts || new Date().toISOString();
         forceTaskCard(parentId, rawTs);
+        forceTaskCard(childId, rawTs);
         const record = getSubagentCardRecord(childId, parentId, role);
         const priorTerminalPhase = record?.finished ? String(record.phaseEl?.dataset?.phase || '') : '';
         const summary = summarizeSubagentCardFrame(msg, {
@@ -2880,6 +2650,8 @@ export function createChatInstance({
         queueTaskLiveUpdate(presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs);
         updateSubagentCardFromEvent(evt, rawTs);
         if (eventType === 'task_done') {
+            recordTerminalActivity(taskId);
+            syncChatStatus();
             const taskState = getTaskUiState(taskId, false);
             revealBufferedCardIfNeeded(taskState, { rawTs });
         }
@@ -2894,6 +2666,8 @@ export function createChatInstance({
         const source = opts.source || '';
         const systemType = opts.systemType || '';
         const taskId = opts.taskId || '';
+        const projectId = opts.projectId || '';
+        const projectName = opts.projectName || '';
         const ts = timestamp || new Date().toISOString();
         const messageKey = buildMessageKey(role, text, ts, {
             clientMessageId,
@@ -2918,6 +2692,8 @@ export function createChatInstance({
                 senderSessionId,
                 clientMessageId,
                 taskId,
+                projectId,
+                projectName,
                 skillReview: opts.skillReview || null,
             });
             // Mirror the sessionStorage slice(-200): the in-memory copy exists
@@ -2954,6 +2730,18 @@ export function createChatInstance({
             ${pendingHtml}
             ${timeHtml}
         `;
+        if (systemType === 'project_completion_summary' && projectId) {
+            const projectLink = document.createElement('button');
+            projectLink.type = 'button';
+            projectLink.className = 'chat-live-project-btn';
+            projectLink.textContent = 'Open Project ↗';
+            projectLink.addEventListener('click', () => {
+                window.dispatchEvent(new CustomEvent('ouro:open-project', {
+                    detail: { project: { id: projectId, name: projectName || 'Project' } },
+                }));
+            });
+            bubble.querySelector('.message')?.append(document.createElement('br'), projectLink);
+        }
         wireSkillReviewDisclosure(bubble, () => requestAnimationFrame(() => !destroyed && updateMessagesPadding({ preserveStickiness: true })));
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
@@ -2961,38 +2749,6 @@ export function createChatInstance({
         rememberMessageKey(messageKey);
         if (pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);
         return bubble;
-    }
-
-    function routingAnnotationText(annotation) {
-        if (!annotation || typeof annotation !== 'object') return '';
-        const action = String(annotation.action || '');
-        const status = String(annotation.status || '');
-        const target = String(annotation.target || '');
-        if (status === 'pending') return 'Choosing the right destination…';
-        if (status === 'needs_manual_target') {
-            const optionLabels = (Array.isArray(annotation.options) ? annotation.options : [])
-                .map(option => {
-                    if (!option || typeof option !== 'object') return '';
-                    if (option.label) return String(option.label);
-                    if (option.action === 'new_task_in_project') {
-                        return `New task in ${String(option.project_name || 'Project')}`;
-                    }
-                    return String(option.title || option.task_id || option.project_name || option.project_id || '');
-                })
-                .filter(Boolean);
-            if (optionLabels.length) return `Choose a target · ${optionLabels.join(' / ')}`;
-            return target ? `Choose a target · ${target}` : 'Choose a target';
-        }
-        if (status === 'project_unavailable') return 'Project is unavailable';
-        const labels = {
-            mailbox_delivery: 'Delivered to task',
-            steer_task: 'Steered task',
-            promote_chat_to_task: 'Started task',
-            route_to_project: 'Routed to project',
-            project_route: 'Project routing',
-        };
-        const label = labels[action] || status.replaceAll('_', ' ') || action.replaceAll('_', ' ');
-        return target && label ? `${label} · ${target}` : label;
     }
 
     function renderRoutingAnnotation(bubble, annotation) {
@@ -3021,6 +2777,9 @@ export function createChatInstance({
     function updateMessageAnnotation(clientMessageId, annotation) {
         const messageId = String(clientMessageId || '');
         if (!messageId) return false;
+        // The journal copy carries the ack, so a re-render restores it too.
+        const journalEntry = localEchoJournal.get(messageId);
+        if (journalEntry) journalEntry.annotation = annotation || null;
         const bubble = Array.from(messagesDiv.querySelectorAll('.chat-bubble.user[data-client-message-id]'))
             .find((candidate) => candidate.dataset.clientMessageId === messageId);
         return renderRoutingAnnotation(bubble, annotation);
@@ -3044,6 +2803,14 @@ export function createChatInstance({
         pendingUserBubbles.delete(clientMessageId);
     }
 
+    function markPendingDropped(clientMessageId) {
+        const bubble = pendingUserBubbles.get(clientMessageId || '');
+        if (!bubble) return;
+        const note = bubble.querySelector('.msg-pending');
+        if (note) note.textContent = 'Not delivered — send again';
+        pendingUserBubbles.delete(clientMessageId);
+    }
+
     function ensureWelcomeMessage() {
         if (!isMain) return;
         if (welcomeShown) return;
@@ -3055,24 +2822,14 @@ export function createChatInstance({
         addMessage('Ouroboros has awakened', 'assistant', false, null, false, { ephemeral: true });
     }
 
-    // perf2 P4.1 [GPT#12 + Fable#1]: sticky single-flight for HYDRATION
-    // triggers ONLY — bootstrap IIFE, the first non-reconnect socket open, and
-    // refreshHistory without a new revision. scheduleHistorySync (the 700ms
-    // post-completion resync) and the reconnect path NEVER short-circuit here:
-    // a lost task_done is healed only by a real refetch (their coalescence is
-    // historySyncPromise). Any failed sync resets the sticky promise so the
-    // next trigger fetches for real.
+    // Hydration triggers share one sticky request; reconnect/resync still refetch.
     function awaitInitialHydration({ includeUser = false } = {}) {
         if (initialHydrationPromise) return initialHydrationPromise;
         initialHydrationPromise = syncHistory({ includeUser });
         return initialHydrationPromise;
     }
 
-    // perf2 P4.2: Main's first hydration waits for an idle slot and yields to
-    // an opening project panel, but only within an UNCONDITIONAL upper bound
-    // [GPT#16] — an hour-open panel must not defer hydration forever. Project
-    // instances hydrate immediately. One-shot: live frames rendered before
-    // hydration are rebuilt by the first rebuildAll replay.
+    // Main briefly yields hydration to an opening Project, with a hard bound.
     const MAIN_HYDRATION_MAX_DEFER_MS = 3500;
     function waitForHydrationWindow() {
         if (!isMain) return Promise.resolve();
@@ -3100,9 +2857,7 @@ export function createChatInstance({
         return hydrationGatePromise;
     }
 
-    // perf2 P4.3: the deferred per-card finals, applied exactly once after the
-    // batch mount — meta/count/layout per touched card, typing and composer
-    // status once per batch, ONE sessionStorage persist for the whole replay.
+    // Apply deferred card/status/storage work once after the replay batch mounts.
     function finalizeRebuildBatch(batch) {
         for (const record of batch.touched) {
             renderLiveCardMeta(record);
@@ -3122,14 +2877,11 @@ export function createChatInstance({
 
     async function syncHistory({ includeUser = false, fromReconnect = false, forceRebuild = false } = {}) {
         if (historySyncPromise) {
-            // Preserve reconnect intent so retiredTaskIds is cleared after this sync.
+            // Preserve reconnect intent across an in-flight ordinary sync.
             if (fromReconnect) {
                 pendingReconnectSync = true;
                 return historySyncPromise.then(() => {
-                    // The first reconnect waiter consumes the queued rebuild; any
-                    // concurrent waiter sees and awaits the newly installed global
-                    // promise. No caller may render its Reconnected banner against
-                    // the intermediate (non-rebuilt) DOM.
+                    // One waiter consumes the queued rebuild; peers await it.
                     if (pendingReconnectSync) {
                         pendingReconnectSync = false;
                         return syncHistory({ includeUser: false, fromReconnect: true });
@@ -3141,9 +2893,7 @@ export function createChatInstance({
         }
         historySyncPromise = (async () => {
             try {
-                // Default request sends NO quota params — the server's window
-                // constants govern the first-load window (perf2 P3). A Load-
-                // older escalation adds explicit n_human/n_progress (perf2 P4).
+                // Server defaults own first-load quotas; Load older overrides them.
                 let historyUrl = `/api/chat/history${isMain ? '' : `?chat_id=${chatId}`}`;
                 if (historyQuotaOverride) {
                     const sep = historyUrl.includes('?') ? '&' : '?';
@@ -3204,6 +2954,14 @@ export function createChatInstance({
                 // clearing and the batch mount [GPT#14]. The routine path
                 // (rebuildAll=false) calls it directly — unchanged behavior.
                 const applySyncedMessages = () => {
+                // Server-confirmed rows retire their journal copy; the rest
+                // survive the rebuild below.
+                const localEcho = partitionLocalEchoJournal(localEchoJournal, new Set(messages
+                    .filter((m) => m.role === 'user' && m.client_message_id)
+                    .map((m) => String(m.client_message_id))));
+                for (const entry of localEcho.confirmed) {
+                    localEchoJournal.delete(entry.clientMessageId);
+                }
                 if (rebuildAll) {
                     for (const record of liveCardRecords.values()) record.root?.remove();
                     liveCardRecords.clear();
@@ -3223,39 +2981,19 @@ export function createChatInstance({
                     }
                     seenMessageKeys.clear();
                     messageKeyOrder.length = 0;
-                    // Subagent lineage + terminal state live only in memory. Clear and
-                    // rebuild them from durable history BEFORE the card passes, so a
-                    // finished child card finalizes regardless of replay order or which
-                    // event carried the terminal signal (a subagent 'completed' event OR
-                    // a server task_terminal_status). Otherwise finished children stick
-                    // on "working" and get revived by parent heartbeats on reload.
                     subagentChildParents.clear();
                     subagentTerminalChildren.clear();
-                    for (const msg of messages) {
-                        if (String(msg.delegation_role || '').toLowerCase() !== 'subagent') continue;
-                        const parentId = String(msg.parent_task_id || '').trim();
-                        const childId = String(msg.subagent_task_id || msg.task_id || '').trim();
-                        if (!parentId || !childId || parentId === childId) continue;
-                        if (!subagentChildParents.has(childId)) {
-                            setSubagentParent(childId, { parentId, role: String(msg.subagent_role || '').trim(), model: msg.model });
-                        }
-                        const ev = String(msg.subagent_event || '').toLowerCase();
-                        if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(ev)) {
-                            subagentTerminalChildren.add(childId);
-                        }
-                    }
+                    for (const msg of messages) learnSubagentLineage(msg);
                 }
 
-                // Two passes ensure cards exist before finishLiveCard() marks them done.
-
-                // Pass 1 builds timelines with DOM insertion suppressed.
+                // First pass builds card state without DOM insertion.
                 _syncPass1Active = true;
                 try { for (const msg of messages) {
                     const taskId = msg.task_id || '';
                     if (!taskId) continue;
                     if (retiredTaskIds.has(taskId)) continue;
                     if (msg.is_progress) {
-                        updateLiveCardFromProgressMessage(msg);
+                        updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: msg.project_mirror !== true });
                         continue;
                     }
                     if (msg.system_type === 'task_summary') {
@@ -3292,22 +3030,40 @@ export function createChatInstance({
                 }
                 for (const msg of messages) {
                     const taskId = msg.task_id || '';
+                    // Reconnect: a durably recorded submission must not stay
+                    // `Sending...` — history + snapshot are the authorities
+                    // (a live turn re-links via hydration / next typing frame).
+                    if (fromReconnect && msg.role === 'user' && msg.client_message_id) {
+                        pendingSubmissions.delete(String(msg.client_message_id));
+                    }
                     if (!renderUser && msg.role === 'user') continue;
                     if (msg.is_progress) {
                         // Progress-only/failed tasks still anchor at their first event.
                         insertCardIfNeeded(taskId);
+                        // Open post-task checkpoint replays as "Finalizing…".
+                        if (msg.task_phase === 'finalizing') markLiveCardFinalizing(taskId);
                         continue;
                     }
                     if (msg.system_type === 'task_summary') continue;
-                    // A delivered document is a media bubble, not a task-final
-                    // message — render it BEFORE the taskId/finishLiveCard block so
-                    // a mid-task file delivery replayed while its task is still
-                    // running does not falsely finalize that task's live card.
-                    if (msg.msg_type === 'document') {
-                        appendDocumentBubble(msg);
+                    if (msg.system_type === 'project_completion_summary') {
+                        addMessage(msg.text, 'system', !!msg.markdown, msg.ts || null, false, {
+                            systemType: msg.system_type,
+                            taskId,
+                            projectId: msg.project_id || '',
+                            projectName: msg.project_name || '',
+                        });
                         continue;
                     }
-                    if (taskId && (msg.role === 'assistant' || msg.role === 'system')) {
+                    // Delivered media is a bubble, not a task-final
+                    // message — render it BEFORE the taskId/finishLiveCard block so
+                    // a mid-task delivery replayed while its task is still
+                    // running does not falsely finalize that task's live card.
+                    if (msg.msg_type === 'document' || msg.msg_type === 'photo' || msg.msg_type === 'video') {
+                        if (msg.msg_type === 'document') appendDocumentBubble(msg);
+                        else appendMediaBubble(msg);
+                        continue;
+                    }
+                    if (taskId && (msg.role === 'assistant' || msg.role === 'system') && !isNonTerminalMediaHistoryRow(msg)) {
                         if (subagentChildParents.has(taskId)) {
                             insertCardIfNeeded(taskId);
                             routeSubagentFinalMessageToCard(taskId, msg);
@@ -3318,10 +3074,21 @@ export function createChatInstance({
                             continue;
                         }
                         insertCardIfNeeded(taskId);
-                        const taskState = getTaskUiState(taskId, false);
-                        const record = liveCardRecords.get(taskId);
-                        const preservedPhase = taskState?.completedPhase || record?.phaseEl?.dataset?.phase || 'done';
-                        finishLiveCard(taskId, preservedPhase);
+                        // A replayed early final must not finalize the card.
+                        if (msg.task_phase === 'finalizing') {
+                            markLiveCardFinalizing(taskId);
+                        } else {
+                            const taskState = getTaskUiState(taskId, false);
+                            const record = liveCardRecords.get(taskId);
+                            const preservedPhase = taskState?.completedPhase || record?.phaseEl?.dataset?.phase || 'done';
+                            finishLiveCard(taskId, preservedPhase);
+                        }
+                    }
+                    // A replayed durable routing receipt carries the same
+                    // authority as its live WS frame: a receipt that landed
+                    // while the socket was down still retires `Sending...`.
+                    if (msg.chat_annotation && msg.client_message_id) {
+                        pendingSubmissions.delete(String(msg.client_message_id));
                     }
                     addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
                         systemType: msg.system_type || '',
@@ -3381,6 +3148,20 @@ export function createChatInstance({
                         else insertMessageNode(rec.root);
                     }
                 }
+                // A rebuild replays only what the server returned; re-render
+                // owner rows a stale snapshot has not confirmed yet.
+                if (rebuildAll) {
+                    for (const entry of localEcho.unconfirmed) {
+                        addMessage(entry.text, 'user', false, entry.ts, false, {
+                            // A still-queued offline row keeps its pending mark.
+                            pending: pendingUserBubbles.has(entry.clientMessageId),
+                            source: 'web',
+                            senderSessionId: chatSessionId,
+                            clientMessageId: entry.clientMessageId,
+                            chatAnnotation: entry.annotation,
+                        });
+                    }
+                }
                 };  // end applySyncedMessages
 
                 // perf2 P4 follow-up (double-fetch fix): the replay below marks
@@ -3420,11 +3201,8 @@ export function createChatInstance({
                     _historyReplayActive = false;
                 }
 
-                // After first load, unfinished foreground cards still show typing.
-                if (!historyLoaded) {
-                    const hasOngoingTask = Array.from(liveCardRecords.values()).some(isForegroundLiveCard);
-                    if (hasOngoingTask) showTyping();
-                }
+                // After first load, sync status from live cards/active turns.
+                syncChatStatus();
 
                 // One-shot server recall seed includes other clients without resetting
                 // ArrowUp during reconnect. Merge [server..., local...], newest wins.
@@ -3480,9 +3258,7 @@ export function createChatInstance({
                     // prior visual offset instead (equal-ts ordinals keep
                     // arrival-order identity), after two RAF frames so async
                     // card heights above the anchor cannot move the reader.
-                    await new Promise((resolve) => requestAnimationFrame(
-                        () => requestAnimationFrame(resolve)
-                    ));
+                    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
                     const restoredFromAnchor = restoreVisibleTimelineAnchor(scrollBeforeSync.anchor);
                     if (!restoredFromAnchor) messagesDiv.scrollTop = scrollBeforeSync.top;
                     updateScrollButton();
@@ -3560,6 +3336,8 @@ export function createChatInstance({
                     senderSessionId: msg.senderSessionId || '',
                     clientMessageId: msg.clientMessageId || '',
                     taskId: msg.taskId || '',
+                    projectId: msg.projectId || '',
+                    projectName: msg.projectName || '',
                     skillReview: msg.skillReview || null,
                 });
             }
@@ -3679,6 +3457,7 @@ export function createChatInstance({
             ...(isMain ? {} : { chat_id: chatId }),
             ...(projectId ? { project_id: projectId } : {}),
             ...(attachmentMeta.length ? { attachments: attachmentMeta } : {}),
+            ...clientSurfaceField(),
         }, hasAttachments ? { queue: false } : undefined);
         if (hasAttachments && result?.status !== 'sent') {
             await cleanupUploadedAttachments(uploadedAttachments);
@@ -3696,13 +3475,25 @@ export function createChatInstance({
         rememberInput(text);
         input.value = '';
         clearInputDraft();
-        addMessage(text, 'user', false, null, false, {
+        const sentTs = new Date().toISOString();
+        addMessage(text, 'user', false, sentTs, false, {
             pending: result?.status === 'queued',
             source: 'web',
             senderSessionId: chatSessionId,
             clientMessageId: result?.clientMessageId || '',
             forceStick: true,
         });
+        // ws.send always coins a client_message_id for chat frames; guard
+        // only against a non-chat result shape.
+        const pendingId = result?.clientMessageId || '';
+        if (pendingId) {
+            pendingSubmissions.set(pendingId, {
+                clientMessageId: pendingId,
+                timestamp: Date.now(),
+            });
+            recordLocalEcho(pendingId, text, sentTs);
+        }
+        syncChatStatus();
         resizeChatInput({ preserveStickiness: false });
         scrollToBottomAfterLayout();
     }
@@ -3720,35 +3511,6 @@ export function createChatInstance({
         if (swarmBtn) swarmBtn.dataset.armed = armed ? 'true' : 'false';
     }
 
-    const stopBtn = byId('stop');
-
-    function syncChatStopButton() {
-        if (!stopBtn) return;
-        const isBusy = sendGroup.dataset.busy === '1' || hasActiveLiveCard() || (typingEl && typingEl.style.display !== 'none');
-        stopBtn.style.display = isBusy ? 'inline-flex' : 'none';
-    }
-
-    async function stopActiveChatAction() {
-        if (stopBtn) stopBtn.disabled = true;
-        try {
-            await apiFetch('/api/chat/stop', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: chatId }),
-            });
-            showToast('Stopping active chat action…', 'info');
-            hideTyping();
-            setSendBusy(false);
-        } catch (e) {
-            showToast(`Could not stop action: ${e?.message || e}`, 'error');
-        } finally {
-            if (stopBtn) stopBtn.disabled = false;
-            syncChatStopButton();
-        }
-    }
-
-    stopBtn?.addEventListener('click', stopActiveChatAction);
-
     function setSendBusy(busy, label = '') {
         sendGroup.dataset.busy = busy ? '1' : '0';
         sendBtn.disabled = busy;
@@ -3759,7 +3521,6 @@ export function createChatInstance({
             sendBtn.textContent = 'Send';
             sendBtn.title = 'Send message';
         }
-        syncChatStopButton();
     }
 
     swarmBtn?.addEventListener('click', () => setSwarm(!swarmArmed()));
@@ -4016,11 +3777,15 @@ export function createChatInstance({
 
     let headerControlInterval = null;
     if (asPanel) {
-        // The panel has no global controls/budget to poll; seed the status from
+        // A panel has no global controls/budget to poll; seed the status from
         // the live socket so a late-created panel never gets stuck on
         // "Connecting…" (the one-shot WS `open` already fired before it existed;
         // future reconnects still update it via the shared `open` handler).
         if (ws.isConnected?.()) setStatus('online', 'Online');
+        // 1A a panel created AFTER the socket opened missed the typing frame
+        // and the `open`-driven refresh — hydrate in-flight turns once from
+        // the snapshot (per-instance closure filters to this panel's chat_id).
+        refreshHeaderControlState(true);
     } else {
         refreshHeaderControlState(true);
         headerControlInterval = setInterval(refreshHeaderControlState, 3000);
@@ -4118,13 +3883,63 @@ export function createChatInstance({
         return Array.from(liveCardRecords.values()).some(isForegroundLiveCard);
     }
 
-    function showTyping() {
-        if (!hasActiveLiveCard()) {
+    function deriveChatStatus() {
+        let directCount = 0, managedActive = 0, managedQueued = 0;
+        for (const entry of activeDirectActivities.values()) {
+            if (String(entry?.kind || '') !== 'managed_task') directCount += 1;
+            else if (String(entry?.phase || '') === 'queued') managedQueued += 1;
+            else managedActive += 1;
+        }
+        return computeDerivedChatStatus({
+            isConnected: ws.isConnected ? ws.isConnected() : true,
+            hasActiveLiveCard: hasActiveLiveCard(),
+            activeDirectCount: directCount,
+            activeManagedCount: managedActive,
+            queuedManagedCount: managedQueued,
+            pendingSubmissionsCount: pendingSubmissions.size,
+            lastTerminalAttention,
+        });
+    }
+
+    function syncChatStatus() {
+        const derived = deriveChatStatus();
+        setStatus(derived.kind, derived.text);
+        if (derived.showDots && !hasActiveLiveCard()) {
             typingEl.style.display = '';
             if (isNearBottom()) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        } else {
+            typingEl.style.display = 'none';
         }
-        setStatus('thinking', 'Thinking...');
-        syncChatStopButton();
+    }
+
+    function showTyping(activityId = '', meta = {}) {
+        const actId = String(activityId || '').trim() || ('direct-' + chatId);
+        // A typing frame after its turn's keyed final must not resurrect the
+        // concluded turn — but it still carries the activity<->cmid link, so
+        // it settles the linked submission (broadcasts are not ordered).
+        if (concludedDirectActivities.has(actId)) {
+            if (meta.clientMessageId && pendingSubmissions.delete(meta.clientMessageId)) {
+                syncChatStatus();
+            }
+            return;
+        }
+        // Fresh live evidence outranks a task-detail read woken by an older
+        // queue-loss snapshot. The in-flight read may finish, but cannot apply.
+        missingManagedTaskIds.delete(actId);
+        activeDirectActivities.set(actId, {
+            activityId: actId,
+            // '' = not registry-tracked (queued managed task): visible in the
+            // active set but exempt from /api/state snapshot deletion.
+            kind: meta.kind || '',
+            phase: meta.phase || 'thinking',
+            clientMessageId: meta.clientMessageId || '',
+            startedAt: Date.now(),
+        });
+        if (meta.clientMessageId) {
+            pendingSubmissions.delete(meta.clientMessageId);
+        }
+        lastTerminalAttention = false;
+        syncChatStatus();
     }
 
     function hideTypingIndicatorOnly() {
@@ -4134,15 +3949,84 @@ export function createChatInstance({
             return;
         }
         typingEl.style.display = 'none';
-        syncChatStopButton();
     }
 
-    function hideTyping() {
-        hideTypingIndicatorOnly();
-        if (statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-            setStatus('online', 'Online');
+    function revokeManagedTaskCancelAuthority(taskId) {
+        cancelableTaskIds.delete(taskId);
+        const record = liveCardRecords.get(taskId);
+        if (!record) return;
+        record.cancelable = false;
+        syncCancelRunButton(record);
+    }
+
+    async function reconcileMissingManagedTask(taskId) {
+        if (
+            destroyed
+            || managedTaskDetailReads.has(taskId)
+            || concludedDirectActivities.has(taskId)
+            || activeDirectActivities.has(taskId)
+            || !missingManagedTaskIds.has(taskId)
+        ) return;
+        const record = liveCardRecords.get(taskId);
+        if (subagentChildParents.has(taskId) || record?.isSubagent) {
+            missingManagedTaskIds.delete(taskId);
+            return;
         }
-        syncChatStopButton();
+        managedTaskDetailReads.add(taskId);
+        try {
+            const detail = await fetchTaskDetail(taskId);
+            if (
+                destroyed
+                || !missingManagedTaskIds.has(taskId)
+                || activeDirectActivities.has(taskId)
+                || concludedDirectActivities.has(taskId)
+                || !isTerminalTaskDetail(detail)
+            ) return;
+            recordTerminalActivity(taskId);
+            finishLiveCard(taskId, taskTerminalPhase(detail));
+        } catch {
+            // No terminal fact was proved. A later existing snapshot retries.
+        } finally {
+            managedTaskDetailReads.delete(taskId);
+        }
+    }
+
+    function observeMissingManagedTask(taskId) {
+        const id = String(taskId || '').trim();
+        if (!id || concludedDirectActivities.has(id)) return;
+        const record = liveCardRecords.get(id);
+        if (subagentChildParents.has(id) || record?.isSubagent) return;
+        missingManagedTaskIds.add(id);
+        void reconcileMissingManagedTask(id);
+    }
+
+    function hydrateDirectActivities(turnsList, snapshotBarrierMs = Infinity, snapshotGeneration = 0) {
+        if (!Array.isArray(turnsList)) return;
+        const {
+            activities: nextMap,
+            departedManagedTaskIds,
+            disappearedManagedTaskIds,
+            globallyActiveActivityIds,
+        } = reconcileHydratedDirectActivities(
+            activeDirectActivities, turnsList, chatId, snapshotBarrierMs,
+            concludedDirectActivities, snapshotGeneration,
+        );
+        activeDirectActivities.clear();
+        for (const [k, v] of nextMap.entries()) {
+            activeDirectActivities.set(k, v);
+            if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
+            if (v.clientMessageId) {
+                pendingSubmissions.delete(v.clientMessageId);
+            }
+        }
+        for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
+        for (const taskId of departedManagedTaskIds) revokeManagedTaskCancelAuthority(taskId);
+        for (const taskId of disappearedManagedTaskIds) observeMissingManagedTask(taskId);
+        // Null or nonterminal detail retries on the next authoritative snapshot.
+        for (const taskId of missingManagedTaskIds) {
+            if (!activeDirectActivities.has(taskId)) void reconcileMissingManagedTask(taskId);
+        }
+        syncChatStatus();
     }
 
     const isKnownProjectFrame = (msg) => {
@@ -4153,8 +4037,7 @@ export function createChatInstance({
     function incrementUnreadIfNeeded(msg) {
         if (!isMain) return;  // the global unread badge tracks the main chat
         // Project visible_revision is the sole unread authority for a Project.
-        // Main may mirror its summary/progress/log into the штаб live card, but
-        // that presentation mirror must not create a second Main unread.
+        // Project-owned frames never create a second Main unread.
         if (isKnownProjectFrame(msg)) return;
         if (state.activePage === 'chat') return;
         state.unreadCount++;
@@ -4163,39 +4046,37 @@ export function createChatInstance({
 
     onWs('typing', (msg) => {
         if (!isMyThread(msg)) return;  // each column shows typing only for its own thread
-        showTyping();
+        const actId = msg.activity_id || msg.task_id || ('direct-' + (msg.chat_id || chatId));
+        const clientMsgId = msg.client_message_id || '';
+        showTyping(actId, {
+            clientMessageId: clientMsgId,
+            phase: msg.phase || 'thinking',
+            // Server-stamped for registry turns and RUNNING queue roots;
+            // kind-less frames stay outside snapshot deletion authority.
+            kind: msg.kind || '',
+        });
     });
 
-    // One socket, client-side fan-out: project instances take only their own
-    // thread. The MAIN instance keeps ordinary non-project traffic AND mirrors
-    // project progress/digests/logs as the "штаб", but never raw project chat
-    // user/assistant messages.
-    const isProjectMirrorFrame = (msg) => {
-        if (!msg) return false;
-        if (msg.type === 'log') return true;
-        if (msg.is_progress) return true;
-        if (msg.system_type === 'task_summary' || msg.system_type === 'project_digest') return true;
-        return false;
-    };
-
-    const isMyThread = (msg, { mirrorProject = false } = {}) => {
+    const isMyThread = (msg) => {
         const cid = Number(msg?.chat_id ?? 1);
         if (isMain) {
-            if (isKnownProjectFrame(msg)) {
-                return mirrorProject && isProjectMirrorFrame(msg);
-            }
-            return true;
+            return !isKnownProjectFrame(msg);
         }
         return cid === chatId;
     };
 
     onWs('chat', (msg) => {
-        if (!isMyThread(msg, { mirrorProject: true })) return;
+        if (!isMyThread(msg)) return;
         if (msg.role === 'user') {
             const clientMessageId = msg.client_message_id || '';
             const senderSessionId = msg.sender_session_id || '';
+            // 2A: the user echo is receipt of the user ROW, not turn start —
+            // it settles the bubble but must NOT retire the `Sending...`
+            // submission; that takes a linked typing frame / snapshot turn /
+            // routing receipt or the turn's conclusion.
             if (senderSessionId === chatSessionId && clientMessageId) {
                 markPendingDelivered(clientMessageId);
+                syncChatStatus();
                 return;
             }
             addMessage(msg.content, 'user', false, msg.ts || null, false, {
@@ -4206,33 +4087,93 @@ export function createChatInstance({
                 taskId: msg.task_id || '',
             });
             incrementUnreadIfNeeded(msg);
+            syncChatStatus();
             return;
         }
 
         if (msg.role === 'assistant' || msg.role === 'system') {
-            hideTyping();
             const explicitTaskId = msg.task_id || '';
+            if (msg.system_type === 'project_completion_summary') {
+                addMessage(msg.content, 'system', msg.markdown, msg.ts || null, false, {
+                    systemType: msg.system_type,
+                    taskId: explicitTaskId,
+                    projectId: msg.project_id || '',
+                    projectName: msg.project_name || '',
+                });
+                incrementUnreadIfNeeded(msg);
+                syncChatStatus();
+                return;
+            }
+            learnSubagentLineage(msg);
             const ephemeralDecision = registerEphemeralDecisionFrame(msg);
+            if (ephemeralDecision && explicitTaskId) {
+                const existing = activeDirectActivities.get(explicitTaskId) || {};
+                activeDirectActivities.set(explicitTaskId, {
+                    activityId: explicitTaskId,
+                    kind: 'ephemeral_decision',
+                    phase: 'thinking',
+                    startedAt: existing.startedAt || Date.now(),
+                    clientMessageId: existing.clientMessageId || '',
+                });
+            }
             if (msg.is_progress) {
                 showTaskIncidentToast(msg);
                 if (ephemeralDecision) return;
-                updateLiveCardFromProgressMessage(msg);
+                if (
+                    msg.cancelable === true
+                    && explicitTaskId
+                    && !msg.subagent_event
+                    && !subagentChildParents.has(explicitTaskId)
+                ) {
+                    showTyping(explicitTaskId, {
+                        kind: 'managed_task', phase: msg.phase || 'working',
+                    });
+                }
+                updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });
+                syncChatStatus();
                 return;
             }
+
+            // An early final (post-task still running) is NOT the turn's
+            // conclusion; task_done or the queue snapshot concludes it.
+            const finalizing = Boolean(explicitTaskId) && msg.task_phase === 'finalizing';
+            if (!finalizing) {
+                if (explicitTaskId) {
+                    // 4A (active set): a keyed final concludes ITS OWN turn —
+                    // the finished activity + its linked pending — never a
+                    // concurrent turn's state (2A keeps later `Sending...`).
+                    const finished = activeDirectActivities.get(explicitTaskId);
+                    activeDirectActivities.delete(explicitTaskId);
+                    recordConcludedActivity(explicitTaskId);
+                    if (finished?.clientMessageId) {
+                        pendingSubmissions.delete(finished.clientMessageId);
+                    }
+                } else {
+                    // A bare (unkeyed) final cannot be scoped: clear the set
+                    // but NEVER ledger — no proof any specific turn ended; a
+                    // live turn stays restorable by typing frame or snapshot.
+                    activeDirectActivities.clear();
+                    pendingSubmissions.clear();
+                }
+            }
+
             if (msg.system_type === 'task_summary') {
                 appendTaskSummaryToLiveCard(msg);
                 markAssistantReply(explicitTaskId);
                 incrementUnreadIfNeeded(msg);
+                syncChatStatus();
                 return;
             }
             if (explicitTaskId && subagentChildParents.has(explicitTaskId)) {
                 routeSubagentFinalMessageToCard(explicitTaskId, msg);
                 markAssistantReply(explicitTaskId);
                 incrementUnreadIfNeeded(msg);
+                syncChatStatus();
                 return;
             }
-            if (explicitTaskId) finishLiveCard(explicitTaskId);
-            markAssistantReply(explicitTaskId);
+            if (finalizing) markLiveCardFinalizing(explicitTaskId);
+            else if (explicitTaskId) finishLiveCard(explicitTaskId);
+            if (!finalizing) markAssistantReply(explicitTaskId);
             clearTransientRoutingAnnotations();
             addMessage(msg.content, msg.role, msg.markdown, msg.ts || null, false, {
                 systemType: msg.system_type || '',
@@ -4240,6 +4181,7 @@ export function createChatInstance({
                 taskId: explicitTaskId,
             });
             incrementUnreadIfNeeded(msg);
+            syncChatStatus();
         }
     });
 
@@ -4247,16 +4189,40 @@ export function createChatInstance({
         if (!isMyThread(msg)) return;
         if (msg.annotation_type !== 'routing_ack') return;
         updateMessageAnnotation(msg.client_message_id || '', msg);
+        // Any routing receipt is the durable disposition of the submission and
+        // ends its `Sending...` phase; further activity announces itself via
+        // its own typing frame or task card.
+        const receiptCid = String(msg.client_message_id || '');
+        if (receiptCid && pendingSubmissions.delete(receiptCid)) {
+            syncChatStatus();
+        }
+    });
+
+    onWs('outbound_dropped', (msg) => {
+        // Evicted from the offline queue: the submission will never reach
+        // the server, so it can never earn a receipt, a turn, or a journal row.
+        const cid = String(msg?.clientMessageId || '');
+        if (!cid) return;
+        markPendingDropped(cid);
+        localEchoJournal.delete(cid);
+        if (pendingSubmissions.delete(cid)) syncChatStatus();
     });
 
     onWs('log', (msg) => {
         if (!msg?.data) return;
-        // Log frames now carry the task's chat_id (backend stamps it), so the
-        // per-thread fan-out routes the full live card to its own column: a
-        // project panel builds/animates/finalizes ITS card, while the main
-        // chat mirrors project progress as штаб. Legacy frames without chat_id
-        // default to the main chat.
-        if (!isMyThread(msg, { mirrorProject: true })) return;
+        // A CONTROL, not a progress line: handled before the grouped-event
+        // pipeline so it is never summarized into a note nobody can answer.
+        if (String(msg.data.type || '') === 'execution_plan_proposal') {
+            if (isMyThread(msg, { mirrorProject: true })) {
+                import('./execution_plan_card.js').then((m) => m.mountExecutionPlanProposal(
+                    msg.data, { insert: insertMessageNode, stamp: stampNodeTimestamp }));
+            }
+            return;
+        }
+        // Log frames carry the task's canonical Project chat_id, so the
+        // Project panel alone builds/animates/finalizes that card. Legacy
+        // frames without chat_id default to the main chat.
+        if (!isMyThread(msg)) return;
         updateLiveCardFromLogEvent(msg.data);
     });
 
@@ -4269,20 +4235,18 @@ export function createChatInstance({
     });
 
     onWs('outbound_sent', (evt) => {
-        markPendingDelivered(evt?.clientMessageId || '');
-    });
-
-    onWs('chat_stopped', (evt) => {
-        if (Number(evt?.chat_id ?? 1) === chatId || isMain) {
-            hideTyping();
-            setSendBusy(false);
-            syncChatStopButton();
+        const cid = evt?.clientMessageId || '';
+        if (cid) {
+            // A socket write is not durable acceptance (2A): settle the
+            // bubble only; `Sending...` retires on authoritative evidence.
+            markPendingDelivered(cid);
+            syncChatStatus();
         }
     });
 
-    onWs('photo', (msg) => {
-        if (!isMyThread(msg)) return;
-        hideTyping();
+    function buildMediaBubble(msg) {
+        const type = msg.msg_type || msg.type;
+        if (type !== 'photo' && type !== 'video') return null;
         const role = msg.role === 'user' ? 'user' : 'assistant';
         const sender = role === 'user'
             ? getSenderLabel('user', false, '', {
@@ -4297,57 +4261,50 @@ export function createChatInstance({
         const timeFmt = formatMsgTime(rawTs);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
         const captionHtml = msg.caption ? `<div class="message">${escapeHtml(msg.caption)}</div>` : '';
-        const mime = /^image\/[a-z0-9.+-]+$/i.test(String(msg.mime || '')) ? String(msg.mime) : 'image/png';
-        const imageBase64 = /^[A-Za-z0-9+/=\s]+$/.test(String(msg.image_base64 || ''))
-            ? String(msg.image_base64 || '').replace(/\s+/g, '')
+        const fallbackMime = type === 'photo' ? 'image/png' : 'video/mp4';
+        const mimePattern = type === 'photo' ? /^image\/[a-z0-9.+-]+$/i : /^video\/[a-z0-9.+-]+$/i;
+        const mime = mimePattern.test(String(msg.mime || '')) ? String(msg.mime) : fallbackMime;
+        const base64Value = type === 'photo' ? msg.image_base64 : msg.video_base64;
+        const mediaBase64 = /^[A-Za-z0-9+/=\s]+$/.test(String(base64Value || ''))
+            ? String(base64Value || '').replace(/\s+/g, '')
             : '';
-        const imageUrl = imageBase64 ? `data:${mime};base64,${imageBase64}` : '';
+        const durableUrl = durableChatMediaUrl(msg.download_url);
+        const mediaUrl = mediaBase64 ? `data:${mime};base64,${mediaBase64}` : durableUrl;
+        if (!mediaUrl) return null;
+        const mediaHtml = type === 'photo'
+            ? `<img class="chat-photo" src="${escapeHtmlAttr(mediaUrl)}" alt="Photo attachment">`
+            : `<video class="chat-video" src="${escapeHtmlAttr(mediaUrl)}" controls></video>`;
         bubble.innerHTML = `
             <div class="sender">${escapeHtml(sender)}</div>
             ${captionHtml}
-            <div class="message"><img class="chat-photo" src="${escapeHtmlAttr(imageUrl)}" alt="Photo attachment"></div>
+            <div class="message">${mediaHtml}</div>
             ${timeHtml}
         `;
         const img = bubble.querySelector('.chat-photo');
-        if (img && imageUrl) {
-            img.addEventListener('click', () => window.open(imageUrl, '_blank'));
+        if (img) {
+            img.addEventListener('click', () => window.open(mediaUrl, '_blank'));
         }
         stampNodeTimestamp(bubble, rawTs);
-        insertMessageNode(bubble);
-        incrementUnreadIfNeeded(msg);
-    });
+        return bubble;
+    }
 
-    onWs('video', (msg) => {
-        if (!isMyThread(msg)) return;
-        hideTyping();
-        const role = msg.role === 'user' ? 'user' : 'assistant';
-        const sender = role === 'user'
-            ? getSenderLabel('user', false, '', {
-                source: msg.source || '',
-                senderLabel: msg.sender_label || '',
-                senderSessionId: msg.sender_session_id || '',
-            })
-            : 'Ouroboros';
-        const bubble = document.createElement('div');
-        bubble.className = `chat-bubble ${role}`;
-        const rawTs = msg.ts || new Date().toISOString();
-        const timeFmt = formatMsgTime(rawTs);
-        const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
-        const captionHtml = msg.caption ? `<div class="message">${escapeHtml(msg.caption)}</div>` : '';
-        const mime = /^video\/[a-z0-9.+-]+$/i.test(String(msg.mime || '')) ? String(msg.mime) : 'video/mp4';
-        const videoBase64 = /^[A-Za-z0-9+/=\s]+$/.test(String(msg.video_base64 || ''))
-            ? String(msg.video_base64 || '').replace(/\s+/g, '')
-            : '';
-        const videoUrl = videoBase64 ? `data:${mime};base64,${videoBase64}` : '';
-        bubble.innerHTML = `
-            <div class="sender">${escapeHtml(sender)}</div>
-            ${captionHtml}
-            <div class="message"><video class="chat-video" src="${escapeHtmlAttr(videoUrl)}" controls></video></div>
-            ${timeHtml}
-        `;
-        stampNodeTimestamp(bubble, rawTs);
+    function appendMediaBubble(msg) {
+        const key = chatMediaMessageKey(msg);
+        if (key && seenMessageKeys.has(key)) return false;
+        const bubble = buildMediaBubble(msg);
+        if (!bubble) return false;
+        rememberMessageKey(key);
         insertMessageNode(bubble);
-        incrementUnreadIfNeeded(msg);
+        return true;
+    }
+
+    for (const type of ['photo', 'video']) onWs(type, (msg) => {
+        if (!isMyThread(msg)) return;
+        // Media frames carry no activity identity: hide the dots row but leave
+        // the authoritative active set intact; sync derives the header from it.
+        hideTypingIndicatorOnly();
+        syncChatStatus();
+        if (appendMediaBubble(msg)) incrementUnreadIfNeeded(msg);
     });
 
     // Shared document-bubble builder for both live WS frames and history replay.
@@ -4462,20 +4419,25 @@ export function createChatInstance({
 
     onWs('document', (msg) => {
         if (!isMyThread(msg)) return;
-        hideTyping();
+        hideTypingIndicatorOnly();
+        syncChatStatus();
         if (appendDocumentBubble(msg)) incrementUnreadIfNeeded(msg);
     });
 
     let wsHasConnectedOnce = false;
 
     onWs('open', (msg) => {
-        setStatus('online', 'Online');
+        // Reconnect drops kind-less entries (no snapshot source tracks them);
+        // kind-stamped ones reconcile against the refreshed snapshot below.
+        for (const [aid, entry] of activeDirectActivities) {
+            if (!entry.kind) activeDirectActivities.delete(aid);
+        }
         refreshHeaderControlState(true);
         // A restart can happen while the selector's initial discovery calls
-        // are in flight. Re-read the model catalog once the websocket confirms
-        // that the server is alive again; the control's loader is single-flight
-        // so this is harmless on the first clean connection.
+        // are in flight. Re-read once the socket confirms the server is alive
+        // again; the control's loader is single-flight, so this is harmless.
         void disposeModelControl.refresh?.();
+        syncChatStatus();
         // perf2 P4.1 [Gemini#3]: reconnect truth comes from the ws CLIENT
         // (previouslyConnected rides the open event) — a project instance
         // created while the socket was already open must still treat the next
@@ -4516,8 +4478,8 @@ export function createChatInstance({
     });
 
     onWs('close', () => {
-        hideTyping();
-        setStatus('offline', 'Reconnecting...');
+        hideTypingIndicatorOnly();
+        syncChatStatus();
         syncHeaderControlState({ accounting: { available: false } });
     });
 
@@ -4530,6 +4492,9 @@ export function createChatInstance({
         restoreScrollPosition,
         refreshHistory,
         cancelHistoryPaint,
+        // app.js fans its already-existing /api/state refresh to every open
+        // thread; panels gain convergence without acquiring their own poll.
+        hydrateStateSnapshot,
         // True once a history snapshot has actually been fetched and painted;
         // app.js uses it to decide whether a reopen needs a forced repaint.
         hasPaintedHistory: () => historyLoaded && lastHistorySyncSucceeded,
@@ -4549,6 +4514,7 @@ export function createChatInstance({
             for (const dispose of wsDisposers) {
                 try { dispose(); } catch {}
             }
+            try { disposeModelControl(); } catch {}
             wsDisposers.length = 0;
             window.removeEventListener('ouro:page-shown', handlePageShown);
             document.removeEventListener('visibilitychange', handleVisibilityChange);
@@ -4562,16 +4528,18 @@ export function createChatInstance({
                 if (taskState?.cleanupTimer) clearTimeout(taskState.cleanupTimer);
             }
             if (headerControlInterval) { clearInterval(headerControlInterval); headerControlInterval = null; }
-            try { disposeModelControl(); } catch {}
             liveCardRecords.clear();
             taskUiStates.clear();
             pendingSuggestedNames.clear();
             subagentChildParents.clear();
             subagentTerminalChildren.clear();
             cancelableTaskIds.clear();
+            missingManagedTaskIds.clear();
+            managedTaskDetailReads.clear();
             ephemeralDecisionTaskIds.clear();
             retiredTaskIds.clear();
             pendingUserBubbles.clear();
+            localEchoJournal.clear();
             seenMessageKeys.clear();
             messageKeyOrder.length = 0;
             persistedHistory.length = 0;

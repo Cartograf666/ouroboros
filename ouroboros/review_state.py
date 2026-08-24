@@ -106,8 +106,8 @@ def _commit_readiness_debts_view(state: Any) -> List["CommitReadinessDebtItem"]:
 _OBLIGATION_STR_DEFAULTS = {"obligation_id": "", "item": "", "severity": "critical", "reason": "", "source_attempt_ts": "", "source_attempt_msg": "", "status": "still_open", "resolved_by": "", "repo_key": _LEGACY_CURRENT_REPO_KEY}
 _DEBT_STR_DEFAULTS = {"debt_id": "", "category": "", "summary": "", "severity": "warning", "status": "detected", "repo_key": _LEGACY_CURRENT_REPO_KEY, "fingerprint": "", "title": "Commit readiness debt", "source": "review_state", "first_seen_at": "", "last_seen_at": "", "updated_at": "", "verified_at": ""}
 _RUN_STR_DEFAULTS = {"snapshot_hash": "", "commit_message": "", "status": "stale", "snapshot_summary": "", "raw_result": "", "bypass_reason": "", "bypassed_by_task": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_ADVISORY_TOOL_NAME, "phase": "advisory", "model_used": "", "session_id": ""}
-_ATTEMPT_STR_DEFAULTS = {"commit_message": "", "snapshot_hash": "", "block_reason": "", "block_details": "", "task_id": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_TOOL_NAME, "pre_review_fingerprint": "", "post_review_fingerprint": "", "fingerprint_status": "", "scope_model": ""}
-_ATTEMPT_MERGE_INCOMING_FIRST = ("ts", "commit_message", "status", "snapshot_hash", "block_reason", "block_details", "duration_sec", "task_id", "repo_key", "tool_name", "phase", "pre_review_fingerprint", "post_review_fingerprint", "fingerprint_status", "scope_model")
+_ATTEMPT_STR_DEFAULTS = {"commit_message": "", "snapshot_hash": "", "block_reason": "", "block_details": "", "task_id": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_TOOL_NAME, "pre_review_fingerprint": "", "post_review_fingerprint": "", "fingerprint_status": "", "scope_model": "", "block_class": "", "rebuttal_sha256": "", "review_contract_fingerprint": "", "root_task_id": ""}
+_ATTEMPT_MERGE_INCOMING_FIRST = ("ts", "commit_message", "status", "snapshot_hash", "block_reason", "block_details", "duration_sec", "task_id", "repo_key", "tool_name", "phase", "pre_review_fingerprint", "post_review_fingerprint", "fingerprint_status", "scope_model", "block_class", "rebuttal_sha256", "review_contract_fingerprint", "root_task_id")
 _ATTEMPT_MERGE_INCOMING_LISTS = ("critical_findings", "advisory_findings", "obligation_ids", "readiness_warnings")
 _RUN_STATUS_ICONS = {"fresh": "✅", "stale": "⚠️", "bypassed": "⏭️", "skipped": "⏭️", "parse_failure": "🔴"}
 
@@ -256,6 +256,24 @@ class CommitAttemptRecord:
     scope_model: str = ""
     triad_raw_results: List[Dict[str, Any]] = field(default_factory=list)
     scope_raw_result: Dict[str, Any] = field(default_factory=dict)
+    # Max-Review-Cycles semantics (owner Q12/Q16/Q22/Q23): the typed class of a
+    # blocked row ("verdict" = reviewer findings, "infra" = fit/quorum/transport/
+    # revalidation facts, "" = preflight/legacy), the content hash of the rebuttal
+    # supplied with the attempt (absent on old rows = no rebuttal), whether a paid
+    # triad/scope dispatch physically happened for this attempt (recorded at
+    # dispatch time, plan-review precedent), the review-contract fingerprint the
+    # attempt ran under (roster+routes+enforcement+prompt contract; a changed
+    # fingerprint lapses free-replay/refusal authority), and the root task the
+    # attempt belongs to (the whole task tree shares one paid-cycle ceiling).
+    block_class: str = ""
+    rebuttal_sha256: str = ""
+    paid: bool = False
+    review_contract_fingerprint: str = ""
+    root_task_id: str = ""
+    # True once the row's heavy forensic payloads (raw reviewer results, full
+    # free text) were compacted because the preserved accounting row fell
+    # outside the newest-50 ledger window (see _strip_attempt_heavy_payload).
+    raw_stripped: bool = False
 
 
 @dataclass
@@ -482,9 +500,37 @@ class AdvisoryReviewState:
                 self.attempts[idx] = merged
                 return merged
         self.attempts.append(attempt)
-        if len(self.attempts) > _MAX_ATTEMPT_HISTORY:
-            self.attempts = self.attempts[-_MAX_ATTEMPT_HISTORY:]
+        self._trim_attempt_history()
         return attempt
+
+    def _trim_attempt_history(self) -> None:
+        """Authority-preserving eviction (Q16 fix round, F1): trimming to the
+        historical cap may only evict NON-authoritative rows, oldest first.
+        Paid rows are the money ledger ``count_paid_review_cycles`` derives the
+        per-root-task ceiling from, and verdict-block rows anchor the
+        identical-diff refusal streak (the quoted verdict) — evicting either
+        would let a capped root task loop free refusals until the ceiling and
+        the refusal both forget themselves. Both preserved classes are bounded
+        by the money ceiling itself, so only the noise portion (free refusals,
+        preflight facts, unpaid infra rows) is capped at
+        ``_MAX_ATTEMPT_HISTORY``; the list may exceed the cap only by the
+        authority-bearing rows. Preserved rows that fall OUTSIDE the newest-50
+        window are COMPACTED (``_strip_attempt_heavy_payload``): accounting
+        facts are immortal, heavy forensic payloads are not — keeping the
+        serialized ledger ~O(preserved rows x small record) instead of growing
+        by full reviewer raw output per reviewed commit forever."""
+        overflow = len(self.attempts) - _MAX_ATTEMPT_HISTORY
+        if overflow <= 0:
+            return
+        kept: List[CommitAttemptRecord] = []
+        for item in self.attempts:
+            if overflow > 0 and _attempt_history_evictable(item):
+                overflow -= 1
+                continue
+            kept.append(item)
+        self.attempts = kept
+        for item in self.attempts[:-_MAX_ATTEMPT_HISTORY]:
+            _strip_attempt_heavy_payload(item)
 
     def _allocate_obligation_id(self) -> str:
         candidate, next_seq = _allocate_prefixed_id(
@@ -1070,6 +1116,8 @@ def _commit_attempt_from_dict(d: Dict[str, Any]) -> CommitAttemptRecord:
         triad_models=[str(x) for x in (d.get("triad_models") or [])],
         triad_raw_results=list(d.get("triad_raw_results") or []),
         scope_raw_result=dict(d.get("scope_raw_result") or {}),
+        paid=bool(d.get("paid", False)),
+        raw_stripped=bool(d.get("raw_stripped", False)),
     )
 
 
@@ -1593,6 +1641,77 @@ def _normalize_findings(items: List[Any]) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _attempt_history_evictable(item: "CommitAttemptRecord") -> bool:
+    """True only for rows the Max-Review-Cycles machinery derives NO authority
+    from. Never evictable: paid rows (the per-root-task money count), rows of
+    an attempt still in flight (their upcoming terminal/paid merge must find
+    them), and review-VERDICT blocks (the anchors an identical-diff refusal
+    quotes; legacy rows classify by recorded reason via the commit gate's
+    ``attempt_block_class``). Unclassifiable rows are kept — fail toward
+    remembering."""
+    if bool(getattr(item, "paid", False)):
+        return False
+    if str(getattr(item, "status", "") or "") == "reviewing" or bool(
+        getattr(item, "late_result_pending", False)
+    ):
+        return False
+    try:
+        from ouroboros.tools.commit_gate import BLOCK_CLASS_VERDICT, attempt_block_class
+
+        return attempt_block_class(item) != BLOCK_CLASS_VERDICT
+    except Exception:
+        return False
+
+
+# What the refusal quote renders at most from an over-window row's
+# block_details (mirrors _quote_verdict_attempt's own limit=600), and a small
+# bound for the free-text commit message on compacted rows.
+_STRIPPED_DETAILS_LIMIT = 600
+_STRIPPED_MESSAGE_LIMIT = 300
+
+
+def _strip_attempt_heavy_payload(item: CommitAttemptRecord, *, force: bool = False) -> None:
+    """Compact one preserved accounting row that fell outside the newest-50
+    ledger window (F1 follow-up: paid-row immortality must not make the hot
+    load-modify-save state file grow by full reviewer raw output forever).
+
+    Dropped: the heavy forensic payloads NO gate reads from over-window rows —
+    ``triad_raw_results`` and ``scope_raw_result`` (full reviewer raw_text) —
+    plus the free-text fields bounded to what consumers render. Kept, exactly
+    the facts the Max-Review-Cycles gates consume: ``paid``/``root_task_id``
+    (the ceiling count), status/phase/``block_reason``/``block_class``/
+    ``pre_review_fingerprint``/``review_contract_fingerprint``/
+    ``rebuttal_sha256`` (the streak walker), and ``critical_findings`` plus a
+    600-char ``block_details`` excerpt (everything ``_quote_verdict_attempt``
+    renders in an identical-diff refusal). A legacy scope verdict classifies
+    THROUGH ``scope_raw_result``, so ``block_class`` is materialized before
+    that evidence is dropped — the row keeps its refusal-anchor authority.
+    ``raw_stripped=True`` marks the compaction for audits; full payloads live
+    only in the newest-50 window. ``force=True`` re-compacts a row ALREADY
+    marked stripped — the terminal-merge path uses it when a merge onto a
+    stripped row would otherwise resurrect the heavy payloads it carries in."""
+    if bool(getattr(item, "raw_stripped", False)) and not force:
+        return
+    if not item.block_class:
+        try:
+            from ouroboros.tools.commit_gate import attempt_block_class
+
+            klass = attempt_block_class(item)
+            if klass:
+                item.block_class = klass
+        except Exception:
+            pass
+    item.triad_raw_results = []
+    item.scope_raw_result = {}
+    item.block_details = _truncate_review_artifact(
+        str(item.block_details or ""), limit=_STRIPPED_DETAILS_LIMIT
+    )
+    item.commit_message = _truncate_review_artifact(
+        str(item.commit_message or ""), limit=_STRIPPED_MESSAGE_LIMIT
+    )
+    item.raw_stripped = True
+
+
 def _merge_attempt(existing: CommitAttemptRecord, incoming: CommitAttemptRecord) -> CommitAttemptRecord:
     data = {
         name: getattr(incoming, name) or getattr(existing, name)
@@ -1610,8 +1729,24 @@ def _merge_attempt(existing: CommitAttemptRecord, incoming: CommitAttemptRecord)
         triad_models=list(incoming.triad_models or existing.triad_models),
         triad_raw_results=list(getattr(incoming, "triad_raw_results", None) or getattr(existing, "triad_raw_results", None) or []),
         scope_raw_result=dict(getattr(incoming, "scope_raw_result", None) or getattr(existing, "scope_raw_result", None) or {}),
+        # Once an attempt physically dispatched a paid triad/scope wave the fact is
+        # durable: a later terminal update on the same row must never launder it.
+        paid=bool(getattr(incoming, "paid", False) or getattr(existing, "paid", False)),
+        # The compaction mark is sticky too — an unlikely late merge onto an
+        # over-window row must not present a stripped row as a full one.
+        raw_stripped=bool(
+            getattr(incoming, "raw_stripped", False) or getattr(existing, "raw_stripped", False)
+        ),
     )
-    return CommitAttemptRecord(**data)
+    merged = CommitAttemptRecord(**data)
+    if merged.raw_stripped:
+        # A late terminal merging onto an already-compacted row (a stale
+        # in-flight row that slid past the newest-50 window) must not
+        # resurrect heavy reviewer raw payloads onto it: re-strip the merged
+        # result — accounting facts (paid/root_task_id/fingerprints/
+        # block_class/critical_findings) all survive the strip by design.
+        _strip_attempt_heavy_payload(merged, force=True)
+    return merged
 
 
 def infer_review_phase(status: str, block_reason: str = "") -> str:

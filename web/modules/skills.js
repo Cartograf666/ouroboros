@@ -6,6 +6,7 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch } from './api_client.js';
 import { renderInstalledSkillCard } from './skill_card_renderer.js';
+import { runSkillPublishFlow } from './skill_publish_flow.js';
 import { installedTime } from './ui_helpers.js';
 import {
     boundedText,
@@ -276,10 +277,45 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
         return result;
     }
 
+    async function savePresenceRuntime(form, reset = false) {
+        const name = String(form?.dataset?.skillName || '');
+        const expected = String(form?.dataset?.stateFingerprint || '');
+        if (!name || !expected) throw new Error('Presence runtime state is unavailable. Refresh and retry.');
+        const modelValue = reset ? '' : String(form.elements.model_slot?.value || '').trim();
+        const roundsValue = reset ? '' : String(form.elements.inline_max_rounds?.value || '').trim();
+        const rounds = roundsValue === '' ? null : Number(roundsValue);
+        if (rounds !== null && (!Number.isInteger(rounds) || rounds < 1)) {
+            throw new Error('Inline rounds must be a positive whole number.');
+        }
+        await apiClient.savePresenceRuntime(name, {
+            expected_state_fingerprint: expected,
+            runtime_overrides: {
+                model_slot: modelValue || null,
+                inline_max_rounds: rounds,
+            },
+        });
+        showToast(`${name}: Presence runtime ${reset ? 'reset' : 'saved'} for new turns`, 'ok');
+    }
+
     async function triggerSkillAction(name, action, options = {}) {
         if (!name || !action) return;
         if (action === 'open_widgets') {
             document.querySelector('[data-nav-page="widgets"]')?.click();
+            return;
+        }
+        if (action === 'submit_hub') {
+            // The clicked card is the selected-skill identity. It may disappear
+            // from the passive inventory after a manifest edit, while the
+            // selected preflight can still return an agent-repairable state.
+            const outcome = await runSkillPublishFlow(name);
+            if (!outcome.started) return;
+            showToast(`${name}: publication task ${outcome.task?.task_id || ''} created`, 'ok');
+            emitSkillLifecycle('submit_hub', name);
+            if (typeof ctx.showPage === 'function') {
+                ctx.showPage('chat');
+            } else {
+                document.querySelector('[data-nav-page="chat"]')?.click();
+            }
             return;
         }
         const { skills } = await fetchSkills();
@@ -376,31 +412,6 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
             return;
         }
 
-        if (action === 'submit_hub') {
-            const ok = await openConfirmDialog({
-                title: `Submit ${name} to OuroborosHub`,
-                body: `Open a public GitHub pull request submitting ${name} to OuroborosHub? The PR will contain the reviewed skill payload and an updated catalog entry.`,
-                confirmLabel: 'Submit to OuroborosHub',
-                danger: true,
-            });
-            if (!ok) return;
-            // A real managed task (v6.70.0): the old path sent a chat command and
-            // printed "task queued" before any task existed — the ephemeral decision
-            // turn cannot even call submit_skill_to_hub, so the placebo could resolve
-            // to nothing. /api/tasks enqueues a supervised folder-less task whose full
-            // tool envelope includes submit_skill_to_hub.
-            const submitTask = await postWithFeedback('/api/tasks', {
-                description: `Submit the local skill "${name}" to OuroborosHub using the submit_skill_to_hub tool. `
-                    + 'Validate the fresh no-blocker review first; if submission is refused, report the exact reason.',
-            });
-            showToast(`${name}: submission task ${submitTask.task_id || ''} created`, 'ok');
-            emitSkillLifecycle('submit_hub', name);
-            if (typeof ctx.showPage === 'function') {
-                ctx.showPage('chat');
-            } else {
-                document.querySelector('[data-nav-page="chat"]')?.click();
-            }
-        }
     }
 
     async function toggleSkillEnabled(name, wantsEnabled) {
@@ -515,7 +526,36 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
         event.preventDefault();
         actionTarget.click();
     });
+    container.addEventListener('submit', async (event) => {
+        const form = event.target.closest?.('[data-presence-runtime-form]');
+        if (!form) return;
+        event.preventDefault();
+        const submit = form.querySelector('button[type="submit"]');
+        if (submit) submit.disabled = true;
+        try {
+            await savePresenceRuntime(form);
+        } catch (err) {
+            showToast(`${form.dataset.skillName || 'Skill'}: ${err.message || err}`, 'danger');
+        } finally {
+            if (submit) submit.disabled = false;
+            renderFn();
+        }
+    });
     container.addEventListener('click', async (event) => {
+        const resetRuntime = event.target.closest('[data-presence-runtime-reset]');
+        if (resetRuntime) {
+            const form = resetRuntime.closest('[data-presence-runtime-form]');
+            resetRuntime.disabled = true;
+            try {
+                await savePresenceRuntime(form, true);
+            } catch (err) {
+                showToast(`${form?.dataset?.skillName || 'Skill'}: ${err.message || err}`, 'danger');
+            } finally {
+                resetRuntime.disabled = false;
+                renderFn();
+            }
+            return;
+        }
         const menuTrigger = event.target.closest('[data-skill-menu-trigger]');
         if (menuTrigger) {
             const menu = menuTrigger.closest('.skills-card-menu');
@@ -818,5 +858,4 @@ export function initSkills(ctx) {
             renderFn();
         }
     });
-    renderFn();
 }

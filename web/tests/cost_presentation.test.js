@@ -8,7 +8,7 @@ import {
     taskCostMeta,
     taskCostProjection,
 } from '../modules/chat.js';
-import { costDashboardPresentation } from '../modules/costs.js';
+import { costBucketPresentation, costDashboardPresentation } from '../modules/costs.js';
 import { summarizeLogEvent } from '../modules/log_events.js';
 import {
     accountedUpperBound,
@@ -55,6 +55,56 @@ test('task cards distinguish unavailable, pending zero, and final zero', () => {
         cost_accounting_status: 'available',
         cost_final: true,
     }), ['cost=$0.00']);
+});
+
+test('compact task cards show one complete cost and keep openness details', () => {
+    assert.deepEqual(taskCostMeta({
+        cost_usd: 55.86,
+        cost_usd_with_children: 76.82,
+        cost_accounting_status: 'available',
+        cost_final: false,
+        cost_with_children_partial: true,
+        reserved_usd: 1.25,
+        unresolved_upper_bound_usd: 0.5,
+        unknown_unmetered: 2,
+    }), [
+        'cost=$76.82 (pending)',
+        'reserved=$1.25',
+        'unresolved≤$0.50',
+        'unmetered=2',
+    ]);
+    assert.deepEqual(taskCostMeta({
+        cost_usd: 4.25,
+        cost_accounting_status: 'available',
+        cost_final: true,
+    }), ['cost=$4.25']);
+
+    const partialChild = taskCostProjection({
+        cost_usd: 4.25,
+        cost_usd_with_children: 6.5,
+        cost_accounting_status: 'available',
+        cost_final: true,
+        cost_with_children_partial: true,
+    }, '2026-07-29T00:00:00Z');
+    assert.deepEqual(partialChild.meta, ['cost=$6.50 (pending)']);
+    assert.equal(partialChild.final, false);
+});
+
+test('unknown zero-dollar accounting stays pending instead of becoming free', () => {
+    assert.deepEqual(taskCostMeta({
+        cost_usd: null,
+        cost_usd_with_children: null,
+        cost_accounting_status: 'available',
+        cost_final: false,
+        cost_with_children_partial: true,
+        unknown_unmetered: 1,
+    }), ['cost pending', 'unmetered=1']);
+    assert.deepEqual(taskCostMeta({
+        cost_usd: 0,
+        cost_accounting_status: 'available',
+        cost_final: false,
+        unknown_unmetered: 1,
+    }), ['cost pending', 'unmetered=1']);
 });
 
 test('a bare per-round cost_usd delta is NOT task cost (v6.82 P1)', () => {
@@ -191,6 +241,21 @@ test('cost dashboard distinguishes loading, unavailable, pending, and final zero
         ...base,
         accounting: { ...base.accounting, accounted_usd: null },
     }).state, 'unavailable');
+});
+
+test('legacy breakdown buckets disclose unknown and pending zero amounts', () => {
+    assert.equal(costBucketPresentation({
+        cost: 0, calls: 1, unknown_unmetered: 1, non_final_rows: 1, cost_final: false,
+    }), 'cost pending (unmetered=1)');
+    assert.equal(costBucketPresentation({
+        cost: 0, calls: 1, unknown_unmetered: 0, non_final_rows: 1, cost_final: false,
+    }), 'cost pending');
+    assert.equal(costBucketPresentation({
+        cost: 0.25, calls: 2, unknown_unmetered: 1, non_final_rows: 1, cost_final: false,
+    }), '$0.25 (pending, unmetered=1)');
+    assert.equal(costBucketPresentation({
+        cost: 0, calls: 1, unknown_unmetered: 0, non_final_rows: 0, cost_final: true,
+    }), '$0.00');
 });
 
 test('an unavailable snapshot is sticky but never pins the card (v6.82 r2)', () => {

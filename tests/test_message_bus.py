@@ -43,6 +43,65 @@ def test_ui_send_preserves_suppress_chat_log_flag(monkeypatch):
     assert updates[0]["message"]["suppress_chat_log"] is True
 
 
+def test_project_completion_summary_keeps_event_time_label_live_and_on_reload(
+    monkeypatch, tmp_path,
+):
+    """The message bus is the one live/durable transport for Main's host row."""
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
+    monkeypatch.setattr(
+        message_bus, "load_state",
+        lambda: {"session_id": "session-1", "owner_id": 7},
+    )
+    monkeypatch.setattr(
+        message_bus, "_advance_project_visible_revision", lambda _chat_id: None,
+    )
+    monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
+
+    message_bus.send_with_budget(
+        1,
+        "Launch 🚀 › Ship release · Completed",
+        task_id="opaque-root-id",
+        role="system",
+        system_type="project_completion_summary",
+        progress_meta={
+            "project_id": "opaque-project-id",
+            "project_name": "Launch 🚀",
+            "target_label": "Launch 🚀 › Ship release",
+            "status": "completed",
+        },
+    )
+
+    live = next(frame for frame in frames if frame.get("type") == "chat")
+    assert live["task_id"] == "opaque-root-id"
+    assert live["target_label"] == "Launch 🚀 › Ship release"
+    assert live["system_type"] == "project_completion_summary"
+
+    from ouroboros.gateway.history import make_chat_history_endpoint
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(
+        query_params={"chat_id": "1", "limit": "20"},
+    )))
+    messages = json.loads(response.body.decode("utf-8"))["messages"]
+    replayed = next(
+        row for row in messages
+        if row.get("system_type") == "project_completion_summary"
+    )
+    assert replayed["task_id"] == live["task_id"]
+    assert replayed["target_label"] == live["target_label"]
+    assert replayed["project_id"] == live["project_id"]
+    assert replayed["project_name"] == live["project_name"]
+    assert replayed["status"] == live["status"]
+
+
 def test_send_photo_publishes_transport_event_with_payload(monkeypatch):
     bridge = _make_bridge(monkeypatch)
     events = []
@@ -142,8 +201,8 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
     revisions = []
     monkeypatch.setattr(message_bus, "_advance_project_visible_revision", revisions.append)
 
-    bridge.send_photo(123, b"image", caption="shot", mime="image/png")
-    bridge.send_video(123, b"video", caption="clip", mime="video/mp4")
+    bridge.send_photo(123, b"image", caption="shot", mime="image/png", task_id="media-task")
+    bridge.send_video(123, b"video", caption="clip", mime="video/mp4", task_id="media-task")
 
     rows = [
         json.loads(line)
@@ -155,7 +214,31 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
         ("video", "clip", "video/mp4"),
     ]
     assert all("image_base64" not in row and "video_base64" not in row for row in rows)
+    assert all(row["task_id"] == "media-task" for row in rows)
+    assert all(row["download_url"].startswith("/api/tasks/media-task/artifacts/chat-media-") for row in rows)
+    stored = list((tmp_path / "task_results" / "artifacts" / "media-task" / "chat_media").iterdir())
+    assert {path.read_bytes() for path in stored} == {b"image", b"video"}
     assert revisions == [123, 123]
+
+
+def test_send_photo_keeps_live_delivery_when_media_persistence_fails(monkeypatch, tmp_path):
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        message_bus, "store_chat_media_bytes",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"session_id": "s", "owner_id": 7})
+
+    ok, _ = bridge.send_photo(123, b"image", caption="shot", task_id="media-task")
+
+    assert ok is True
+    assert next(frame for frame in frames if frame.get("type") == "photo")["image_base64"]
+    import json
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    assert row.get("download_url", "") == ""
 
 
 def test_push_log_broadcast_surfaces_chat_id(monkeypatch):

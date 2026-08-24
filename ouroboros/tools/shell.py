@@ -25,17 +25,36 @@ from ouroboros.runtime_mode_policy import (
     is_protected_runtime_path,
 )
 from ouroboros.tools.commit_gate import _invalidate_advisory
-from ouroboros.shell_parse import embedded_absolute_path_tokens, is_absolute_path_text, recover_stringified_argv, shell_argv_with_inline
+from ouroboros.shell_parse import is_absolute_path_text, recover_stringified_argv
 from ouroboros.tools.registry import (
     ToolContext,
     ToolEntry,
-    active_repo_dir_for,
 )
+from ouroboros.tools import shell_audit as _shell_audit
+from ouroboros.tools.deliverables_shell import lexical_user_files_block_reason
+from ouroboros.tools.shell_audit import (
+    _UNDECLARED_OUTPUTS_MARKER,
+    _mentioned_user_file_outputs_without_declaration,
+    _presence_allows_user_output,
+    _allowed_output_roots,
+)
+
+# Preserve private module attributes used by existing callers/tests while the
+# implementation lives in the extracted audit module.
+_EMBEDDED_OUTPUT_PATH_RE = _shell_audit._EMBEDDED_OUTPUT_PATH_RE
+_OUTPUT_CALL_PATH_RE = _shell_audit._OUTPUT_CALL_PATH_RE
+_OUTPUT_REDIRECT_PATH_RE = _shell_audit._OUTPUT_REDIRECT_PATH_RE
+_OUTPUT_STAT_SLACK_SEC = _shell_audit._OUTPUT_STAT_SLACK_SEC
+_USER_FILE_OPEN_WRITE_CALL_RE = _shell_audit._USER_FILE_OPEN_WRITE_CALL_RE
+_USER_FILE_REDIRECT_RE = _shell_audit._USER_FILE_REDIRECT_RE
+_USER_FILE_WRITE_CALL_RE = _shell_audit._USER_FILE_WRITE_CALL_RE
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
-    active_tool_profile,
+    _deliverables_root_lexical,
+    _deliverables_root_lexical_alias,
+    _lexical_path_is_relative_to_casefold,
+    _path_is_relative_to_casefold,
     build_resolved_resource_binding,
-    decide_tool_access,
     path_is_relative_to,
     resource_root_path,
     shell_cwd_block_message,
@@ -46,6 +65,7 @@ from ouroboros.deadline_utils import deadline_remaining_sec
 from ouroboros.workspace_executor import execute as executor_execute
 from ouroboros.workspace_executor import executor_ref_from_ctx
 from ouroboros.workspace_executor import map_backend_path as executor_map_backend_path
+from ouroboros.workspace_executor import map_backend_path_lexical as executor_map_backend_path_lexical
 from ouroboros.workspace_executor import map_host_path as executor_map_host_path
 
 log = logging.getLogger(__name__)
@@ -224,40 +244,6 @@ def _format_process_output(stdout: str, stderr: str, *, limit: int = 50_000) -> 
     return rendered
 
 
-def _allowed_output_roots(
-    ctx: ToolContext,
-    work_dir: pathlib.Path,
-    cwd_root: str = "",
-    binding: ResolvedResourceBinding | None = None,
-) -> list[tuple[str, pathlib.Path]]:
-    roots: list[tuple[str, pathlib.Path]] = []
-    root_label = str(cwd_root or "cwd").strip() or "cwd"
-    roots.append((root_label, pathlib.Path(work_dir).resolve(strict=False)))
-    if binding is not None:
-        base = pathlib.Path(binding.base_path).resolve(strict=False)
-        if not any(
-            path_is_relative_to(base, existing)
-            and path_is_relative_to(existing, base)
-            for _, existing in roots
-        ):
-            roots.append((binding.root, base))
-    profile = active_tool_profile(ctx)
-    for label in ("task_drive", "artifact_store", "user_files"):
-        # A user_files output is a deliverable the command produced, so that root
-        # must be WRITABLE by the active profile.  Task/artifact registration keeps
-        # its existing host-owned read/copy semantics.
-        op = "write" if label == "user_files" else "read"
-        if not decide_tool_access(profile=profile, root=label, operation=op).allow:  # type: ignore[arg-type]
-            continue
-        try:
-            root_path = resource_root_path(ctx, label)  # type: ignore[arg-type]
-        except Exception:
-            continue
-        if not any(path_is_relative_to(root_path, existing) and path_is_relative_to(existing, root_path) for _, existing in roots):
-            roots.append((label, root_path))
-    return roots
-
-
 def _protected_output_source_reason(
     ctx: ToolContext,
     source: pathlib.Path,
@@ -344,6 +330,15 @@ def _resolve_declared_output(
         return None, "empty output path"
     raw = pathlib.Path(text).expanduser()
     executor_ref = executor_ref_from_ctx(ctx)
+    if executor_ref is not None and is_absolute_path_text(text) and not text.startswith("~"):
+        try:
+            lexical_source = executor_map_backend_path_lexical(executor_ref, text)
+        except ValueError:
+            lexical_source = raw
+    elif is_absolute_path_text(text) or text.startswith("~"):
+        lexical_source = raw
+    else:
+        lexical_source = pathlib.Path(work_dir) / safe_relpath(text)
     # is_absolute_path_text (not Path.is_absolute) so a backend output path like
     # "/workspace/out.txt" maps through the executor on Windows too, where
     # Path.is_absolute() is False for drive-less roots.
@@ -357,13 +352,78 @@ def _resolve_declared_output(
     else:
         source = (pathlib.Path(work_dir) / safe_relpath(text)).resolve(strict=False)
     changed = changed_paths or set()
+
+    # Deliverables may be configured inside the active workspace.  Check that
+    # physical target before the generic cwd root, otherwise a declared
+    # ``workspace/Deliverables/.env`` is labelled active_workspace and skips
+    # the user-files hidden/credential and Presence policy.
+    try:
+        deliverables_root = resource_root_path(ctx, "deliverables")
+        deliverables_root_lexical = _deliverables_root_lexical()
+        deliverables_root_lexical_alias = _deliverables_root_lexical_alias()
+    except Exception:
+        deliverables_root = None
+        deliverables_root_lexical = None
+        deliverables_root_lexical_alias = None
+    if deliverables_root is not None:
+        try:
+            in_deliverables = (
+                deliverables_root_lexical is not None
+                and (
+                    path_is_relative_to(lexical_source, deliverables_root_lexical)
+                    or _lexical_path_is_relative_to_casefold(lexical_source, deliverables_root_lexical)
+                    or _lexical_path_is_relative_to_casefold(
+                        lexical_source, deliverables_root_lexical_alias,
+                    )
+                    or _lexical_path_is_relative_to_casefold(
+                        lexical_source, deliverables_root,
+                    )
+                )
+            )
+        except (OSError, TypeError, ValueError):
+            in_deliverables = False
+        if in_deliverables:
+            physical_deliverables = pathlib.Path(deliverables_root).resolve(strict=False)
+            if not (
+                path_is_relative_to(source, physical_deliverables)
+                or _path_is_relative_to_casefold(source, physical_deliverables)
+            ):
+                return None, (
+                    f"Deliverables output escapes its resolved configured root: {text}"
+                )
+            lexical_reason = lexical_user_files_block_reason(lexical_source)
+            if lexical_reason:
+                return None, f"protected user_files output {text}: {lexical_reason}"
+            reason = user_files_path_block_reason(ctx, source)
+            if reason:
+                return None, f"protected user_files output {text}: {reason}"
+            if not _presence_allows_user_output(ctx, source):
+                return None, (
+                    "user_files output is outside this presence task's positive "
+                    "resource ceiling"
+                )
+            protected_reason = _protected_output_source_reason(
+                ctx, source, "user_files", changed, binding,
+            )
+            if protected_reason:
+                return None, protected_reason
+            return source, ""
+
     for label, root in _allowed_output_roots(ctx, work_dir, cwd_root, binding):
-        if not path_is_relative_to(source, root):
+        if not (
+            path_is_relative_to(source, root)
+            or _path_is_relative_to_casefold(source, root)
+        ):
             continue
         if label == "user_files":
             reason = user_files_path_block_reason(ctx, source)
             if reason:
                 return None, f"protected user_files output {text}: {reason}"
+            if not _presence_allows_user_output(ctx, source):
+                return None, (
+                    "user_files output is outside this presence task's positive "
+                    "resource ceiling"
+                )
         protected_reason = _protected_output_source_reason(
             ctx, source, label, changed, binding,
         )
@@ -618,9 +678,6 @@ def _register_process_outputs(
 # to ``tool_failure``. The submarine wave-3 incident was exactly this: a moot nudge
 # on an already-registered artifact fed the failure record. SSOT for both
 # ``run_command`` and ``run_script`` so the two nudges cannot drift apart.
-_UNDECLARED_OUTPUTS_MARKER = "⚠️ ARTIFACT_OUTPUT_UNDECLARED"
-
-
 def _executor_can_run_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> bool:
     executor_ref = executor_ref_from_ctx(ctx)
     if executor_ref is None:
@@ -799,25 +856,6 @@ def _sensitive_output_component_reason(parts: tuple[str, ...]) -> str:
         if low in _SENSITIVE_OUTPUT_COMPONENT_NAMES or low.endswith(_SENSITIVE_OUTPUT_SUFFIXES) or any(marker in low for marker in _SENSITIVE_OUTPUT_MARKERS):
             return f"credential-like output path component {text} is not a deliverable artifact"
     return ""
-_OUTPUT_CALL_PATH_RE = r"(?:~?/[^'\"]+|[A-Za-z]:[\\/][^'\"]+|\\\\[^'\"]+)"
-_OUTPUT_REDIRECT_PATH_RE = r"(?:~?/[^\s;|&'\"]+|[A-Za-z]:[\\/][^\s;|&'\"]+|\\\\[^\s;|&'\"]+)"
-_EMBEDDED_OUTPUT_PATH_RE = re.compile(_OUTPUT_CALL_PATH_RE)
-_USER_FILE_WRITE_CALL_RE = re.compile(
-    rf"(?:write_text|write_bytes)\s*\(\s*['\"](?P<path>{_OUTPUT_CALL_PATH_RE})['\"]",
-    re.I,
-)
-_USER_FILE_OPEN_WRITE_CALL_RE = re.compile(
-    rf"open\s*\(\s*['\"](?P<path>{_OUTPUT_CALL_PATH_RE})['\"]\s*,\s*['\"][^'\"]*[wax+][^'\"]*['\"]",
-    re.I,
-)
-_USER_FILE_REDIRECT_RE = re.compile(
-    rf"(?:^|\s)(?:>|>>|1>|2>|&>)\s*(?:['\"](?P<quoted>{_OUTPUT_REDIRECT_PATH_RE})['\"]|(?P<bare>{_OUTPUT_REDIRECT_PATH_RE}))"
-)
-
-# Undeclared-output stat filter (v6.56.0): a text-scan candidate counts as a real write only if it
-# exists with mtime >= command_start - this slack (covers coarse FS mtime granularity, e.g. FAT 2s).
-_OUTPUT_STAT_SLACK_SEC = 2.0
-
 # Portable grep fix: GNU basic-regex "\|" fails on BSD grep in argv mode.
 _GREP_TOOLS = frozenset(("grep", "egrep", "fgrep"))
 _GREP_REGEX_MODE_FLAGS = frozenset((
@@ -963,86 +1001,6 @@ def _record_scratch_fingerprints(ctx: ToolContext, scratch_abs: list[pathlib.Pat
             continue
     if fingerprints:
         record_task_scratch(ctx, fingerprints)
-
-
-def _mentioned_user_file_outputs_without_declaration(
-    ctx: ToolContext,
-    cmd: List[str],
-    outputs: List[str] | None,
-    scratch_abs: list[pathlib.Path] | None = None,
-    command_start_ts: float | None = None,
-) -> list[str]:
-    """Best-effort audit for commands that write absolute user_files without outputs. Declared
-    ephemeral `scratch` paths (v6.52.2) are exempt.
-
-    v6.56.0: the text scan only produces CANDIDATES; a candidate is confirmed a written deliverable
-    only if it now exists on disk with a fresh mtime (>= command start). This grounds the guard in
-    real filesystem effects instead of string shape, so import strings (`/http`, `/zap`), CLI flags
-    (`-run TestX`), and heredoc bodies no longer trip a false ARTIFACT_OUTPUT_ERROR. Pass
-    `command_start_ts` on the POST-exec call (run_command, and the run_script body audit); when it is
-    None the stat filter is skipped (candidate list returned as before). Known limitations (advisory
-    audit, both acceptable): (1) `cp -p` / `tar -x` preserve mtime, so such a copied deliverable is
-    not flagged (false negative); (2) a file created by a PRIOR tool call within the ~2s mtime slack
-    of this command's start and merely MENTIONED here can trip the mtime floor (false positive) — the
-    slack is deliberate to cover coarse FS mtime granularity. In workspace mode, candidates under the
-    active workspace are skipped — real /app edits are captured by the workspace patch, not undeclared
-    user_files deliverables."""
-
-    if outputs:
-        return []
-    scratch_set = {str(p) for p in (scratch_abs or [])}
-    mtime_floor = (command_start_ts - _OUTPUT_STAT_SLACK_SEC) if command_start_ts is not None else None
-    workspace_root: pathlib.Path | None = None
-    if bool(getattr(ctx, "is_workspace_mode", lambda: False)()):
-        try:
-            workspace_root = active_repo_dir_for(ctx).resolve(strict=False)
-        except Exception:
-            workspace_root = None
-    mentioned: list[str] = []
-    for token in shell_argv_with_inline(cmd):
-        token_text = str(token)
-        token_lower = token_text.lower()
-        redirect_paths = [
-            match.group("quoted") or match.group("bare")
-            for match in _USER_FILE_REDIRECT_RE.finditer(token_text)
-        ]
-        has_write_open = bool(_USER_FILE_OPEN_WRITE_CALL_RE.search(token_text))
-        if not redirect_paths and not has_write_open and not any(marker in token_lower for marker in ("write_text", "write_bytes", ".write(", "writefile", "createwritestream")):
-            continue
-        candidates = embedded_absolute_path_tokens(str(token))
-        candidates.extend(_EMBEDDED_OUTPUT_PATH_RE.findall(str(token)))
-        candidates.extend(match.group("path") for match in _USER_FILE_WRITE_CALL_RE.finditer(str(token)))
-        candidates.extend(match.group("path") for match in _USER_FILE_OPEN_WRITE_CALL_RE.finditer(str(token)))
-        candidates.extend(redirect_paths)
-        for candidate in candidates:
-            try:
-                path = pathlib.Path(candidate).expanduser().resolve(strict=False)
-            except Exception:
-                continue
-            try:
-                user_root = resource_root_path(ctx, "user_files")
-            except Exception:
-                continue
-            if not path_is_relative_to(path, user_root):
-                continue
-            if user_files_path_block_reason(ctx, path):
-                continue
-            if workspace_root is not None and path_is_relative_to(path, workspace_root):
-                continue  # real active-workspace edit — captured by the workspace patch, not a user_files deliverable
-            path_text = str(path)
-            if path_text in scratch_set:
-                continue  # declared ephemeral scratch (v6.52.2) — not an undeclared deliverable
-            if path_text in mentioned:
-                continue
-            if mtime_floor is not None:
-                # Confirm a real filesystem write: the candidate must exist now with a fresh mtime.
-                try:
-                    if not (path.is_file() and path.stat().st_mtime >= mtime_floor):
-                        continue
-                except OSError:
-                    continue
-            mentioned.append(path_text)
-    return mentioned
 
 
 def _run_shell(
@@ -1245,7 +1203,14 @@ def _run_shell(
                 mutation_root=repo_root,
                 source_tool="run_command",
             )
-        undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(ctx, cmd, outputs, scratch_abs=scratch_abs, command_start_ts=_command_start_ts)
+        undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(
+            ctx,
+            cmd,
+            outputs,
+            scratch_abs=scratch_abs,
+            command_start_ts=_command_start_ts,
+            cwd=work_dir,
+        )
         if undeclared_user_outputs:
             # Declaration NUDGE, not a failure — see _UNDECLARED_OUTPUTS_MARKER.
             return (
@@ -1471,7 +1436,12 @@ def _run_script(
     # timeout) still leaves that file on disk, so a `⚠️` result does NOT mean "no
     # deliverable to declare" — surface both the error and the output-guard note.
     undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(
-        ctx, [interp, "-c", body], outputs, scratch_abs=_scratch_abs_body, command_start_ts=_body_start_ts,
+        ctx,
+        [interp, "-c", body],
+        outputs,
+        scratch_abs=_scratch_abs_body,
+        command_start_ts=_body_start_ts,
+        cwd=resolved_workdir,
     )
     audit_note = ""
     if undeclared_user_outputs:

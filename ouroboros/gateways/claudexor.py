@@ -78,11 +78,20 @@ class ClaudexorUnavailable(RuntimeError):
         self.required_actions = tuple(required_actions or ())
 
 
+# Cross-repo contract (B1): the engine's window-exhausted RunFailure codes. A
+# newer engine (rotation PR-A) reports a spent credential POOL under its own
+# code; both heal on a timer, so both map onto the exhausted class below — with
+# the ORIGINAL code preserved. Any other code stays a generic
+# ClaudexorUnavailable: fail-open, old engines emitting code:null included.
+WINDOW_EXHAUSTED_CODES = ("subscription_window_exhausted", "credential_pool_exhausted")
+
+
 class ClaudexorSubscriptionWindowExhausted(ClaudexorUnavailable):
     """The subscription window is spent and heals on a timer, not on payment."""
 
-    def __init__(self, message: str, *, reset_at: str = "", status_code: int = 0) -> None:
-        super().__init__("subscription_window_exhausted", message, status_code=status_code)
+    def __init__(self, message: str, *, reset_at: str = "", status_code: int = 0,
+                 code: str = "subscription_window_exhausted") -> None:
+        super().__init__(code, message, status_code=status_code)
         self.reset_at = str(reset_at or "")
 
 
@@ -244,6 +253,7 @@ class ClaudexorGateway:
     def __init__(self, endpoint: Optional[DaemonEndpoint] = None, *, home: Optional[pathlib.Path] = None):
         self._endpoint = endpoint if endpoint is not None else discover_daemon(home)
         self._engine_version = ""
+        self._engine_build_sha = ""
         # trust_env=False: a shell HTTP(S)_PROXY must never be able to intercept the
         # loopback control plane (the bearer token rides these requests).
         self._client = httpx.Client(
@@ -274,6 +284,10 @@ class ClaudexorGateway:
     @property
     def engine_version(self) -> str:
         return self._engine_version
+
+    @property
+    def engine_build_sha(self) -> str:
+        return self._engine_build_sha
 
     # -- transport -------------------------------------------------------------
 
@@ -347,10 +361,10 @@ class ClaudexorGateway:
         # quota snapshot), so the transient class was unreachable — while any unrelated
         # refusal that happened to carry one, an `idempotency_conflict` say, would have
         # been announced as a spent subscription window and retried on a timer.
-        if code == "subscription_window_exhausted":
+        if code in WINDOW_EXHAUSTED_CODES:
             return ClaudexorSubscriptionWindowExhausted(
                 message, reset_at=str(context.get("resetsAt") or ""),
-                status_code=response.status_code,
+                status_code=response.status_code, code=code,
             )
         return ClaudexorUnavailable(code, message, status_code=response.status_code,
                                     required_actions=required_actions)
@@ -383,6 +397,7 @@ class ClaudexorGateway:
                 f"Claudexor {version or 'unknown'} is older than the required {CLAUDEXOR_MIN_VERSION}",
             )
         self._engine_version = version
+        self._engine_build_sha = str(engine.get("sha") or "")
         return body
 
     def agent_capabilities(self) -> Dict[str, Any]:
@@ -470,6 +485,41 @@ class ClaudexorGateway:
         if not isinstance(body, dict):
             raise ClaudexorUnavailable("malformed_response", "run start returned no handle")
         return body
+
+    def create_thread(self, request: Dict[str, Any], *, idempotency_key: str) -> Dict[str, Any]:
+        """Create one durable v3 conversation thread.
+
+        Claudexor owns continuity and profile routing. This client only carries
+        the strict request and the caller's stable idempotency identity.
+        """
+        body = self._request(
+            "POST", "/v2/threads", json_body=dict(request),
+            headers={"Idempotency-Key": str(idempotency_key)},
+        )
+        if not isinstance(body, dict) or not str(body.get("id") or ""):
+            raise ClaudexorUnavailable("malformed_response", "thread create returned no id")
+        return body
+
+    def start_thread_turn(
+        self, thread_id: str, request: Dict[str, Any], *, idempotency_key: str,
+    ) -> Dict[str, Any]:
+        """Append one turn through the public v3 thread pipeline."""
+        from urllib.parse import quote
+
+        body = self._request(
+            "POST", f"/v2/threads/{quote(str(thread_id), safe='')}/turns",
+            json_body=dict(request), headers={"Idempotency-Key": str(idempotency_key)},
+        )
+        if not isinstance(body, dict):
+            raise ClaudexorUnavailable("malformed_response", "thread turn returned no handle")
+        return body
+
+    def get_thread(self, thread_id: str) -> Dict[str, Any]:
+        """Read turns, native-session bindings, and continuity receipts."""
+        from urllib.parse import quote
+
+        body = self._request("GET", f"/v2/threads/{quote(str(thread_id), safe='')}")
+        return body if isinstance(body, dict) else {}
 
     def get_run(self, run_id: str, *, timeout_sec: Optional[float] = None) -> Dict[str, Any]:
         body = self._request("GET", f"/v2/runs/{run_id}", timeout_sec=timeout_sec)
@@ -578,6 +628,27 @@ class ClaudexorGateway:
         )
         return body if isinstance(body, dict) else {}
 
+    def update_credential_profile(self, harness_id: str, profile_id: str,
+                                  *, enabled: bool) -> Dict[str, Any]:
+        """PATCH /v2/credential-profiles/:harness/:profileId — the engine's own
+        Enabled toggle for a NAMED account (``{enabled}`` is the one
+        user-settable routing control the profile row carries).
+
+        Translate-only, like every account surface here: the daemon owns the
+        registry row and rotation policy, and its refusal is the answer. The
+        route exists on 3.5.0 engines already; unified-model engines serve the
+        migrated default logins through it too, because those are ordinary
+        registry rows there."""
+        from urllib.parse import quote
+
+        body = self._request(
+            "PATCH",
+            f"/v2/credential-profiles/{quote(str(harness_id), safe='')}"
+            f"/{quote(str(profile_id), safe='')}",
+            json_body={"enabled": bool(enabled)},
+        )
+        return body if isinstance(body, dict) else {}
+
     def delete_credential_profile(self, harness_id: str, profile_id: str) -> Dict[str, Any]:
         """DELETE /v2/credential-profiles/:harness/:profileId — the engine's own
         removal contract for a NAMED account.
@@ -655,9 +726,22 @@ class ClaudexorGateway:
         ops = body.get("operations") if isinstance(body, dict) else None
         return [row for row in (ops or []) if isinstance(row, dict)]
 
+    def get_settings(self) -> Dict[str, Any]:
+        """GET /v2/settings — the daemon's effective settings snapshot.
+
+        The read half of the rotation reconcile (B3): the snapshot's
+        ``harnesses`` map carries each configured harness's
+        ``profileLimitAction``, so provisioning patches only what is actually
+        missing instead of blind-writing every discovered harness. The route
+        has served since the v2 boundary existed, so every engine past
+        ``CLAUDEXOR_MIN_VERSION`` answers it.
+        """
+        body = self._request("GET", "/v2/settings")
+        return body if isinstance(body, dict) else {}
+
     def patch_settings(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /v2/settings — the daemon's own live settings patch (used once
-        at provisioning to turn on profile rotation, D28)."""
+        """POST /v2/settings — the daemon's own live settings patch (the
+        write half of the rotation reconcile, D28/B3)."""
         body = self._request("POST", "/v2/settings", json_body=dict(request))
         return body if isinstance(body, dict) else {}
 
@@ -814,6 +898,7 @@ __all__ = [
     "ClaudexorSubscriptionWindowExhausted",
     "ClaudexorUnavailable",
     "DaemonEndpoint",
+    "WINDOW_EXHAUSTED_CODES",
     "attempt_containment",
     "discover_daemon",
     "discover_daemon_at",

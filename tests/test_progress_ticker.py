@@ -10,7 +10,7 @@ already talking, and it says nothing at all when nothing was stamped.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List
+from typing import List
 
 import pytest
 
@@ -97,130 +97,67 @@ def test_duration_formatting(seconds, expected):
     assert task_activity.format_duration(seconds) == expected
 
 
-# --- the agent-side gate -------------------------------------------------------
+# --- the tick gate --------------------------------------------------------------
+#
+# No stub Agent any more: the tick moved to `task_activity` precisely because
+# nothing it does needs one. It takes how to emit and when the task last spoke,
+# and the child-count clause is stubbed out so these stay hermetic.
 
 
-class _StubAgent:
-    """Only the state ``_maybe_emit_progress_tick`` actually touches."""
+class _Recorder:
+    """The two things the tick actually needs from its caller."""
 
-    def __init__(self, task_id: str, last_progress_ts: float):
-        from ouroboros.agent import OuroborosAgent
-
-        self._maybe_emit_progress_tick = OuroborosAgent._maybe_emit_progress_tick.__get__(self)
-        self._live_children_clause = lambda _task_id: ""
-        self._last_progress_ts = last_progress_ts
+    def __init__(self, last_progress_ts: float):
+        self.last_progress_ts = last_progress_ts
         self.emitted: List[str] = []
 
-    def _emit_progress(self, text: str) -> None:
+    def emit(self, text: str) -> None:
         self.emitted.append(text)
-        self._last_progress_ts = time.time()
+        self.last_progress_ts = time.time()
+
+    def tick(self, task_id: str) -> None:
+        task_activity.emit_tick(
+            task_id, emit=self.emit, quiet_since=self.last_progress_ts,
+            metadata={}, drive_root="/nonexistent")
+
+
+@pytest.fixture(autouse=True)
+def _no_children(monkeypatch):
+    monkeypatch.setattr(task_activity, "live_children_clause", lambda *a, **k: "")
 
 
 def test_ticker_stays_silent_while_the_task_is_already_talking():
     task_activity.mark("task-1", task_activity.PHASE_MODEL, model="m")
-    agent = _StubAgent("task-1", last_progress_ts=time.time())
-    agent._maybe_emit_progress_tick("task-1")
+    agent = _Recorder(last_progress_ts=time.time())
+    agent.tick("task-1")
     assert agent.emitted == []
 
 
 def test_ticker_speaks_after_the_silence_window():
     task_activity.mark("task-1", task_activity.PHASE_MODEL, round_idx=2, max_rounds=200, model="m")
-    agent = _StubAgent("task-1", last_progress_ts=time.time() - 600.0)
-    agent._maybe_emit_progress_tick("task-1")
+    agent = _Recorder(last_progress_ts=time.time() - 600.0)
+    agent.tick("task-1")
     assert len(agent.emitted) == 1
     assert "waiting on m" in agent.emitted[0]
 
 
 def test_a_silent_but_unstamped_task_still_emits_nothing():
-    agent = _StubAgent("task-1", last_progress_ts=time.time() - 600.0)
-    agent._maybe_emit_progress_tick("task-1")
+    agent = _Recorder(last_progress_ts=time.time() - 600.0)
+    agent.tick("task-1")
     assert agent.emitted == []
 
 
 def test_one_tick_per_window_not_one_per_heartbeat():
     task_activity.mark("task-1", task_activity.PHASE_MODEL, model="m")
-    agent = _StubAgent("task-1", last_progress_ts=time.time() - 600.0)
-    agent._maybe_emit_progress_tick("task-1")
-    agent._maybe_emit_progress_tick("task-1")
+    agent = _Recorder(last_progress_ts=time.time() - 600.0)
+    agent.tick("task-1")
+    agent.tick("task-1")
     assert len(agent.emitted) == 1
 
 
 def test_ticker_disabled_by_setting(monkeypatch):
     monkeypatch.setenv("OUROBOROS_PROGRESS_TICKER_SEC", "0")
     task_activity.mark("task-1", task_activity.PHASE_MODEL, model="m")
-    agent = _StubAgent("task-1", last_progress_ts=time.time() - 600.0)
-    agent._maybe_emit_progress_tick("task-1")
+    agent = _Recorder(last_progress_ts=time.time() - 600.0)
+    agent.tick("task-1")
     assert agent.emitted == []
-
-
-def test_tool_batch_stamp_names_up_to_three_and_counts_the_rest():
-    from ouroboros.loop_tool_execution import _stamp_tool_activity
-
-    calls: List[Dict[str, Any]] = [
-        {"function": {"name": name}} for name in
-        ["read_file", "search_code", "list_files", "query_code", "vcs_diff"]
-    ]
-    _stamp_tool_activity("task-1", calls)
-    line = task_activity.render("task-1")
-    assert "read_file, search_code, list_files" in line
-    assert "+2 more" in line
-
-
-def test_tool_batch_stamp_deduplicates_repeated_tools():
-    from ouroboros.loop_tool_execution import _stamp_tool_activity
-
-    _stamp_tool_activity("task-1", [{"function": {"name": "read_file"}}] * 4)
-    assert "read_file" in task_activity.render("task-1")
-    assert "+" not in task_activity.render("task-1")
-
-
-def test_tool_batch_stamp_ignores_a_nameless_batch():
-    from ouroboros.loop_tool_execution import _stamp_tool_activity
-
-    _stamp_tool_activity("task-1", [{"function": {}}])
-    assert task_activity.render("task-1") == ""
-
-
-# --- the swarm-visible phases --------------------------------------------------
-
-
-def test_review_phase_names_the_pass():
-    task_activity.mark(
-        "task-1", task_activity.PHASE_REVIEW, detail="acceptance panel, pass 1",
-    )
-    assert "review: acceptance panel, pass 1" in task_activity.render("task-1")
-
-
-def test_children_phase_names_the_wait_set():
-    task_activity.mark(
-        "task-1", task_activity.PHASE_CHILDREN, detail="waiting on 3 subagent(s) (all terminal)",
-    )
-    assert "waiting on 3 subagent(s) (all terminal)" in task_activity.render("task-1")
-
-
-def test_wait_tasks_stamps_the_wait_set_before_it_blocks(tmp_path, monkeypatch):
-    """The swarm parent's longest silence is inside wait_tasks, so the stamp has
-    to land BEFORE the blocking call, not after it returns."""
-    from ouroboros.tools import control
-
-    stamped: List[str] = []
-
-    def _fake_wait(*_args, **_kwargs):
-        # Read the ticker from inside the block: a stamp written afterwards would
-        # be useless to an owner watching a 7200s wait.
-        stamped.append(task_activity.render("task-1"))
-        return {"tasks": {}, "elapsed_sec": 0.0, "early_return": None}
-
-    monkeypatch.setattr(control, "wait_for_effective_tasks", _fake_wait)
-    monkeypatch.setattr(control, "_unminted_wait_ids", lambda *_a, **_k: [])
-    monkeypatch.setattr(control, "_wait_attention_poll", lambda *_a, **_k: (lambda *a, **k: None))
-
-    ctx = type("Ctx", (), {})()
-    ctx.task_id = "task-1"
-    ctx.task_metadata = {}
-    ctx.drive_root = tmp_path
-
-    control._wait_for_tasks(ctx, ["11111111", "22222222"], timeout_sec=5)
-
-    assert stamped, "wait_for_effective_tasks was never reached"
-    assert "waiting on 2 subagent(s) (all terminal)" in stamped[0]

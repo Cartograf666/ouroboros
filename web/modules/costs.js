@@ -20,6 +20,20 @@ function optionalFiniteNumber(value) {
     return Number.isFinite(number) ? number : null;
 }
 
+/** Render one legacy breakdown bucket without turning an open zero into free. */
+export function costBucketPresentation(info) {
+    const cost = optionalFiniteNumber(info?.cost);
+    if (cost === null) return 'unknown';
+    const unknown = optionalFiniteNumber(info?.unknown_unmetered) || 0;
+    const nonFinalRows = optionalFiniteNumber(info?.non_final_rows) || 0;
+    const pending = info?.cost_final === false || nonFinalRows > 0 || unknown > 0;
+    if (!pending) return formatUsd2(cost);
+    const unknownLabel = unknown > 0 ? `unmetered=${Math.trunc(unknown)}` : '';
+    const details = [unknownLabel].filter(Boolean).join(', ');
+    if (cost === 0) return details ? `cost pending (${details})` : 'cost pending';
+    return details ? `${formatUsd2(cost)} (pending, ${details})` : `${formatUsd2(cost)} (pending)`;
+}
+
 /** Pure cost-dashboard projection: null/unavailable never renders as $0. */
 export function costDashboardPresentation(data) {
     if (!data) return { state: 'loading' };
@@ -71,11 +85,11 @@ export function initCosts({ state, mount }) {
                 <div class="costs-budget-fields">
                     <div class="form-field">
                         <label>Total Budget ($)</label>
-                        <input id="s-budget" type="number" value="10">
+                        <input id="s-budget" type="number" value="200">
                     </div>
                     <div class="form-field">
                         <label>Per-task Cost Cap ($)</label>
-                        <input id="s-per-task-cost" type="number" value="20">
+                        <input id="s-per-task-cost" type="number" value="50">
                         <div class="settings-inline-note">Hard dispatch cap for the whole root task tree. In-flight calls settle normally; increasing the cap does not auto-resume paused work.</div>
                     </div>
                 </div>
@@ -137,7 +151,7 @@ export function initCosts({ state, mount }) {
             tr.append(
                 cell('cost-cell-name', name, { title: name }),
                 cell('cost-cell-right', info.calls),
-                cell('cost-cell-right', formatUsd2(info.cost)),
+                cell('cost-cell-right', costBucketPresentation(info)),
                 tdBar,
             );
             tbody.appendChild(tr);

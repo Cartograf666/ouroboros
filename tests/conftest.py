@@ -286,6 +286,13 @@ def _rebind_runtime_roots_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def _scrub_inherited_subagent_selection(monkeypatch):
+    """Keep tests independent of the operator's saved actor list and account pin."""
+    monkeypatch.delenv("OUROBOROS_SUBAGENT_PROFILE", raising=False)
+    monkeypatch.delenv("OUROBOROS_SUBAGENTS", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_runtime_mode_baseline_between_tests():
     """v5.1.2 iter-2 test isolation fix (Gemini finding F2-7):
     ``ouroboros.config._BOOT_RUNTIME_MODE`` is a module-level global

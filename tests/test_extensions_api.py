@@ -35,6 +35,7 @@ def _write_ext(
     plugin: str,
     env_from_settings: list[str] | None = None,
     conflicts: list[str] | None = None,
+    presence: str = "",
 ) -> pathlib.Path:
     skill_dir = repo_root / name
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -52,6 +53,7 @@ def _write_ext(
             f"permissions: {perms_yaml}\n"
             f"env_from_settings: {env_yaml}\n"
             f"conflicts: {conflicts_yaml}\n"
+            f"{presence}"
             "---\n"
             "body\n"
         ),
@@ -198,6 +200,12 @@ def client_env(tmp_path, monkeypatch):
 
 
 def test_api_extensions_index_lists_extension_skills(tmp_path, monkeypatch):
+    import ouroboros.gateway.skill_publish as skill_publish_preflight
+
+    def unexpected_scan(*_args, **_kwargs):
+        raise AssertionError("passive extension listing ran Betterleaks")
+
+    monkeypatch.setattr(skill_publish_preflight, "scan_named_bytes", unexpected_scan)
     skills_root = tmp_path / "skills"
     plugin = (
         "def register(api):\n"
@@ -219,8 +227,178 @@ def test_api_extensions_index_lists_extension_skills(tmp_path, monkeypatch):
         assert ext_meta["live_reason"] == "disabled"
         assert ext_meta["executable_review"] is False
         assert ext_meta["review_gate"]["blocking_reason"] == "review_pending"
+        assert ext_meta["submit_hub"]["publication_ready"] is False
+        assert ext_meta["submit_hub"]["disabled"] is (
+            not ext_meta["submit_hub"]["task_start_allowed"]
+        )
     finally:
         _stop_patches(patches)
+
+
+def test_reviewed_presence_runtime_card_projection_and_owner_cas(tmp_path, monkeypatch):
+    from ouroboros.presence_capabilities import load_presence_state
+    from ouroboros.skill_loader import SkillReviewState, compute_content_hash, save_review_state
+
+    skills_root = tmp_path / "skills"
+    skill_dir = _write_ext(
+        skills_root,
+        "presence_ext",
+        permissions=[],
+        plugin="def register(api):\n    pass\n",
+        presence=(
+            "presence:\n"
+            "  instructions: Participate when useful.\n"
+            "  runtime_defaults:\n"
+            "    model_slot: light\n"
+            "    inline_max_rounds: 10\n"
+        ),
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
+        save_review_state(
+            drive_root,
+            "presence_ext",
+            SkillReviewState(status="pass", content_hash=content_hash),
+        )
+        review_path = drive_root / "state" / "skills" / "presence_ext" / "review.json"
+        review_before = review_path.read_bytes()
+
+        row = next(
+            item for item in client.get("/api/extensions").json()["skills"]
+            if item["name"] == "presence_ext"
+        )
+        runtime = row["presence_runtime"]
+        assert runtime["defaults"] == {"model_slot": "light", "inline_max_rounds": 10}
+        assert runtime["overrides"] == {"model_slot": None, "inline_max_rounds": None}
+
+        update = client.post(
+            "/api/owner/skills/presence_ext/presence-runtime",
+            json={
+                "expected_state_fingerprint": runtime["state_fingerprint"],
+                "runtime_overrides": {"model_slot": "main", "inline_max_rounds": 7},
+            },
+        )
+        assert update.status_code == 200, update.text
+        updated_runtime = update.json()["presence_runtime"]
+        assert updated_runtime["overrides"] == {"model_slot": "main", "inline_max_rounds": 7}
+        assert review_path.read_bytes() == review_before
+        assert load_presence_state(drive_root, "presence_ext").runtime_overrides.model_slot == "main"
+
+        conflict = client.post(
+            "/api/owner/skills/presence_ext/presence-runtime",
+            json={
+                "expected_state_fingerprint": runtime["state_fingerprint"],
+                "runtime_overrides": {"model_slot": "light", "inline_max_rounds": 5},
+            },
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["code"] == "presence_state_conflict"
+
+        reset = client.post(
+            "/api/owner/skills/presence_ext/presence-runtime",
+            json={
+                "expected_state_fingerprint": updated_runtime["state_fingerprint"],
+                "runtime_overrides": {"model_slot": None, "inline_max_rounds": None},
+            },
+        )
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["presence_runtime"]["overrides"] == {
+            "model_slot": None,
+            "inline_max_rounds": None,
+        }
+        refreshed = next(
+            item for item in client.get("/api/extensions").json()["skills"]
+            if item["name"] == "presence_ext"
+        )
+        assert refreshed["review_stale"] is False
+    finally:
+        _stop_patches(patches)
+
+
+def test_presence_runtime_controls_require_fresh_executable_review(tmp_path, monkeypatch):
+    skills_root = tmp_path / "skills"
+    _write_ext(
+        skills_root,
+        "presence_pending",
+        permissions=[],
+        plugin="def register(api):\n    pass\n",
+        presence="presence:\n  instructions: Participate when useful.\n",
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, _drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        row = next(
+            item for item in client.get("/api/extensions").json()["skills"]
+            if item["name"] == "presence_pending"
+        )
+        assert "presence_runtime" not in row
+        response = client.post(
+            "/api/owner/skills/presence_pending/presence-runtime",
+            json={
+                "expected_state_fingerprint": "0" * 64,
+                "runtime_overrides": {"model_slot": None, "inline_max_rounds": None},
+            },
+        )
+        assert response.status_code == 409
+    finally:
+        _stop_patches(patches)
+
+
+def test_api_extensions_index_uses_one_request_local_repo_identity(
+    tmp_path,
+    monkeypatch,
+):
+    import ouroboros.gateway.extensions as extensions_api
+    import ouroboros.skill_review_runner as review_runner
+
+    drive_root = tmp_path / "drive"
+    request_repo = str(tmp_path / "request-skills")
+    later_repo = str(tmp_path / "later-skills")
+    config_reads: list[str] = []
+    reconcile_calls: list[tuple[pathlib.Path, str]] = []
+    build_calls: list[tuple[pathlib.Path, str]] = []
+
+    def changing_repo_path() -> str:
+        value = request_repo if not config_reads else later_repo
+        config_reads.append(value)
+        return value
+
+    def reconcile_stale_review_jobs(root, *, repo_path=None, **_kwargs):
+        effective_repo_path = changing_repo_path() if repo_path is None else repo_path
+        reconcile_calls.append((pathlib.Path(root), effective_repo_path))
+
+    def build_extensions_index(root, repo_path):
+        build_calls.append((pathlib.Path(root), repo_path))
+        return {"skills": [], "live": {}}
+
+    monkeypatch.setattr(
+        "ouroboros.config.get_skills_repo_path",
+        changing_repo_path,
+    )
+    monkeypatch.setattr(
+        review_runner,
+        "reconcile_stale_review_jobs",
+        reconcile_stale_review_jobs,
+    )
+    monkeypatch.setattr(
+        extensions_api,
+        "_build_extensions_index",
+        build_extensions_index,
+    )
+    monkeypatch.setattr(
+        extensions_api,
+        "_request_drive_root",
+        lambda _request: drive_root,
+    )
+
+    response = asyncio.run(extensions_api.api_extensions_index(object()))
+
+    assert response.status_code == 200
+    assert config_reads == [request_repo]
+    assert reconcile_calls == [(drive_root, request_repo)]
+    assert build_calls == [(drive_root, request_repo)]
 
 
 def test_extensions_index_collision_row_skips_lifecycle_projections(
@@ -288,6 +466,14 @@ def test_extensions_index_collision_row_skips_lifecycle_projections(
     assert row["conflict"] is None
     assert row["skill_review"] == {}
     assert row["grants"] == {}
+    assert row["submit_hub"] == {
+        "visible": False,
+        "publication_ready": False,
+        "task_start_allowed": False,
+        "disabled": True,
+        "state": "hard_block",
+        "reason": "",
+    }
     assert schedule_inputs == [[collision]]
     assert not (drive_root / "state").exists()
 

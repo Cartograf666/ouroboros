@@ -6,10 +6,10 @@
 # Tier 2.6 (Skill smoke): Push to ouroboros-stable / manual / tag                     → LIVE OuroborosHub official-skill install smoke (3-OS, ~5 min) + review→grant→enable-persistence flow on one cheap reviewer slot (ubuntu-only step, OPENROUTER_API_KEY, ~$1.2/run)
 # Tier 3 (Build+Release): Tag v*                                                       → PyInstaller + GitHub Release (~15 min)
 #
-# Tier 2.5 requires OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY /
-# CLOUDRU_FOUNDATION_MODELS_API_KEY in
-# repository secrets and runs the `integration` pytest marker; locally these
-# tests are excluded by `addopts = -m 'not integration'` in pyproject.toml.
+# Tier 2.5 requires OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY.
+# Optional MiniMax / Cloud.ru / GigaChat rows run when their repository secrets
+# exist. The job runs the `integration` pytest marker; locally these tests are
+# excluded by `addopts = -m 'not integration'` in pyproject.toml.
 
 name: CI
 
@@ -69,6 +69,7 @@ jobs:
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros')
       || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       # This job installs pytest-xdist/pytest-timeout below, so the preflight
@@ -104,9 +105,23 @@ jobs:
       # `not integration and not browser ...` exclusions must be repeated here, then ANDed with
       # the serial split. --timeout guards against a hung test blocking the whole job.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
-        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short
+        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short
       - name: Run tests (serial — real subprocess/port/global-state suites that flake under -n)
-        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke" -q --tb=short
+        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short
+      # OFFICIAL-CI-ONLY enforcement of the repository size gates: manifest
+      # exactness against this tree plus the pairwise base-vs-tip shrink-only
+      # transition. Local runs exclude the `size_ratchet` marker and surface
+      # the same validator findings as warnings (docs/DEVELOPMENT.md "Pytest
+      # marker lanes"). Deliberately NOT the `-m "..."` double-quoted form:
+      # tests/test_preflight_runner.py pins that form to the two-pass split
+      # above. The base env: PR -> the PR base SHA; push -> the previous
+      # branch tip. An all-zeros (new-branch/tag) or unresolvable base
+      # degrades to the tip's tree-verified parent manifest — never a skip;
+      # a resolvable base without the manifest fails closed.
+      - name: Run tests (size-ratchet lane — blocking here, warning-only locally)
+        env:
+          OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: python -m pytest tests/ -m size_ratchet -q --tb=short
       - name: Guard extracted transport imports stay out of core
         run: python -m pytest tests/test_no_core_a2a_telegram_imports.py -q
 
@@ -136,22 +151,68 @@ jobs:
       # A command-line `-m` REPLACES the pyproject addopts markexpr, so repeat the default
       # marker-lane exclusions and AND them with the serial split. --timeout guards hangs.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
-        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short
+        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short
       - name: Run tests (serial — real subprocess/port/global-state suites that flake under -n)
-        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke" -q --tb=short
+        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short
+      # Same size-ratchet enforcement contract as quick-test (see its comment).
+      # full-test triggers: stable pushes carry event.before; dispatch runs leave
+      # the env empty and tag pushes carry an all-zeros before — both degrade to
+      # the tip's parent manifest (never a skip: a skip would let a recreated
+      # branch grandfather debt in one green run).
+      - name: Run tests (size-ratchet lane — blocking here, warning-only locally)
+        env:
+          OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: python -m pytest tests/ -m size_ratchet -q --tb=short
       - name: Guard extracted transport imports stay out of core
         run: python -m pytest tests/test_no_core_a2a_telegram_imports.py -q
+
+  # Fork-safe PR proof for the one native secret-scanner dependency. This job
+  # carries no provider or repository secret: it exercises the explicit pinned
+  # installer, managed resolver, license/version checks, and redaction-safe real
+  # scanner smoke on each supported desktop OS family.
+  betterleaks-platform-smoke:
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros')
+      || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
+      || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
+      OUROBOROS_BETTERLEAKS_REQUIRE_REAL: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-env
+      - name: Install exact Betterleaks runtime
+        env:
+          OUROBOROS_DATA_DIR: ${{ runner.temp }}/ouroboros-betterleaks-data
+        shell: bash
+        run: python -m ouroboros.betterleaks_runtime install
+      - name: Smoke managed Betterleaks runtime
+        env:
+          OUROBOROS_DATA_DIR: ${{ runner.temp }}/ouroboros-betterleaks-data
+        shell: bash
+        run: python scripts/betterleaks_platform_smoke.py --managed-runtime
+      - name: Run full pinned Betterleaks scanner contract
+        env:
+          OUROBOROS_DATA_DIR: ${{ runner.temp }}/ouroboros-betterleaks-data
+        shell: bash
+        run: python -m pytest tests/test_skill_publish_scanner_real.py -q
 
   # ──────────────────────────────────────────────────────────────────
   # Tier 2.5: Integration tests against real provider APIs
   # Triggered on push to main / ouroboros / ouroboros-stable, manual,
-  # or tag v*. Requires OPENROUTER_API_KEY / OPENAI_API_KEY /
-  # ANTHROPIC_API_KEY / CLOUDRU_FOUNDATION_MODELS_API_KEY in repository secrets. The `integration` pytest
-  # marker (in pyproject.toml) controls inclusion via `-m integration`;
-  # within an included test file, missing-key skipping is done by per-
-  # test `@pytest.mark.skipif(not os.environ.get(KEY))` decorators (see
-  # tests/test_provider_integration.py). NOT a `needs:` of build/
-  # release: a provider outage must not block a tagged release.
+  # or tag v*. OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY
+  # are required in the official trusted job; MiniMax / Cloud.ru / GigaChat
+  # credentials are optional and their absent rows remain visible as skips.
+  # The `integration` pytest marker controls inclusion via `-m integration`.
+  # Confirmed provider-contract failures block release-preflight; the test
+  # classifier keeps quota/rate-limit/5xx/timeout outcomes inconclusive.
   # ──────────────────────────────────────────────────────────────────
   integration-test:
     if: |
@@ -169,9 +230,11 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
           CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
-        run: python -m pytest tests/test_provider_integration.py -m integration -q --tb=short
+          GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
+        run: python -m pytest tests/test_provider_integration.py -m integration -q -rs --tb=short
 
   # ──────────────────────────────────────────────────────────────────
   # Tier 2.6: Official-skill install smoke against the LIVE OuroborosHub
@@ -183,8 +246,9 @@ jobs:
   # broken official skill); there is deliberately NO fallback-skip on
   # network failure, and gating the release on live external services
   # (GitHub raw, PyPI, DuckDuckGo, wttr.in, OpenRouter) is a deliberate
-  # owner decision — the opposite trade-off from integration-test, which is
-  # deliberately NOT a release need. Runs the `skill_smoke` pytest marker
+  # owner decision. Provider integration is now a separate release-preflight
+  # dependency with typed inconclusive outcomes for transient outages. Runs
+  # the `skill_smoke` pytest marker
   # (pyproject.toml) as serial pytest invocations: real network installs +
   # real pip installs into per-skill isolated envs are not xdist-safe —
   # never add -n here (the lane's tests are also kept out of the quick/full
@@ -297,6 +361,16 @@ jobs:
           # canary so a marker refactor cannot silently empty the lane.
           python -m pytest tests/ --collect-only -m skill_smoke -q | tee /tmp/skill-smoke-collect.txt
           grep -q "tests/test_skill_smoke_official.py" /tmp/skill-smoke-collect.txt
+      - name: Guard non-empty size_ratchet marker lane
+        run: |
+          set -euo pipefail
+          # Same positive-anchor pattern as the skill_smoke guard above. This
+          # lane is the ONLY blocking surface for the size gates (local runs
+          # merely warn), so silently emptying it would retire size
+          # enforcement altogether.
+          python -m pytest tests/ --collect-only -m size_ratchet -q | tee /tmp/size-ratchet-collect.txt
+          grep -q "tests/test_smoke.py" /tmp/size-ratchet-collect.txt
+          grep -q "tests/test_repo_health_smoke.py" /tmp/size-ratchet-collect.txt
 
   ui-smoke:
     if: |
@@ -360,7 +434,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   release-preflight:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: full-test
+    needs: [full-test, integration-test]
     runs-on: ubuntu-latest
     outputs:
       is_prerelease: ${{ steps.release_meta.outputs.is_prerelease }}
@@ -616,8 +690,12 @@ jobs:
               --managed-runtime --lane fixture --max-seconds 300
           if [ "${{ needs.release-preflight.outputs.is_prerelease }}" != "true" ] \
               && [ "$HAS_APPLE_SIGNING" = "true" ]; then
+            codesign --verify --strict \
+              "$MOUNT/Ouroboros.app/Contents/Resources/betterleaks-standalone/bin/betterleaks"
             codesign --verify --deep --strict "$MOUNT/Ouroboros.app"
           fi
+          python scripts/betterleaks_platform_smoke.py \
+            --bundle-root "$MOUNT/Ouroboros.app/Contents/Resources"
           rm -rf "$SBOM_ROOT"
           mkdir -p "$SBOM_ROOT"
           ditto "$MOUNT" "$SBOM_ROOT"
@@ -648,6 +726,8 @@ jobs:
             OUROBOROS_BUNDLE_DIR="$SMOKE_ROOT/Ouroboros/_internal" \
             python scripts/claudexor_platform_smoke.py \
               --managed-runtime --lane fixture --max-seconds 300
+          python scripts/betterleaks_platform_smoke.py \
+            --bundle-root "$SMOKE_ROOT/Ouroboros/_internal"
           echo "sbom_path=$SMOKE_ROOT" >> "$GITHUB_OUTPUT"
 
       - name: Smoke final Linux AppImage
@@ -801,6 +881,8 @@ jobs:
             OUROBOROS_BUNDLE_DIR="$APPDIR/usr/lib/ouroboros/_internal" \
             python scripts/claudexor_platform_smoke.py \
               --managed-runtime --lane fixture --max-seconds 300
+          python scripts/betterleaks_platform_smoke.py \
+            --bundle-root "$APPDIR/usr/lib/ouroboros/_internal"
           echo "artifact_path=$APPIMAGE" >> "$GITHUB_OUTPUT"
           echo "sbom_path=$APPDIR" >> "$GITHUB_OUTPUT"
 
@@ -833,6 +915,8 @@ jobs:
           $env:OUROBOROS_BUNDLE_DIR = "$SmokeRoot\Ouroboros\_internal"
           python scripts/claudexor_platform_smoke.py --managed-runtime --lane fixture --max-seconds 300
           if ($LASTEXITCODE -ne 0) { throw "packaged Claudexor runtime smoke failed: $LASTEXITCODE" }
+          python scripts/betterleaks_platform_smoke.py --bundle-root "$SmokeRoot\Ouroboros\_internal"
+          if ($LASTEXITCODE -ne 0) { throw "packaged Betterleaks runtime smoke failed: $LASTEXITCODE" }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "sbom_path=$SmokeRoot"
 
       - name: Record packaged artifact smoke
@@ -850,6 +934,7 @@ jobs:
             --tag "$GITHUB_REF_NAME" \
             --check embedded_repo_bundle \
             --check embedded_claudexor_runtime \
+            --check embedded_betterleaks_runtime \
             --check packaged_cli_help \
             "${EXTRA_CHECKS[@]}"
 
@@ -863,6 +948,7 @@ jobs:
             --output dist/release-smoke-linux-appimage-x86_64.json \
             --commit "$GITHUB_SHA" --tag "$GITHUB_REF_NAME" \
             --check embedded_repo_bundle --check embedded_claudexor_runtime \
+            --check embedded_betterleaks_runtime \
             --check packaged_cli_help --check appimage_extract_and_run \
             --check appimage_metadata --check product_version \
             --check browser_fallback_start --check gateway_readiness \
@@ -981,6 +1067,7 @@ jobs:
               --tag "$GITHUB_REF_NAME" \
               --check package_install \
               --check runtime_dependency \
+              --check embedded_betterleaks_runtime \
               --check packaged_cli_help \
               --check desktop_entry \
               --check systemd_user_unit \
@@ -1251,7 +1338,9 @@ jobs:
             release-artifacts/release-evidence.json
           body_path: release-notes.md
           fail_on_unmatched_files: true
-          target_commitish: ${{ github.sha }}
+          # The existing annotated tag is exact-SHA verified above. Passing an
+          # explicit target would make GitHub require Workflows:write, which
+          # the Actions GITHUB_TOKEN cannot receive.
           draft: true
           prerelease: ${{ needs.release-preflight.outputs.is_prerelease == 'true' }}
 

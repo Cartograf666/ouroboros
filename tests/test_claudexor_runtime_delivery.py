@@ -28,7 +28,10 @@ NODE_PLATFORMS = (
 )
 
 
-def _archive(path: pathlib.Path, *, entrypoint: str = "dist/claudexord.js") -> pathlib.Path:
+def _archive(
+    path: pathlib.Path, *, entrypoint: str = "dist/claudexord.js",
+    cli_entrypoint: str | None = None,
+) -> pathlib.Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = b"console.log('fixture')\n"
     with tarfile.open(path, "w:gz") as bundle:
@@ -36,6 +39,11 @@ def _archive(path: pathlib.Path, *, entrypoint: str = "dist/claudexord.js") -> p
         member.size = len(payload)
         member.mode = 0o644
         bundle.addfile(member, io.BytesIO(payload))
+        if cli_entrypoint:
+            cli = tarfile.TarInfo(cli_entrypoint)
+            cli.size = len(payload)
+            cli.mode = 0o644
+            bundle.addfile(cli, io.BytesIO(payload))
     return path
 
 
@@ -71,6 +79,8 @@ def _pin(
     *,
     version: str = "3.4.0",
     node_artifacts: dict[str, runtime.NodeRuntimeArtifact] | None = None,
+    entrypoint: str = "dist/claudexord.js",
+    cli_entrypoint: str | None = None,
 ) -> runtime.ClaudexorRuntimePin:
     return runtime.ClaudexorRuntimePin(
         version=version,
@@ -81,7 +91,8 @@ def _pin(
         size_bytes=archive.stat().st_size,
         node_version=NODE_VERSION,
         node_artifacts=node_artifacts or _node_artifacts(),
-        entrypoint="dist/claudexord.js",
+        entrypoint=entrypoint,
+        cli_entrypoint=cli_entrypoint,
     )
 
 
@@ -134,6 +145,17 @@ def test_pin_loader_distinguishes_unpublished_from_partial(tmp_path):
         runtime.load_runtime_pin(pin_file)
     assert excinfo.value.code == "runtime_pin_invalid"
     assert "missing fields" in str(excinfo.value)
+
+
+def test_tracked_pin_names_a_cli_capable_release():
+    """The reviewed pin is the ONE selector of the delivered engine/CLI: the
+    tracked release must carry the CLI entrypoint or Connect's vendor-CLI
+    install path is structurally unreachable (the exact finding every reviewer
+    of this proposal converged on while the pin was still pre-CLI 3.6.0)."""
+    pin = runtime.load_runtime_pin()
+    assert pin is not None
+    assert pin.version == "3.8.0"
+    assert pin.cli_entrypoint == "claudexor.bundle.cjs"
 
 
 def test_managed_runtime_layout_stays_inside_legacy_windows_path_budget(
@@ -316,6 +338,8 @@ def test_clean_source_install_fetches_exact_managed_node_in_the_same_ensure(
 
     assert pathlib.Path(command[0]).is_relative_to(runtime.managed_runtime_root())
     assert pathlib.Path(command[0]).parts[-3:] == ("node-standalone", "bin", "node")
+    assert manager._resolve_preserved_node(NODE_VERSION) == str(
+        pathlib.Path(command[0]).resolve())
     assert not (source_root / "node-standalone").exists()
     metadata = json.loads(
         (
@@ -325,6 +349,218 @@ def test_clean_source_install_fetches_exact_managed_node_in_the_same_ensure(
     )
     assert metadata["archive_sha256"] == pin.node_artifacts["linux-x64"].sha256
     assert metadata["version"] == NODE_VERSION
+
+
+def test_daemon_only_resolution_reuses_legacy_node_metadata_without_download(tmp_path, monkeypatch):
+    """Schema-1 node metadata written by a pre-CLI install stays valid for the
+    DAEMON's resolution even under a CLI-capable pin: the executable-only node
+    keeps serving claudexord, while the CLI resolver separately demands the
+    schema-2 npm pair (its own tests below)."""
+    _data_plane(monkeypatch, tmp_path)
+    pin = runtime.load_runtime_pin()
+    assert pin is not None and pin.cli_entrypoint is not None
+    artifact = pin.node_artifacts["linux-x64"]
+    root = runtime.managed_node_dir(pin, "linux-x64")
+    node = root / "node-standalone" / "bin" / "node"
+    node.parent.mkdir(parents=True)
+    node.write_bytes(b"legacy exact node\n")
+    (root / "managed-node.json").write_text(json.dumps({
+        "schema_version": 1,
+        "version": pin.node_version,
+        "platform": "linux-x64",
+        "archive_url": artifact.archive_url,
+        "archive_sha256": artifact.sha256,
+        "archive_size": artifact.size_bytes,
+        "archive_executable": artifact.executable,
+    }), encoding="utf-8")
+
+    import ouroboros.platform_layer as platform
+
+    monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [])
+    monkeypatch.setattr(platform, "node_distribution_platform", lambda: "linux-x64")
+    monkeypatch.setattr(
+        platform, "embedded_node_candidates",
+        lambda base: [pathlib.Path(base) / "node-standalone" / "bin" / "node"],
+    )
+    monkeypatch.setattr(platform, "probe_node_version", lambda candidate: (
+        pin.node_version if candidate == str(node) else ""))
+    monkeypatch.setattr(runtime, "fetch_node_archive", lambda *_a, **_kw: (
+        pytest.fail("legacy exact Node must not be downloaded again")))
+
+    assert runtime.ClaudexorRuntimeManager(pin)._ensure_node(pin) == str(node)
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+def test_preserved_node_reader_accepts_exact_supported_metadata_schemas(
+    tmp_path, monkeypatch, schema
+):
+    _data_plane(monkeypatch, tmp_path)
+    root = runtime.managed_runtime_root() / "node" / f"{NODE_VERSION}-linux-x64"
+    node = root / "node-standalone" / "bin" / "node"
+    node.parent.mkdir(parents=True)
+    node.write_bytes(b"exact node\n")
+    metadata = {
+        "schema_version": schema,
+        "version": NODE_VERSION,
+        "platform": "linux-x64",
+        "archive_url": f"https://node.example.test/node-v{NODE_VERSION}-linux-x64.tar.gz",
+        "archive_sha256": "a" * 64,
+        "archive_size": 123,
+        "archive_executable": f"node-v{NODE_VERSION}-linux-x64/bin/node",
+    }
+    if schema == 2:
+        metadata["archive_npm_cli"] = (
+            f"node-v{NODE_VERSION}-linux-x64/lib/node_modules/npm/bin/npm-cli.js"
+        )
+    (root / "managed-node.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    import ouroboros.platform_layer as platform
+
+    monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [])
+    monkeypatch.setattr(platform, "node_distribution_platform", lambda: "linux-x64")
+    monkeypatch.setattr(
+        platform, "embedded_node_candidates",
+        lambda base: [pathlib.Path(base) / "node-standalone" / "bin" / "node"],
+    )
+    monkeypatch.setattr(
+        platform, "probe_node_version",
+        lambda candidate: NODE_VERSION if candidate == str(node) else "",
+    )
+
+    manager = runtime.ClaudexorRuntimeManager(None)
+    assert manager._resolve_preserved_node(NODE_VERSION) == str(node.resolve())
+
+
+@pytest.mark.parametrize("payload", [
+    {"schema_version": 3, "version": NODE_VERSION, "platform": "linux-x64"},
+    {"schema_version": True, "version": NODE_VERSION, "platform": "linux-x64"},
+    {"schema_version": "2", "version": NODE_VERSION, "platform": "linux-x64"},
+    {"schema_version": 2, "version": "bad", "platform": "linux-x64"},
+    [],
+])
+def test_preserved_node_reader_rejects_future_or_malformed_metadata_typed(
+    tmp_path, monkeypatch, payload
+):
+    _data_plane(monkeypatch, tmp_path)
+    root = runtime.managed_runtime_root() / "node" / f"{NODE_VERSION}-linux-x64"
+    root.mkdir(parents=True)
+    (root / "managed-node.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    import ouroboros.platform_layer as platform
+
+    monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [])
+    monkeypatch.setattr(platform, "node_distribution_platform", lambda: "linux-x64")
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        runtime.ClaudexorRuntimeManager(None)._resolve_preserved_node(NODE_VERSION)
+    assert excinfo.value.code == "runtime_serving_node_metadata_invalid"
+
+
+def test_cli_command_installs_exact_closure_and_managed_node_npm_tree(tmp_path, monkeypatch):
+    _data_plane(monkeypatch, tmp_path)
+    source_root = tmp_path / "bundle"
+    closure = _archive(
+        source_root / "claudexor-runtime" / "runtime.tar.gz",
+        entrypoint="claudexord.bundle.cjs",
+        cli_entrypoint="claudexor.bundle.cjs",
+    )
+    distribution = f"node-v{NODE_VERSION}-linux-x64"
+    node_member = f"{distribution}/bin/node"
+    npm_cli = f"{distribution}/lib/node_modules/npm/bin/npm-cli.js"
+    npm_package = f"{distribution}/lib/node_modules/npm/package.json"
+    node_archive = tmp_path / f"{distribution}.tar.gz"
+    with tarfile.open(node_archive, "w:gz") as bundle:
+        for name, payload, mode in (
+            (node_member, b"node\n", 0o755),
+            (npm_cli, b"npm cli\n", 0o755),
+            (npm_package, b"{}\n", 0o644),
+        ):
+            member = tarfile.TarInfo(name)
+            member.size, member.mode = len(payload), mode
+            bundle.addfile(member, io.BytesIO(payload))
+    pin = _pin(
+        closure,
+        node_artifacts=_node_artifacts(exact_key="linux-x64", exact_archive=node_archive),
+        entrypoint="claudexord.bundle.cjs",
+        cli_entrypoint="claudexor.bundle.cjs",
+    )
+
+    import ouroboros.platform_layer as platform
+
+    monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [source_root])
+    monkeypatch.setattr(platform, "node_distribution_platform", lambda: "linux-x64")
+    monkeypatch.setattr(
+        platform, "embedded_node_candidates",
+        lambda base: [pathlib.Path(base) / "node-standalone" / "bin" / "node"],
+    )
+    monkeypatch.setattr(platform, "probe_node_version", lambda candidate: (
+        NODE_VERSION if pathlib.Path(candidate).is_file() else ""))
+    fetches = []
+
+    def fetch_fixture(artifact, destination):
+        fetches.append(artifact.archive_url)
+        pathlib.Path(destination).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(node_archive, destination)
+        return runtime.verify_node_archive(destination, artifact)
+
+    monkeypatch.setattr(runtime, "fetch_node_archive", fetch_fixture)
+    manager = runtime.ClaudexorRuntimeManager(pin)
+    monkeypatch.setattr(manager, "_probe", lambda _command, _pin: NODE_VERSION)
+
+    command = manager.ensure_cli_command()
+    node_root = runtime.managed_node_dir(pin, "linux-x64") / "node-standalone"
+    assert command == [str(node_root / "bin" / "node"),
+                       str(runtime.managed_runtime_dir(pin) / "claudexor.bundle.cjs")]
+    assert (node_root / "lib/node_modules/npm/bin/npm-cli.js").read_bytes() == b"npm cli\n"
+    assert (node_root / "lib/node_modules/npm/package.json").read_bytes() == b"{}\n"
+    node_metadata = json.loads((node_root.parent / "managed-node.json").read_text())
+    assert node_metadata["schema_version"] == 2
+    assert node_metadata["archive_npm_cli"] == npm_cli
+    assert manager.ensure_cli_command() == command
+    assert len(fetches) == 1
+
+
+def test_cli_toolchain_rejects_npm_links_and_windows_before_fetch(tmp_path, monkeypatch):
+    distribution = f"node-v{NODE_VERSION}-linux-x64"
+    node_member = f"{distribution}/bin/node"
+    npm_cli = f"{distribution}/lib/node_modules/npm/bin/npm-cli.js"
+    archive = tmp_path / "node.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        node = tarfile.TarInfo(node_member)
+        node.size = 1
+        bundle.addfile(node, io.BytesIO(b"n"))
+        link = tarfile.TarInfo(npm_cli)
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/tmp/npm-cli.js"
+        bundle.addfile(link)
+    artifact = runtime.NodeRuntimeArtifact(
+        archive_url="https://node.example.test/node.tar.gz",
+        sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+        size_bytes=archive.stat().st_size,
+        executable=node_member,
+    )
+    destination = tmp_path / "out/node-standalone/bin/node"
+    destination.parent.mkdir(parents=True)
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        runtime.ClaudexorRuntimeManager._extract_node_archive(
+            archive, artifact, destination,
+            archive_npm_cli=npm_cli,
+            npm_root=tmp_path / "out/node-standalone/lib/node_modules/npm",
+        )
+    assert excinfo.value.code == "runtime_node_archive_invalid"
+
+    _data_plane(monkeypatch, tmp_path)
+    closure = _archive(tmp_path / "runtime.tar.gz", cli_entrypoint="claudexor.bundle.cjs")
+    pin = _pin(closure, cli_entrypoint="claudexor.bundle.cjs")
+    import ouroboros.platform_layer as platform
+    monkeypatch.setattr(platform, "node_distribution_platform", lambda: "win32-x64")
+    monkeypatch.setattr(runtime, "fetch_node_archive", lambda *_a, **_kw: (
+        pytest.fail("Windows local CLI must refuse before fetching a toolchain")))
+    monkeypatch.setattr(runtime, "fetch_runtime_archive", lambda *_a, **_kw: (
+        pytest.fail("Windows local CLI must refuse before fetching a closure")))
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        runtime.ClaudexorRuntimeManager(pin).ensure_cli_command()
+    assert excinfo.value.code == "runtime_cli_platform_unsupported"
+    assert not runtime.managed_runtime_root().exists()
 
 
 def test_managed_pin_never_falls_back_to_random_path_binary(tmp_path, monkeypatch):
@@ -467,6 +703,100 @@ def test_probe_requires_exact_bundled_node_and_stamped_identity(tmp_path, monkey
         manager._probe(["/bundle/node", "/runtime/daemon.js"], pin)
     assert excinfo.value.code == "runtime_probe_identity_mismatch"
     assert "CLAUDEXOR_BUILD_SHA" not in seen["env"]
+
+
+def test_serving_role_uses_exact_preserved_tree_not_staged_pin(tmp_path, monkeypatch):
+    """A staged target cannot author a command for the still-serving daemon."""
+    _data_plane(monkeypatch, tmp_path)
+    archive = _archive(tmp_path / "runtime.tar.gz")
+    pin = _pin(archive, version="4.0.0")
+    manager = runtime.ClaudexorRuntimeManager(pin)
+
+    serving_root = runtime.managed_runtime_root() / f"3.7.0-{OLD_BUILD_SHA[:12]}"
+    _metadata(serving_root, version="3.7.0", build_sha=OLD_BUILD_SHA)
+    serving_entry = (serving_root / "dist" / "claudexord.js").resolve()
+    staged_entry = runtime.managed_runtime_dir(pin) / "dist" / "claudexord.js"
+    _metadata(runtime.managed_runtime_dir(pin), version=pin.version, build_sha=pin.build_sha)
+
+    monkeypatch.setattr(manager, "_resolve_preserved_node", lambda _version: "/exact/node")
+    seen = {}
+
+    def probe(command, *, expected_node_version):
+        seen["command"] = command
+        seen["node_version"] = expected_node_version
+        return ({
+            "version": "3.7.0",
+            "buildSha": OLD_BUILD_SHA,
+            "roles": ["future_role", "setup_attach"],
+        }, NODE_VERSION)
+
+    monkeypatch.setattr(manager, "_probe_payload", probe)
+    command = manager.resolve_serving_role_command(
+        engine_version="3.7.0",
+        engine_build_sha=OLD_BUILD_SHA,
+        engine_entry=str(serving_entry),
+        role="setup_attach",
+    )
+    assert command == ["/exact/node", str(serving_entry)]
+    assert seen == {"command": command, "node_version": NODE_VERSION}
+    assert str(staged_entry) not in command
+
+
+def test_old_serving_probe_without_role_is_unavailable_and_metadata_stays_bytes(
+    tmp_path, monkeypatch
+):
+    """Schema-v1 metadata needs no repair; the live probe owns role truth."""
+    _data_plane(monkeypatch, tmp_path)
+    archive = _archive(tmp_path / "runtime.tar.gz")
+    manager = runtime.ClaudexorRuntimeManager(_pin(archive, version="4.0.0"))
+    serving_root = runtime.managed_runtime_root() / f"3.6.0-{OLD_BUILD_SHA[:12]}"
+    _metadata(serving_root, version="3.6.0", build_sha=OLD_BUILD_SHA)
+    metadata_path = serving_root / "managed-runtime.json"
+    before = metadata_path.read_bytes()
+
+    monkeypatch.setattr(manager, "_resolve_preserved_node", lambda _version: "/exact/node")
+    monkeypatch.setattr(
+        manager,
+        "_probe_payload",
+        lambda _command, *, expected_node_version: (
+            {"version": "3.6.0", "buildSha": OLD_BUILD_SHA},
+            expected_node_version,
+        ),
+    )
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        manager.resolve_serving_role_command(
+            engine_version="3.6.0",
+            engine_build_sha=OLD_BUILD_SHA,
+            engine_entry=str(serving_root / "dist" / "claudexord.js"),
+            role="setup_attach",
+        )
+    assert excinfo.value.code == "runtime_role_unavailable"
+    assert metadata_path.read_bytes() == before
+
+
+def test_serving_role_refuses_same_identity_from_a_different_entry(tmp_path, monkeypatch):
+    _data_plane(monkeypatch, tmp_path)
+    archive = _archive(tmp_path / "runtime.tar.gz")
+    manager = runtime.ClaudexorRuntimeManager(_pin(archive))
+    serving_root = runtime.managed_runtime_root() / f"3.6.0-{OLD_BUILD_SHA[:12]}"
+    _metadata(serving_root, version="3.6.0", build_sha=OLD_BUILD_SHA)
+    foreign_entry = tmp_path / "foreign" / "claudexord.js"
+    foreign_entry.parent.mkdir(parents=True)
+    foreign_entry.write_text("fixture\n", encoding="utf-8")
+    monkeypatch.setattr(
+        manager,
+        "_probe_payload",
+        lambda *_args, **_kwargs: pytest.fail("an unbound entry must not be probed"),
+    )
+
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        manager.resolve_serving_role_command(
+            engine_version="3.6.0",
+            engine_build_sha=OLD_BUILD_SHA,
+            engine_entry=str(foreign_entry),
+            role="setup_attach",
+        )
+    assert excinfo.value.code == "runtime_serving_tree_unavailable"
 
 
 def test_failed_candidate_probe_preserves_existing_target(tmp_path, monkeypatch):

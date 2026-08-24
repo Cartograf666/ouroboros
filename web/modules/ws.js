@@ -205,7 +205,13 @@ export class WS {
         if (options.queue === false) {
             return { status: 'failed', clientMessageId: payload.client_message_id || '' };
         }
-        if (this._pendingMessages.length >= 100) this._pendingMessages.shift();
+        if (this._pendingMessages.length >= 100) {
+            const dropped = this._pendingMessages.shift();
+            this.emit('outbound_dropped', {
+                clientMessageId: (dropped && dropped.client_message_id) || '',
+                type: (dropped && dropped.type) || '',
+            });
+        }
         this._pendingMessages.push(payload);
         this.emit('outbound_queued', {
             clientMessageId: payload.client_message_id || '',

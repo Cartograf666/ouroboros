@@ -482,6 +482,20 @@ class TestHotStoreGrowthInvariant:
         result = build_health_invariants(env)
         assert "HOT STORE GROWTH" not in result
 
+    def test_scheduled_tasks_store_growth_warns_with_receipt_remediation(self, tmp_path):
+        """The one-shot follow-up receipts (B2b W=A) made this whole-document
+        store grow with every fired follow-up; the scheduler re-parses and
+        rewrites it on every tick under the queue lock."""
+        from ouroboros.context_budget import SCHEDULED_TASKS_WARN_BYTES
+
+        env = _make_health_env(tmp_path)
+        _grow_file(tmp_path / "state" / "scheduled_tasks.json", SCHEDULED_TASKS_WARN_BYTES + 1)
+
+        result = build_health_invariants(env)
+        assert "HOT STORE GROWTH" in result
+        assert "state/scheduled_tasks.json" in result
+        assert "receipts" in result  # remediation pointer
+
     def test_absent_stores_stay_silent(self, tmp_path):
         env = _make_health_env(tmp_path)
 
@@ -777,7 +791,7 @@ class TestAdvisoryReviewStatusInContext:
         assert "third evidence" in dynamic_text
 
 
-def test_runtime_section_includes_improvement_backlog_digest(tmp_path):
+def test_improvement_backlog_digest_is_actor_scoped(tmp_path):
     from ouroboros.context import build_llm_messages
     from ouroboros.memory import Memory
 
@@ -818,18 +832,29 @@ def test_runtime_section_includes_improvement_backlog_digest(tmp_path):
         encoding="utf-8",
     )
 
-    messages, _ = build_llm_messages(
-        env=FakeEnv(),
-        memory=Memory(drive_root=tmp_path),
-        task={"id": "task-a", "type": "task", "text": "hello"},
-    )
-    dynamic_text = messages[0]["content"][2]["text"]
-    assert "## Improvement Backlog" in dynamic_text
-    assert "Reduce recurring task friction around REVIEW_BLOCKED" in dynamic_text
+    ordinary = ({"id": "main", "type": "task", "_is_direct_chat": True},
+                {"id": "project", "type": "task", "project_id": "p1"},
+                {"id": "managed", "type": "task"},
+                {"id": "child", "type": "task", "delegation_role": "subagent"})
+    for task in ordinary:
+        task["text"] = "hello"
+        messages, _ = build_llm_messages(
+            env=FakeEnv(), memory=Memory(drive_root=tmp_path), task=task,
+        )
+        assert "## Improvement Backlog" not in messages[0]["content"][2]["text"]
+
+    for task_type in ("evolution", "deep_self_review"):
+        messages, _ = build_llm_messages(
+            env=FakeEnv(), memory=Memory(drive_root=tmp_path),
+            task={"id": task_type, "type": task_type, "text": "improve"})
+        dynamic_text = messages[0]["content"][2]["text"]
+        assert "## Improvement Backlog" in dynamic_text
+        assert "Reduce recurring task friction around REVIEW_BLOCKED" in dynamic_text
 
 
 class TestRuntimeEnvSection:
-    """build_runtime_section includes runtime_env with platform and is_desktop."""
+    """build_runtime_section: runtime_env carries presentation + platform, and
+    the per-message owner_client fact renders beside it (is_desktop retired)."""
 
     def _make_env(self, tmp_path):
         class FakeEnv:
@@ -845,26 +870,83 @@ class TestRuntimeEnvSection:
         )
         return FakeEnv()
 
-    def test_runtime_env_present(self, tmp_path, monkeypatch):
+    def test_runtime_env_presentation_absent_means_web(self, tmp_path, monkeypatch):
         from ouroboros.context import build_runtime_section
 
-        monkeypatch.delenv("OUROBOROS_DESKTOP_MODE", raising=False)
+        monkeypatch.delenv("OUROBOROS_PRESENTATION", raising=False)
         env = self._make_env(tmp_path)
         section = build_runtime_section(env, {"id": "t1", "type": "task"})
         data = json.loads(section.split("## Runtime context\n\n", 1)[1])
         assert "runtime_env" in data
         assert "platform" in data["runtime_env"]
         assert isinstance(data["runtime_env"]["platform"], str)
-        assert data["runtime_env"]["is_desktop"] is False
+        assert data["runtime_env"]["presentation"] == "web"
+        # The dead is_desktop flag is retired; presentation replaced it.
+        assert "is_desktop" not in data["runtime_env"]
 
-    def test_runtime_env_desktop_flag(self, tmp_path, monkeypatch):
+    def test_runtime_env_presentation_from_launcher_export(self, tmp_path, monkeypatch):
         from ouroboros.context import build_runtime_section
 
-        monkeypatch.setenv("OUROBOROS_DESKTOP_MODE", "1")
+        for value in ("desktop_window", "browser_fallback"):
+            monkeypatch.setenv("OUROBOROS_PRESENTATION", value)
+            env = self._make_env(tmp_path)
+            section = build_runtime_section(env, {"id": "t2", "type": "task"})
+            data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+            assert data["runtime_env"]["presentation"] == value
+
+    def test_owner_client_rendered_from_metadata(self, tmp_path, monkeypatch):
+        from ouroboros.context import build_runtime_section
+
+        monkeypatch.delenv("OUROBOROS_PRESENTATION", raising=False)
         env = self._make_env(tmp_path)
-        section = build_runtime_section(env, {"id": "t2", "type": "task"})
+        fact = {"pywebview": True, "ua": "TestShell/1.0", "viewport": {"w": 1200, "h": 800}}
+        section = build_runtime_section(
+            env, {"id": "t3", "type": "task", "metadata": {"client_surface": fact}}
+        )
         data = json.loads(section.split("## Runtime context\n\n", 1)[1])
-        assert data["runtime_env"]["is_desktop"] is True
+        assert data["owner_client"] == fact
+        assert "SENT" in data["owner_client_note"]
+
+    def test_owner_client_absent_is_a_gap_not_a_default(self, tmp_path, monkeypatch):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        section = build_runtime_section(env, {"id": "t4", "type": "task"})
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert "owner_client" not in data
+        assert "owner_client_note" not in data
+
+    def test_owner_client_channel_fact_stamped_by_external_admission(self, tmp_path):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        # /api/tasks and CLI STAMP the channel fact at admission; the renderer
+        # reads only the producer-assembled fact.
+        section = build_runtime_section(
+            env, {"id": "t5", "type": "task", "metadata": {"client_surface": {"channel": "cli"}}}
+        )
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert data["owner_client"] == {"channel": "cli"}
+
+    def test_owner_client_never_inferred_from_metadata_source(self, tmp_path):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        # metadata.source is OVERLOADED (scheduler writes scheduled_task /
+        # skill_scheduled_task): the renderer must never dress it up as an
+        # owner surface — no producer stamp, no fact (codex scope round 2 N1).
+        for source in ("cli", "scheduled_task", "skill_scheduled_task", "web"):
+            section = build_runtime_section(
+                env, {"id": "t6", "type": "task", "metadata": {"source": source}}
+            )
+            data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+            assert "owner_client" not in data, f"source={source!r} must not render"
+        # Internal producers use top-level task["source"], never rendered.
+        section = build_runtime_section(
+            env, {"id": "t7", "type": "task", "source": "promote_chat_to_task"}
+        )
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert "owner_client" not in data
 
 
 # ===========================================================================
@@ -983,6 +1065,242 @@ def test_recent_chat_for_project_thread_shows_only_its_own_thread(tmp_path):
     assert "project-a-own-thread" in combined   # its own thread is visible
     assert "project-b-sibling" not in combined  # sibling project not in focused view
     assert "main-stab-chat" not in combined     # main chat not in focused project view
+
+
+def test_project_recent_chat_filters_archives_before_recent_bound(tmp_path, monkeypatch):
+    """Sibling traffic cannot hide an older own-project directive before filtering."""
+    from ouroboros.context import build_recent_sections
+    from ouroboros.memory import Memory
+    from ouroboros.projects_registry import create_project
+
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
+    logs = tmp_path / "logs"
+    archive = tmp_path / "archive"
+    logs.mkdir(parents=True)
+    archive.mkdir(parents=True)
+    own = create_project(tmp_path, "own")
+    sibling = create_project(tmp_path, "sibling")
+    own_chat = int(own["chat_id"])
+    sibling_chat = int(sibling["chat_id"])
+    decisive = "CLAUDEXOR_ONLY_AND_THREE_LEVEL_NESTING"
+    (archive / "chat_20260820T010000.jsonl").write_text(
+        json.dumps({"chat_id": own_chat, "direction": "in", "text": decisive}) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "chat.jsonl").write_text(
+        "\n".join(
+            json.dumps({"chat_id": sibling_chat, "direction": "in", "text": f"noise-{i}"})
+            for i in range(4500)
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    combined = "\n\n".join(build_recent_sections(
+        Memory(drive_root=tmp_path), env=None, thread_chat_id=own_chat,
+    ))
+
+    assert decisive in combined
+    assert "noise-4499" not in combined
+    assert '\"omitted_matching_rows\": 0' in combined
+    assert "chat_history(count, offset, search)" in combined
+    assert str(tmp_path) not in combined
+
+
+def test_project_context_keeps_retention_proof_cross_thread_cat_directive_once(tmp_path):
+    from ouroboros.context import build_recent_sections
+    from ouroboros.memory import Memory
+    from ouroboros.project_dialogue import build_owner_message_ref
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    project = create_project(tmp_path, "cat-tower")
+    project_chat = int(project["chat_id"])
+    directive = "d" * 500 + " CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3"
+    ref = build_owner_message_ref(
+        chat_id=1, client_message_id="cat-origin", ts="2026-08-21T00:00:00Z", text=directive,
+    )
+    bind_task_to_project(
+        tmp_path, "cat-root", "cat-tower", project_chat,
+        origin={"ref": ref, "text": directive},
+    )
+    source_row = {**ref, "direction": "in", "text": directive}
+    (logs / "chat.jsonl").write_text(
+        json.dumps(source_row) + "\n"
+        + json.dumps({"chat_id": project_chat, "direction": "in", "text": "continue"}) + "\n",
+        encoding="utf-8",
+    )
+    present = "\n\n".join(build_recent_sections(
+        Memory(drive_root=tmp_path), env=None, thread_chat_id=project_chat,
+    ))
+    assert present.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1
+
+    (logs / "chat.jsonl").write_text(
+        json.dumps({"chat_id": project_chat, "direction": "in", "text": "continue"}) + "\n",
+        encoding="utf-8",
+    )
+
+    combined = "\n\n".join(build_recent_sections(
+        Memory(drive_root=tmp_path), env=None, thread_chat_id=project_chat,
+    ))
+
+    assert directive in combined
+    assert combined.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1
+    assert "Project owner origins (retention-proof bindings)" in combined
+
+
+def test_automatic_recent_context_reads_only_bounded_generation_suffix(tmp_path, monkeypatch):
+    import pathlib
+
+    from ouroboros.memory import Memory, _AUTOMATIC_CHAT_GENERATIONS
+
+    logs, archive = tmp_path / "logs", tmp_path / "archive"
+    logs.mkdir(parents=True)
+    archive.mkdir()
+    for index in range(10):
+        (archive / f"chat_20260820T{index:02d}0000.jsonl").write_text(
+            json.dumps({"direction": "in", "text": f"archive-{index}"}) + "\n",
+            encoding="utf-8",
+        )
+    (logs / "chat.jsonl").write_text(
+        json.dumps({"direction": "in", "text": "live-latest"}) + "\n",
+        encoding="utf-8",
+    )
+    memory = Memory(tmp_path)
+    reads = []
+    original = memory._read_chat_generation
+
+    def _counted(path, **kwargs):
+        reads.append(path)
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(memory, "_read_chat_generation", _counted)
+    entries, coverage = memory.read_unconsolidated_chat({}, 20)
+
+    assert len(reads) <= _AUTOMATIC_CHAT_GENERATIONS
+    assert entries[-1]["text"] == "live-latest"
+    assert coverage["omitted_matching_rows_unknown"] is True
+    assert any(gap["kind"] == "unscanned_unconsolidated_generations" for gap in coverage["gaps"])
+    assert [pathlib.Path(row["path"]).name for row in coverage["generations"]] == [
+        "chat_20260820T080000.jsonl", "chat_20260820T090000.jsonl", "chat.jsonl",
+    ]
+
+
+def test_automatic_recent_context_materializes_a_bounded_row_suffix(tmp_path):
+    from ouroboros.memory import Memory
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    (logs / "chat.jsonl").write_text(
+        "".join(
+            json.dumps({"direction": "in", "text": f"row-{index}"}) + "\n"
+            for index in range(20_000)
+        ),
+        encoding="utf-8",
+    )
+
+    entries, coverage = Memory(tmp_path).read_unconsolidated_chat({}, 1)
+
+    assert [entry["text"] for entry in entries] == ["row-19999"]
+    assert coverage["generations"][0]["rows"] <= 100
+    assert coverage["omitted_matching_rows_unknown"] is True
+    assert any(
+        gap["kind"] in {"generation_prefix_unscanned", "generation_tail_rows_unscanned"}
+        for gap in coverage["gaps"]
+    )
+
+
+def test_chat_history_surfaces_malformed_gap_even_when_search_matches_nothing(tmp_path):
+    from ouroboros.memory import Memory
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    (logs / "chat.jsonl").write_bytes(
+        b'{"direction":"in","text":"valid"}\n{"direction":"in","text":"decisive-tail"\n'
+    )
+
+    result = Memory(tmp_path).chat_history(count=20, search="absent-query")
+
+    assert "no observed messages matching query" in result
+    assert "completeness unknown" in result
+    assert "jsonl_malformed" in result
+
+
+def test_main_recent_chat_resumes_unconsolidated_archived_generation(tmp_path):
+    from ouroboros.context import build_recent_sections
+    from ouroboros.memory import Memory
+    from ouroboros.utils import jsonl_generation_signature
+
+    logs = tmp_path / "logs"
+    archive = tmp_path / "archive"
+    memory_dir = tmp_path / "memory"
+    logs.mkdir(parents=True)
+    archive.mkdir(parents=True)
+    memory_dir.mkdir(parents=True)
+    old = archive / "chat_20260820T010000.jsonl"
+    old.write_text(
+        "\n".join(json.dumps({"direction": "in", "text": f"old-{i}"}) for i in range(5)) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "chat.jsonl").write_text(
+        json.dumps({"direction": "in", "text": "new-live"}) + "\n",
+        encoding="utf-8",
+    )
+    (memory_dir / "dialogue_meta.json").write_text(json.dumps({
+        "last_consolidated_offset": 3,
+        "chat_log_signature": jsonl_generation_signature(old),
+    }), encoding="utf-8")
+
+    combined = "\n\n".join(build_recent_sections(Memory(drive_root=tmp_path), env=None))
+
+    assert "old-0" not in combined
+    assert "old-2" not in combined
+    assert "old-3" in combined
+    assert "old-4" in combined
+    assert "new-live" in combined
+    assert '\"gaps\": []' in combined
+
+
+def test_archive_only_chat_chain_is_complete_while_live_file_is_absent(tmp_path):
+    from ouroboros.memory import Memory
+
+    archive = tmp_path / "archive"
+    archive.mkdir(parents=True)
+    (archive / "chat_20260820T010000.jsonl").write_text(
+        json.dumps({"direction": "in", "text": "archive-only"}) + "\n",
+        encoding="utf-8",
+    )
+
+    entries, coverage = Memory(drive_root=tmp_path).read_chat_generations()
+
+    assert [entry["text"] for entry in entries] == ["archive-only"]
+    assert coverage["gaps"] == []
+
+
+def test_missing_cursor_generation_hot_path_never_replays_full_archive(tmp_path, monkeypatch):
+    from ouroboros.memory import Memory
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    (logs / "chat.jsonl").write_text(
+        json.dumps({"direction": "in", "text": "bounded-live"}) + "\n",
+        encoding="utf-8",
+    )
+    memory = Memory(drive_root=tmp_path)
+
+    def _forbidden_full_replay(**_kwargs):
+        raise AssertionError("automatic gap recovery must not scan every archive generation")
+
+    monkeypatch.setattr(memory, "read_chat_generations", _forbidden_full_replay)
+    entries, coverage = memory.read_unconsolidated_chat({
+        "last_consolidated_offset": 50,
+        "chat_log_signature": {"first_line_sha256": "f" * 64, "size": 999},
+    }, 20)
+
+    assert [entry["text"] for entry in entries] == ["bounded-live"]
+    assert coverage["omitted_matching_rows_unknown"] is True
+    assert coverage["gaps"][0]["kind"] == "consolidation_cursor_generation_missing"
+    assert coverage["reader"] == "chat_history(count, offset, search)"
 
 
 def test_project_workpad_and_journal_not_silently_sliced(tmp_path, monkeypatch):
@@ -1623,3 +1941,136 @@ def test_settled_continuation_with_open_obligations_survives_age_retirement(tmp_
     assert not continuation_path(tmp_path, "closedtask").exists()
     assert (archived_continuation_dir(tmp_path) / "closedtask.json").exists()
     assert "closedtask" in dynamic_text  # transient archive disclosure line
+
+
+# ---------------------------------------------------------------------------
+# B4-lite: capabilities["delegation"] — honestly-labeled HISTORICAL
+# observations only (never saved intent or live health).
+# ---------------------------------------------------------------------------
+
+
+def _delegation_data_root(tmp_path, monkeypatch):
+    root = tmp_path / "delegation_data_root"
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", root)
+    return root
+
+
+def _delegation_fact(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"})
+    payload = json.loads(section.split("\n\n", 1)[1])
+    return payload["capabilities"]
+
+
+def test_delegation_fact_carries_historical_rows_and_profile_evidence(tmp_path, monkeypatch):
+    root = _delegation_data_root(tmp_path, monkeypatch)
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claudexor=opus-5:high")
+    (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
+        "triad_1": {
+            "ts": "2026-08-18T01:02:03+00:00",
+            "surface": "triad",
+            "status": "ok",
+            "requested": {"profile_id": "requested-review-profile"},
+            "effective": {
+                "route": "agent_session:claudexor",
+                "model": "opus-5",
+                "profile_id": "applied-review-profile",
+            },
+        },
+        "triad_2": {
+            "ts": "2026-08-18T01:02:04+00:00",
+            "surface": "triad",
+            "status": "error",
+            # B1 typed facts: a dated window carries reset_at, an undated one
+            # only the code — both must surface independently.
+            "failure_code": "subscription_window_exhausted",
+            "reset_at": "2026-08-18T09:20:00+00:00",
+        },
+    }), encoding="utf-8")
+    (root / "state" / "subagent_last_delegation.json").write_text(json.dumps({
+        "ts": "2026-08-18T02:00:00+00:00",
+        "route": "claudexor",
+        "requested_model": "opus-5",
+        "applied_model": "claude-opus-5",
+        "requested_profile": "requested-delegate-profile",
+        "applied_profile": "applied-delegate-profile",
+        "selected_subagent_id": "builder",
+        "run_id": "run-1",
+    }), encoding="utf-8")
+
+    capabilities = _delegation_fact(tmp_path, monkeypatch)
+    delegation = capabilities["delegation"]
+
+    assert "configured_route" not in delegation
+    rows = {row["slot"]: row for row in delegation["reviewer_slots_last"]}
+    assert rows["triad_1"]["outcome"] == "ok"
+    assert rows["triad_1"]["requested_profile"] == "requested-review-profile"
+    assert rows["triad_1"]["applied_profile"] == "applied-review-profile"
+    assert "failure_code" not in rows["triad_1"]
+    assert rows["triad_2"]["outcome"] == "failed"
+    assert rows["triad_2"]["failure_code"] == "subscription_window_exhausted"
+    assert rows["triad_2"]["reset_at"] == "2026-08-18T09:20:00+00:00"
+    # Per-row label is the timestamp only; the verbatim historical disclaimer
+    # lives ONCE in the note (review fix 12), never repeated per row.
+    assert rows["triad_1"]["observed"] == "last observed at 2026-08-18T01:02:03+00:00"
+    last = delegation["subagent_last_delegation"]
+    assert last["route"] == "claudexor"
+    assert last["applied_model"] == "claude-opus-5"
+    assert last["requested_profile"] == "requested-delegate-profile"
+    assert last["applied_profile"] == "applied-delegate-profile"
+    assert last["selected_subagent_id"] == "builder"
+    assert last["observed"] == "last observed at 2026-08-18T02:00:00+00:00"
+    assert "historical" not in rows["triad_1"]["observed"]
+    # The prompt-visible note teaches the semantics ONCE: rows are history, live
+    # facts come from plan-review waves and typed delegate refusals.
+    assert "historical, not live health" in delegation["note"]
+    assert "plan-review wave rows" in delegation["note"]
+    assert "typed" in delegation["note"] and "refusal" in delegation["note"]
+    assert "never healthy" in delegation["note"]
+
+
+def test_delegation_fact_undated_window_code_surfaces_without_reset(tmp_path, monkeypatch):
+    root = _delegation_data_root(tmp_path, monkeypatch)
+    monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
+    (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
+        "scope": {
+            "ts": "2026-08-18T03:00:00+00:00",
+            "status": "error",
+            "failure_code": "credential_pool_exhausted",
+        },
+    }), encoding="utf-8")
+
+    delegation = _delegation_fact(tmp_path, monkeypatch)["delegation"]
+
+    (row,) = delegation["reviewer_slots_last"]
+    assert row["failure_code"] == "credential_pool_exhausted"
+    assert "reset_at" not in row
+    assert row["outcome"] == "failed"
+
+
+def test_delegation_fact_absent_files_mean_absent_observations_not_health(tmp_path, monkeypatch):
+    _delegation_data_root(tmp_path, monkeypatch)
+    monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
+
+    capabilities = _delegation_fact(tmp_path, monkeypatch)
+
+    assert "delegation" not in capabilities
+
+
+def test_delegation_fact_failure_never_drops_capability_digest(tmp_path, monkeypatch):
+    _delegation_data_root(tmp_path, monkeypatch)
+
+    def _boom():
+        raise RuntimeError("reader exploded")
+
+    monkeypatch.setattr(
+        "ouroboros.reviewer_slot_config.reviewer_slot_last_executions", _boom)
+
+    capabilities = _delegation_fact(tmp_path, monkeypatch)
+
+    assert "delegation" not in capabilities
+    # The surrounding digest survives intact.
+    assert "allow_mutative_subagents" in capabilities
+    assert "write_surfaces" in capabilities

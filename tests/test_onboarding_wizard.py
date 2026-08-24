@@ -201,9 +201,28 @@ def test_prepare_onboarding_settings_sets_all_local_routes():
 
     assert error is None
     assert prepared["USE_LOCAL_MAIN"] is True
-    assert prepared["USE_LOCAL_HEAVY"] is True
     assert prepared["USE_LOCAL_LIGHT"] is True
+    assert prepared["USE_LOCAL_CONSCIOUSNESS"] is True
     assert prepared["USE_LOCAL_FALLBACK"] is True
+
+
+def test_onboarding_never_authors_or_rewrites_legacy_heavy():
+    payload = _base_payload()
+    payload["LOCAL_MODEL_SOURCE"] = "Qwen/Qwen2.5-7B-Instruct-GGUF"
+    payload["LOCAL_MODEL_FILENAME"] = "qwen2.5-7b-instruct-q3_k_m.gguf"
+    payload["LOCAL_ROUTING_MODE"] = "all"
+    payload["OUROBOROS_MODEL_HEAVY"] = "incoming/zombie-heavy"
+    payload["USE_LOCAL_HEAVY"] = False
+    current = {
+        "OUROBOROS_MODEL_HEAVY": "owner/legacy-heavy",
+        "USE_LOCAL_HEAVY": True,
+    }
+
+    prepared, error = prepare_onboarding_settings(payload, current)
+
+    assert error is None
+    assert prepared["OUROBOROS_MODEL_HEAVY"] == "owner/legacy-heavy"
+    assert prepared["USE_LOCAL_HEAVY"] is True
 
 
 def test_prepare_onboarding_settings_preserves_non_wizard_provider_fields():
@@ -248,14 +267,13 @@ def test_prepare_onboarding_settings_accepts_openai_compatible_setup():
     assert prepared["OUROBOROS_MODEL"] == "openai-compatible::llama3"
 
 
-def test_prepare_onboarding_settings_accepts_empty_heavy_and_light():
-    """Role-model (v6.39): only Main is required; empty Heavy/Light fall back to Main, so
+def test_prepare_onboarding_settings_accepts_empty_light():
+    """Role-model (v6.39): only Main is required; empty Light falls back to Main, so
     the owner is not forced to fill every slot (mirrors the relaxed JS validateModelsStep
     and the live desktop launcher path)."""
     payload = _base_payload()
     payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
     payload["OUROBOROS_MODEL"] = "openai::gpt-5.5"
-    payload["OUROBOROS_MODEL_HEAVY"] = ""
     payload["OUROBOROS_MODEL_LIGHT"] = ""
 
     prepared, error = prepare_onboarding_settings(payload, {})
@@ -322,6 +340,7 @@ def test_onboarding_bootstrap_cannot_break_out_of_its_inline_script():
 
 def test_onboarding_wizard_module_keeps_its_multistep_contract():
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+    draft_source = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
 
     assert "const STEP_ORDER = bootstrap.stepOrder || (SETUP_CONTRACT.steps || []).map" in source
     assert "Add your access" in source or "Local model settings" in source
@@ -331,9 +350,12 @@ def test_onboarding_wizard_module_keeps_its_multistep_contract():
     assert "function nextButtonShouldBeDisabled()" in source
     assert "function syncCurrentStepActionState()" in source
     assert "return 'direct-multi';" in source
-    assert "PROVIDER_FIELDS.map((field) => [field.settingKey, trim(state[field.stateKey])])" in source
-    assert "MODEL_SLOTS.map((slot) => [slot.settingKey, trim(state[slot.stateKey])])" in source
-    assert "LOCAL_ROUTING_MODE: trim(state.localSource) ? (trim(state.localRoutingMode) || 'cloud') : 'cloud'" in source
+    assert "onboardingSettingsDraft({" in source
+    assert "function onboardingSettingsDraft({" in draft_source
+    assert "[field.settingKey, clean(state[field.stateKey])]" in draft_source
+    assert "[slot.settingKey, clean(state[slot.stateKey])]" in draft_source
+    assert "LOCAL_ROUTING_MODE: clean(state.localSource)" in draft_source
+    assert "clean(state.localRoutingMode) || 'cloud'" in draft_source
 
 
 def test_onboarding_steps_and_stylesheet_keep_their_owner_facing_shape():
@@ -346,6 +368,16 @@ def test_onboarding_steps_and_stylesheet_keep_their_owner_facing_shape():
     assert {"Keys + local", "model slots"} <= rails
     assert "@media (max-width: 720px)" in css
     assert "scroll-snap-type: x proximity;" in css
+
+
+def test_setup_contract_exports_active_model_slots_only():
+    contract = build_setup_contract("web")
+    setting_keys = {slot["settingKey"] for slot in contract["modelSlots"]}
+
+    assert "OUROBOROS_MODEL_HEAVY" not in setting_keys
+    assert "OUROBOROS_MODEL_HEAVY" not in repr(contract["modelSlots"])
+    assert all("heavy" not in defaults for defaults in build_setup_bootstrap({}, "web")["modelDefaults"].values())
+    assert all(len(mode["flags"]) == 4 for mode in contract["localRoutingModes"])
 
 
 # --------------------------------------------------------------------------
@@ -393,7 +425,7 @@ def test_agents_step_ladder_states_the_startup_gate_honestly():
     assert "keeps using the API key or local model" in source
     assert "a plan cannot run it" in source
     assert "not free" in source
-    assert "Plan review, task acceptance and" in source
+    assert "Task acceptance and skill review" in source and "plan review follows each triad row" in source
     assert "stay on the API key" in source
     assert "all reviewers" not in source.lower()
     # D-10 vocabulary in the new owner-facing surface.
@@ -455,8 +487,12 @@ def test_wizard_declares_the_subscription_intent_the_endpoint_expects():
     assert f"{SUBSCRIPTIONS_CONNECTED_FIELD}: state.agentsConnected.length > 0" in source
     assert f"{SKIP_SUBSCRIPTION_PRESETS_FIELD}: state.skipSubscriptionPresets" in source
     assert 'id="skip-presets-btn"' in source
-    assert "Finish without agent defaults" in source
+    assert "Finish without subscription presets" in source
     assert "saveWizard({ skipPresets: true })" in source
+    save = source.split("async function saveWizard", 1)[1]
+    assert save.index("await agentsStep?.setSkipPresets(true)") < save.index(
+        "const providersError = validateProvidersStep()"
+    )
 
 
 def test_a_browser_owner_is_told_when_the_saved_runtime_mode_needs_a_restart():
@@ -579,11 +615,16 @@ def test_setup_contract_has_no_secret_values():
     assert "OPENROUTER_API_KEY" in text
     assert "sk-or-v1-super-secret" not in text
     assert "sk-ant-super-secret" not in text
-    suggestions = build_setup_bootstrap({}, "web")["modelSuggestions"]
+    empty_bootstrap = build_setup_bootstrap({}, "web")
+    suggestions = empty_bootstrap["modelSuggestions"]
     assert "anthropic/claude-sonnet-5" in suggestions
     assert "anthropic::claude-sonnet-5" in suggestions
     assert "minimax::MiniMax-M3" in suggestions
     assert "minimax::MiniMax-M2.7" in suggestions
+    assert empty_bootstrap["initialState"]["totalBudget"] == 200.0
+    assert empty_bootstrap["initialState"]["perTaskCostUsd"] == 50.0
+    assert budget_fields["TOTAL_BUDGET"]["default"] == 200.0
+    assert budget_fields["OUROBOROS_PER_TASK_COST_USD"]["default"] == 50.0
 
     configured_value = "minimax-hidden-value"
     bootstrap = build_setup_bootstrap({"MINIMAX_API_KEY": configured_value}, "web")
@@ -1077,21 +1118,19 @@ def test_onboarding_frontend_exempts_unchanged_prefilled_keys_from_length_check(
     assert len(CONFIGURED_SECRET_PLACEHOLDER) < 10
 
 
-def test_completion_branches_on_typed_login_custody_before_detach():
-    """The IIFE consumer retries only unknown cleanup, then leaves honestly."""
-    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+def test_agents_step_owns_typed_login_custody_before_wizard_announcement():
+    """The step retries only unknown cleanup, then leaves honestly."""
+    source = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
 
-    body = source.split("async function saveWizardPayload", 1)[1].split("\n    }", 1)[0]
+    body = source.split("async function disposeForCompletion", 1)[1].split("\n    }", 1)[0]
     # Ordering is judged on CODE only: both names also appear in the comments
     # that explain the ordering, and matching those would pass on prose alone.
     code = "\n".join(line for line in body.splitlines()
                      if not line.strip().startswith("//"))
 
     # Awaited, and its typed answer kept.
-    assert "agentsStep ? await agentsStep.dispose() : 'released'" in code
-    assert "'released'" in code
-    # The announcement comes AFTER the disposal, not before it.
-    assert code.index("dispose()") < code.index("announceCompletion")
+    assert "let custody = await dispose()" in code
+    assert "return login ? login.dispose() : 'released';" in source
     assert "custody === 'retained'" in code
     assert "custody === 'unknown'" in code
     assert "released === false" not in code
@@ -1099,16 +1138,23 @@ def test_completion_branches_on_typed_login_custody_before_detach():
     # proceeds directly to local detach because another cancel proves nothing.
     retry = code.index("for (let attempt = 0; custody === 'unknown'")
     retained = code.index("custody === 'retained'")
-    detach = code.index("agentsStep?.detach()")
-    drop = code.index("agentsStep = null")
-    announce = code.index("announceCompletion")
-    assert retry < retained < detach < drop < announce
+    detach = code.index("detach()")
+    assert retry < retained < detach
     assert "LOGIN_RELEASE_RETRIES" in code and "LOGIN_RELEASE_RETRY_MS" in code
     assert source.count("const LOGIN_RELEASE_RETRIES = ") == 1
     retries = int(source.split("const LOGIN_RELEASE_RETRIES = ", 1)[1].split(";", 1)[0])
     delay = int(source.split("const LOGIN_RELEASE_RETRY_MS = ", 1)[1].split(";", 1)[0])
     assert 1 <= retries <= 5 and 100 <= delay <= 2000, (
         "the retry must stay a blip-sized bound, not a stall")
+
+    wizard = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+    save = wizard.split("async function saveWizardPayload", 1)[1].split("\n    }", 1)[0]
+    save_code = "\n".join(line for line in save.splitlines()
+                          if not line.strip().startswith("//"))
+    dispose = save_code.index("await agentsStep?.disposeForCompletion()")
+    drop = save_code.index("agentsStep = null")
+    announce = save_code.index("announceCompletion")
+    assert dispose < drop < announce
 
 
 def test_the_review_step_spells_a_family_the_way_the_agents_step_did():

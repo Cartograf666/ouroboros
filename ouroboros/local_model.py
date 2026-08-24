@@ -998,3 +998,17 @@ class LocalModelManager:
                 "Consider using it for Light/Consciousness only."
             )
         return result
+
+
+# The local lane's own per-request deadline, read where the local lane lives.
+# The DEFAULT stays in config (the SSOT for runtime values); only its reader
+# moved, as `reviewer_slot_config` already does for its own setting.
+def get_local_request_timeout_sec() -> float:
+    """Per-request timeout for the local llama.cpp chat lane.
+
+    The local server is the slowest route the loop can take and the one most likely
+    to spend minutes on prefill before the first token, so it needs a MORE generous
+    deadline than the remote transport bound, not a stricter one."""
+    from ouroboros.config import _clamped_number_setting
+
+    return _clamped_number_setting("OUROBOROS_LOCAL_REQUEST_TIMEOUT_SEC", low=60.0, high=7200.0)

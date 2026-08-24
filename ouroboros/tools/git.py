@@ -39,11 +39,22 @@ from ouroboros.tools.claude_advisory_review import (
     advisory_gate_unavailable,
 )
 from ouroboros.tools.commit_gate import (
+    BLOCK_CLASS_INFRA,
+    IDENTICAL_DIFF_BLOCK_REASON,
     _check_advisory_freshness,
     _check_overlapping_review_attempt,
     _invalidate_advisory,
     _record_commit_attempt,
-    check_blocked_attempt_cap,
+    check_identical_verdict_refusal,
+    check_review_cycles_ceiling,
+    classify_review_block,
+    commit_review_contract_fingerprint,
+    compute_rebuttal_sha256,
+    resolve_root_task_id,
+)
+from ouroboros.review_cycles import (
+    REASON_REVIEW_CYCLES_EXHAUSTED,
+    emit_review_cycles_exhausted,
 )
 from ouroboros.tools.review_revalidation import handle_revalidation_failure
 from ouroboros.utils import utc_now_iso, write_text, safe_relpath, run_cmd
@@ -268,6 +279,7 @@ def _finalize_blocked_review(
     combined_findings: List[Dict[str, Any]],
     pre_fingerprint: Dict[str, Any],
     post_fingerprint: Dict[str, Any],
+    block_class: str = "",
 ) -> str:
     """Persist a genuine blocked review result, then unstage the reviewed diff."""
     _record_commit_attempt(
@@ -279,6 +291,7 @@ def _finalize_blocked_review(
         duration_sec=time.time() - commit_start,
         critical_findings=combined_findings,
         phase="blocking_review",
+        block_class=block_class,
         pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
         post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
         fingerprint_status="matched",
@@ -348,7 +361,23 @@ def _mark_failed_bypass_advisory_stale(
         log.debug("Failed to stale bypass advisory after preflight block", exc_info=True)
 
 
-def _refuse_capped_attempt(
+def _repair_managed_merge_head(ctx: ToolContext) -> None:
+    """Re-establish MERGE_HEAD for an authorized managed resolver after a
+    refusal's index reset, so the resolution is not stranded (same repair the
+    blocked-review path performs in ``_repo_commit_push``)."""
+    try:
+        from supervisor.update_merge import managed_assisted_tx_for, reestablish_merge_head
+
+        tx, _block = managed_assisted_tx_for(
+            getattr(ctx, "task_id", ""), getattr(ctx, "task_metadata", None)
+        )
+        if tx:
+            reestablish_merge_head(str(tx.get("target_sha") or ""))
+    except Exception:
+        log.debug("reestablish_merge_head after free refusal failed", exc_info=True)
+
+
+def _free_cycle_gate(
     ctx: ToolContext,
     commit_message: str,
     commit_start: float,
@@ -356,33 +385,122 @@ def _refuse_capped_attempt(
     pre_fingerprint: Dict[str, Any],
     review_rebuttal: str,
 ) -> Optional[Dict[str, Any]]:
-    """Identical-diff blocked-attempt cap preflight; None allows the attempt."""
-    cap_msg = check_blocked_attempt_cap(
-        ctx,
-        pre_fingerprint.get("fingerprint", ""),
-        has_rebuttal=bool(str(review_rebuttal or "").strip()),
+    """Max-Review-Cycles gate, run BEFORE advisory freshness and any paid
+    dispatch. ``None`` allows a paid attempt. Two free typed outcomes:
+    a byte-identical resubmission of a verdict-blocked diff without a NEW
+    rebuttal, and an exhausted per-root-task paid-cycle ceiling. Under
+    blocking enforcement each is a free refusal dict; under advisory each is
+    an ``{"advisory_replay": …}`` marker — the commit proceeds with a loud
+    disclosure and WITHOUT buying another review."""
+    from ouroboros.config import get_review_enforcement
+
+    fp = pre_fingerprint.get("fingerprint", "")
+    rebuttal_sha = compute_rebuttal_sha256(review_rebuttal)
+    contract_fp = commit_review_contract_fingerprint()
+    ctx._current_review_rebuttal_sha256 = rebuttal_sha
+    ctx._current_review_contract_fingerprint = contract_fp
+    root_task_id = resolve_root_task_id(ctx)
+    identical_msg = check_identical_verdict_refusal(
+        ctx, fp, rebuttal_sha256=rebuttal_sha, contract_fingerprint=contract_fp
     )
-    if not cap_msg:
+    ceiling = None if identical_msg else check_review_cycles_ceiling(
+        ctx, root_task_id=root_task_id
+    )
+    if not identical_msg and ceiling is None:
         return None
+    enforcement = str(get_review_enforcement() or "")
+    reason = IDENTICAL_DIFF_BLOCK_REASON if identical_msg else REASON_REVIEW_CYCLES_EXHAUSTED
+    message = identical_msg or str(ceiling["message"])
+    if ceiling is not None:
+        emit_review_cycles_exhausted(
+            getattr(ctx, "event_queue", None), ctx.drive_root,
+            surface="commit_gate", task_id=str(getattr(ctx, "task_id", "") or ""),
+            cycles_paid=int(ceiling["cycles_paid"]), cap=int(ceiling["cap"]),
+            enforcement=enforcement, root_task_id=root_task_id, fingerprint=str(fp),
+        )
+    if enforcement != "blocking":
+        # ADVISORY: neither state hard-blocks a commit — disclose loudly (typed
+        # event + result message) and reuse the recorded outcome for free.
+        # The identical-replay half of this branch is structurally near-dead
+        # TODAY (fable P3-2, deliberate): verdict rows are only minted under
+        # blocking enforcement, and the review-contract fingerprint includes
+        # enforcement, so blocking-era verdicts never match an advisory-era
+        # contract — the streak lapses and the commit degrades to an ordinary
+        # PAID review. Kept as defense-in-depth for any future path that
+        # records advisory-era verdict rows.
+        try:
+            from ouroboros.utils import append_jsonl
+
+            append_jsonl(ctx.drive_logs() / "events.jsonl", {
+                "ts": utc_now_iso(), "type": "commit_review_free_replay",
+                "reason": reason, "enforcement": enforcement,
+                "task_id": str(getattr(ctx, "task_id", "") or ""),
+                "root_task_id": root_task_id,
+                "pre_review_fingerprint": str(fp),
+            })
+        except Exception:
+            log.debug("commit_review_free_replay event emission failed", exc_info=True)
+        return {"advisory_replay": message, "replay_reason": reason}
     try:
         run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
     except Exception:
         pass
+    if _authorized_managed_update_resolver(ctx):
+        _repair_managed_merge_head(ctx)
     _record_commit_attempt(
         ctx,
         commit_message,
         "blocked",
-        block_reason="attempt_cap_reached",
-        block_details=cap_msg,
+        block_reason=reason,
+        block_details=message,
         duration_sec=time.time() - commit_start,
         phase="preflight",
-        pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+        pre_review_fingerprint=str(fp),
+        rebuttal_sha256=rebuttal_sha,
+        review_contract_fingerprint=contract_fp,
     )
     return {
         "status": "blocked",
-        "message": cap_msg,
-        "block_reason": "attempt_cap_reached",
+        "message": message,
+        "block_reason": reason,
     }
+
+
+def _install_paid_dispatch_stamp(
+    ctx: ToolContext,
+    commit_message: str,
+    commit_start: float,
+    pre_fingerprint: Dict[str, Any],
+) -> None:
+    """WRITE-AHEAD paid stamp (Q16 fix round, F2): durably merge ``paid=True``
+    onto the current attempt row immediately BEFORE the first physical
+    reviewer transport call, on EITHER side — triad and scope dispatch in
+    parallel, so scope spend can coexist with a triad assembly overflow, and
+    any side dispatching makes the cycle paid. Assembly-only exits (triad fit
+    ladder, scope pack signals) never invoke the stamp, so a $0 attempt stays
+    outside the ceiling; a crash after dispatch keeps the paid fact
+    (write-ahead). The shared transport entry (``run_review_request``)
+    invokes the stamp via ``ctx._review_paid_stamp`` — the seam where the
+    L-review lane's two-phase admission slots in at synthesis."""
+    from ouroboros.review_dispatch import ReviewPaidStamp
+
+    def _write() -> None:
+        _record_commit_attempt(
+            ctx,
+            commit_message,
+            "reviewing",
+            duration_sec=time.time() - commit_start,
+            phase="review",
+            pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+            fingerprint_status="pending",
+            paid=True,
+            rebuttal_sha256=str(getattr(ctx, "_current_review_rebuttal_sha256", "") or ""),
+            review_contract_fingerprint=str(
+                getattr(ctx, "_current_review_contract_fingerprint", "") or ""
+            ),
+        )
+
+    ctx._review_paid_stamp = ReviewPaidStamp(_write)
 
 
 def _review_cycle_infra_failure(
@@ -503,62 +621,126 @@ def _stage_candidate_for_review(
     return classification_paths, advisory_paths, None
 
 
-def _run_reviewed_stage_cycle(
+def _tests_preflight_block_message(managed_needs_proof: bool, test_err: str) -> str:
+    """The red-preflight block text. Managed merges get the honest mandate
+    wording: the env/skip escapes the ordinary text offers do NOT lift the
+    managed requirement — they only defer the same mandatory suite to the
+    post-commit gate, which would commit and then roll the merge back on red."""
+    if managed_needs_proof:
+        return (
+            "⚠️ TESTS_PREFLIGHT_BLOCKED: The full hermetic suite is MANDATORY for a "
+            "managed update resolution and must be green BEFORE review and commit.\n"
+            "skip_tests and OUROBOROS_PRE_PUSH_TESTS are not honored for managed "
+            "merges: an unproven candidate pays the same suite at the commit gate "
+            "and a red result rolls the merge back. Fix the failures below, then "
+            "re-run commit_reviewed.\n\n"
+            f"{test_err}"
+        )
+    return (
+        "⚠️ TESTS_PREFLIGHT_BLOCKED: Tests must pass before triad + scope review "
+        "when advisory is bypassed.\n"
+        "Fix the failures below, then re-run commit_reviewed (or drop "
+        "skip_advisory_review=True to run the full advisory flow).\n"
+        "Set OUROBOROS_PRE_PUSH_TESTS=0 to skip tests entirely.\n\n"
+        f"{test_err}"
+    )
+
+
+def _managed_candidate_needs_proof(ctx: ToolContext) -> bool:
+    """Managed single-run mandate (Q10): True when the authorized resolver's
+    CURRENT candidate tree carries no recorded green-suite proof (advisory ran
+    with skip_tests, or the tree changed since) — the compensating preflight
+    must then run PRE-commit, before paid review and before any commit exists,
+    regardless of skip_tests/doc-only, so a red candidate is fixed in place
+    instead of committed and rolled back.
+
+    AUTHORITY (synthesis F2): the proof consulted here is the PROCESS-HELD ctx
+    record pinned by ``record_managed_tests_proof`` when the host itself ran
+    the suite — never the durable ``tests_evidence`` tx copy, which is a plain
+    resolver-writable file (forensic only; a forged tree there must not
+    suppress the mandatory run). A restart between the proof run and the
+    commit therefore re-runs the suite once."""
+    if not _authorized_managed_update_resolver(ctx):
+        return False
+    try:
+        from supervisor.update_merge import worktree_snapshot_tree
+
+        cand_tree, _cand_err = worktree_snapshot_tree("HEAD")
+        proofs = getattr(ctx, "_managed_tests_proof_trees", None) or ()
+        return not (cand_tree and cand_tree in proofs)
+    except Exception:
+        log.debug("managed proof check failed; running the preflight", exc_info=True)
+        return True
+
+
+def _subject_binding_mismatch_outcome(
+    ctx: ToolContext,
+    commit_message: str,
+    commit_start: float,
+    pre_fingerprint: Dict[str, Any],
+    post_fingerprint: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Defense-in-depth for the managed review subject: every gate subject
+    built during this attempt recorded its S tree (review_subject,
+    surface="gate"). Assert the reviewed subject is EXACTLY the tree the
+    binding fingerprints — i.e. the tree this commit writes. Empty set =
+    non-managed attempt (or a managed one that never built a subject): nothing
+    to assert, returns None. A mismatch returns the typed blocked outcome."""
+    subject_trees = {
+        str(t) for t in (getattr(ctx, "_last_review_subject_trees", None) or ())
+        if str(t or "").strip()
+    }
+    if not subject_trees:
+        return None
+    binding_tree = str((pre_fingerprint.get("binding") or {}).get("tree_sha") or "")
+    if subject_trees == {binding_tree}:
+        return None
+    mismatch_msg = (
+        "⚠️ REVIEW_BLOCKED: the managed review subject is not bound to "
+        "the staged candidate — reviewed subject tree(s) "
+        f"{', '.join(sorted(subject_trees))} do not equal the "
+        f"review-binding index tree {binding_tree or '(unavailable)'}. "
+        "The reviewers judged material that is not the tree this commit "
+        "would write; nothing was committed. Re-stage the intended "
+        "candidate and retry."
+    )
+    _record_commit_attempt(
+        ctx,
+        commit_message,
+        "blocked",
+        block_reason="review_subject_binding_mismatch",
+        block_details=mismatch_msg,
+        duration_sec=time.time() - commit_start,
+        phase="revalidation",
+        # Infra by construction (A1 composition): a binding mismatch is a gate
+        # fact, not a reviewer verdict — it must never build a refusal streak
+        # nor anchor an identical-diff refusal quote.
+        block_class=BLOCK_CLASS_INFRA,
+        pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+        fingerprint_status="invalid",
+    )
+    return {
+        "status": "blocked",
+        "message": mismatch_msg,
+        "block_reason": "review_subject_binding_mismatch",
+        "pre_fingerprint": pre_fingerprint,
+        "post_fingerprint": post_fingerprint,
+    }
+
+
+def _advisory_and_tests_gate(
     ctx: ToolContext,
     commit_message: str,
     commit_start: float,
     *,
-    paths: Optional[List[str]] = None,
-    skip_advisory_review: bool = False,
-    skip_advisory_pre_review: bool = False,
-    skip_tests: bool = False,
-    goal: str = "",
-    scope: str = "",
-    review_rebuttal: str = "",
-    came_from_detached_checkout: bool = False,
-    require_release_tag: bool = True,
-) -> Dict[str, Any]:
-    skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
-    classification_paths, advisory_paths, stage_error = _stage_candidate_for_review(
-        ctx,
-        commit_message,
-        commit_start,
-        paths=paths,
-        came_from_detached_checkout=came_from_detached_checkout,
-    )
-    if stage_error is not None:
-        return stage_error
-    protected_staged_paths = protected_paths_in(classification_paths)
-    runtime_mode = _current_runtime_mode()
-    if (
-        protected_staged_paths
-        and not mode_allows_protected_write(runtime_mode)
-        and not _authorized_managed_update_resolver(ctx)
-    ):
-        msg = _protected_paths_block_message(
-            protected_staged_paths,
-            runtime_mode=runtime_mode,
-            action="commit",
-        )
-        try:
-            run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
-        except Exception:
-            pass
-        _record_commit_attempt(
-            ctx,
-            commit_message,
-            "blocked",
-            block_reason="core_protection_blocked",
-            block_details=msg,
-            duration_sec=time.time() - commit_start,
-            critical_findings=[],
-            phase="preflight",
-        )
-        return {
-            "status": "blocked",
-            "message": msg,
-            "block_reason": "core_protection_blocked",
-        }
+    classification_paths: List[str],
+    advisory_paths: Optional[List[str]],
+    skip_advisory_pre_review: bool,
+    skip_tests: bool,
+) -> Optional[Dict[str, Any]]:
+    """Advisory-freshness gate plus the compensating tests preflight (moved
+    whole out of ``_run_reviewed_stage_cycle`` at the function-size gate).
+    ``None`` = proceed to review."""
     advisory_err = _check_advisory_freshness(
         ctx,
         commit_message,
@@ -609,23 +791,20 @@ def _run_reviewed_stage_cycle(
     # preflight instead of skipping both advisory and tests.
     _diff_aware = (os.environ.get("OUROBOROS_PREFLIGHT_DIFF_AWARE", "true") or "true").strip().lower() in ("true", "1", "yes")
     _doc_only = _diff_aware and _diff_is_doc_only(classification_paths)
-    if _advisory_bypassed and not skip_tests and not _doc_only:
+    _managed_needs_proof = _managed_candidate_needs_proof(ctx)
+    if (_advisory_bypassed and not skip_tests and not _doc_only) or _managed_needs_proof:
         try:
             ctx.emit_progress_fn(
-                "Advisory bypassed — running test preflight before triad + scope review..."
+                "Managed candidate lacks a pre-commit test proof — running the mandatory "
+                "hermetic suite before review..."
+                if _managed_needs_proof
+                else "Advisory bypassed — running test preflight before triad + scope review..."
             )
         except Exception:
             pass
         test_err = _run_review_preflight_tests(ctx)
         if test_err:
-            msg = (
-                "⚠️ TESTS_PREFLIGHT_BLOCKED: Tests must pass before triad + scope review "
-                "when advisory is bypassed.\n"
-                "Fix the failures below, then re-run commit_reviewed (or drop "
-                "skip_advisory_review=True to run the full advisory flow).\n"
-                "Set OUROBOROS_PRE_PUSH_TESTS=0 to skip tests entirely.\n\n"
-                f"{test_err}"
-            )
+            msg = _tests_preflight_block_message(_managed_needs_proof, test_err)
             try:
                 run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
             except Exception:
@@ -638,7 +817,7 @@ def _run_reviewed_stage_cycle(
                 block_details=msg,
                 duration_sec=time.time() - commit_start,
                 # Preflight, not a review verdict: must neither inflate nor
-                # reset the identical-diff blocked-attempt cap streak.
+                # reset the identical-diff refusal streak.
                 phase="preflight",
             )
             _mark_failed_bypass_advisory_stale(ctx, commit_message, advisory_paths)
@@ -647,6 +826,15 @@ def _run_reviewed_stage_cycle(
                 "message": msg,
                 "block_reason": "tests_preflight_blocked",
             }
+        # Q10 single-run: this green preflight IS the managed pre-commit proof.
+        # Process-held on ctx (the gates' authority, F2); the durable tx copy
+        # written alongside is forensic telemetry only.
+        try:
+            from supervisor.update_merge import record_managed_tests_proof
+
+            record_managed_tests_proof(ctx)
+        except Exception:
+            log.debug("managed tests evidence recording failed", exc_info=True)
     elif _advisory_bypassed:
         if skip_tests and _doc_only:
             _skip_reason = "skip_tests + doc_only"
@@ -660,7 +848,76 @@ def _run_reviewed_stage_cycle(
             )
         except Exception:
             pass
+    return None
 
+
+def _run_reviewed_stage_cycle(
+    ctx: ToolContext,
+    commit_message: str,
+    commit_start: float,
+    *,
+    paths: Optional[List[str]] = None,
+    skip_advisory_review: bool = False,
+    skip_advisory_pre_review: bool = False,
+    skip_tests: bool = False,
+    goal: str = "",
+    scope: str = "",
+    review_rebuttal: str = "",
+    came_from_detached_checkout: bool = False,
+    require_release_tag: bool = True,
+) -> Dict[str, Any]:
+    skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
+    # In-attempt semantics for the managed subject↔binding assertion: the set
+    # must only ever hold subject trees built during THIS attempt. The paid
+    # path resets it again inside run_parallel_review (harmless double reset),
+    # but the advisory free-replay branch skips that dispatch entirely — a
+    # stale set left by a previous paid attempt would then be compared against
+    # the CURRENT binding tree and permanently block the free-replay commit
+    # (typed review_subject_binding_mismatch on every retry).
+    ctx._last_review_subject_trees = set()
+    # The per-attempt subject memo shares the attempt boundary (C5): a new
+    # attempt must rebuild against the fresh candidate.
+    ctx._managed_review_subject_memo = {}
+    classification_paths, advisory_paths, stage_error = _stage_candidate_for_review(
+        ctx,
+        commit_message,
+        commit_start,
+        paths=paths,
+        came_from_detached_checkout=came_from_detached_checkout,
+    )
+    if stage_error is not None:
+        return stage_error
+    protected_staged_paths = protected_paths_in(classification_paths)
+    runtime_mode = _current_runtime_mode()
+    if (
+        protected_staged_paths
+        and not mode_allows_protected_write(runtime_mode)
+        and not _authorized_managed_update_resolver(ctx)
+    ):
+        msg = _protected_paths_block_message(
+            protected_staged_paths,
+            runtime_mode=runtime_mode,
+            action="commit",
+        )
+        try:
+            run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
+        except Exception:
+            pass
+        _record_commit_attempt(
+            ctx,
+            commit_message,
+            "blocked",
+            block_reason="core_protection_blocked",
+            block_details=msg,
+            duration_sec=time.time() - commit_start,
+            critical_findings=[],
+            phase="preflight",
+        )
+        return {
+            "status": "blocked",
+            "message": msg,
+            "block_reason": "core_protection_blocked",
+        }
     pre_fingerprint = _fingerprint_staged_diff(pathlib.Path(ctx.repo_dir))
     if not pre_fingerprint.get("ok"):
         return {
@@ -676,6 +933,31 @@ def _run_reviewed_stage_cycle(
             "pre_fingerprint": pre_fingerprint,
             "post_fingerprint": {},
         }
+    # Max-Review-Cycles free gate: BEFORE the advisory-freshness gate (an
+    # identical resubmission must not be told to buy a fresh SDK advisory) and
+    # before any paid dispatch. A refusal is free; under advisory it becomes a
+    # free replay marker instead of a block. The fingerprint is computed early
+    # because this gate needs it; the binding-precondition check keeps its
+    # original place AFTER the advisory/tests gate (wording-4, I1).
+    gate_outcome = _free_cycle_gate(
+        ctx, commit_message, commit_start,
+        pre_fingerprint=pre_fingerprint, review_rebuttal=review_rebuttal,
+    )
+    advisory_replay: Optional[Dict[str, Any]] = None
+    if gate_outcome is not None:
+        if "advisory_replay" in gate_outcome:
+            advisory_replay = gate_outcome
+        else:
+            return gate_outcome
+    advisory_gate_outcome = _advisory_and_tests_gate(
+        ctx, commit_message, commit_start,
+        classification_paths=classification_paths,
+        advisory_paths=advisory_paths,
+        skip_advisory_pre_review=skip_advisory_pre_review,
+        skip_tests=skip_tests,
+    )
+    if advisory_gate_outcome is not None:
+        return advisory_gate_outcome
     binding_error = _review_binding_precondition_error(
         pre_fingerprint, require_release_tag=require_release_tag
     )
@@ -698,12 +980,6 @@ def _run_reviewed_stage_cycle(
             "pre_fingerprint": pre_fingerprint,
             "post_fingerprint": {},
         }
-    cap_refusal = _refuse_capped_attempt(
-        ctx, commit_message, commit_start,
-        pre_fingerprint=pre_fingerprint, review_rebuttal=review_rebuttal,
-    )
-    if cap_refusal is not None:
-        return cap_refusal
     _record_commit_attempt(
         ctx,
         commit_message,
@@ -712,15 +988,61 @@ def _run_reviewed_stage_cycle(
         phase="review",
         pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
         fingerprint_status="pending",
+        # The PAID fact is deliberately NOT recorded here: it lands write-ahead
+        # at the first PHYSICAL reviewer dispatch (_install_paid_dispatch_stamp
+        # below, plan-review precedent), so an attempt where BOTH packs refuse
+        # at assembly — and a free advisory replay, which dispatches nothing —
+        # stays unpaid. The per-root-task cycle count is derived from these
+        # rows, never from a separate counter file (P7).
+        rebuttal_sha256=str(getattr(ctx, "_current_review_rebuttal_sha256", "") or ""),
+        review_contract_fingerprint=str(
+            getattr(ctx, "_current_review_contract_fingerprint", "") or ""
+        ),
     )
 
-    review_err, scope_result, triad_block_reason, triad_advisory = _run_parallel_review(
-        ctx,
-        commit_message,
-        goal=goal,
-        scope=scope,
-        review_rebuttal=review_rebuttal,
-    )
+    if advisory_replay is not None:
+        # ADVISORY free outcome: disclose loudly and let the commit proceed
+        # without buying another triad+scope run. Honest wording per cause
+        # (wording-3): an identical-diff replay REUSES a recorded verdict; a
+        # ceiling exhaustion on NEW bytes has no verdict to reuse — the diff
+        # ships without a fresh review and the disclosure must say so.
+        review_err, scope_result, triad_block_reason, triad_advisory = None, None, "", []
+        replay_reason = str(advisory_replay.get("replay_reason") or "")
+        if replay_reason == IDENTICAL_DIFF_BLOCK_REASON:
+            progress_note = (
+                "Max Review Cycles: identical staged diff — reusing the recorded "
+                "review verdict, no paid triad+scope dispatch."
+            )
+        else:
+            progress_note = (
+                "Max Review Cycles: paid-cycle ceiling exhausted — no review outcome "
+                "exists for this diff; the commit proceeds without a fresh triad+scope "
+                "review under advisory enforcement."
+            )
+        disclosure = (
+            "Review enforcement=Advisory: no new triad+scope review was bought for "
+            f"this commit ({replay_reason}). "
+            + str(advisory_replay.get("advisory_replay") or "")
+        )
+        advisory_list = getattr(ctx, "_review_advisory", None)
+        if isinstance(advisory_list, list):
+            advisory_list.append(disclosure)
+        try:
+            ctx.emit_progress_fn(progress_note)
+        except Exception:
+            pass
+    else:
+        _install_paid_dispatch_stamp(ctx, commit_message, commit_start, pre_fingerprint)
+        try:
+            review_err, scope_result, triad_block_reason, triad_advisory = _run_parallel_review(
+                ctx,
+                commit_message,
+                goal=goal,
+                scope=scope,
+                review_rebuttal=review_rebuttal,
+            )
+        finally:
+            ctx._review_paid_stamp = None
     blocked, combined_msg, block_reason, combined_findings, scope_advisory = _aggregate_review_verdict(
         review_err,
         scope_result,
@@ -766,7 +1088,24 @@ def _run_reviewed_stage_cycle(
             "pre_fingerprint": pre_fingerprint,
             "post_fingerprint": post_fingerprint,
         }
+    _subject_mismatch = _subject_binding_mismatch_outcome(
+        ctx, commit_message, commit_start, pre_fingerprint, post_fingerprint
+    )
+    if _subject_mismatch is not None:
+        return _subject_mismatch
     if blocked:
+        # Typed block-row classification (Q16/Δ5): a reviewer VERDICT builds
+        # the identical-diff refusal streak; an INFRA fact (fit/quorum/
+        # transport/sub-floor) never does and retries freely. Money is a
+        # separate axis: paid was stamped at PHYSICAL dispatch, so a
+        # dispatched-then-infra-blocked wave still counts toward the ceiling,
+        # while an assembly-refused (undispatched) infra block stays free.
+        block_class = classify_review_block(
+            triad_blocked=bool(review_err),
+            triad_block_reason=str(triad_block_reason or ""),
+            scope_blocked=bool(scope_result is not None and getattr(scope_result, "blocked", False)),
+            scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}) or {},
+        )
         return {
             "status": "blocked",
             "message": _finalize_blocked_review(
@@ -778,6 +1117,7 @@ def _run_reviewed_stage_cycle(
                 combined_findings=combined_findings,
                 pre_fingerprint=pre_fingerprint,
                 post_fingerprint=post_fingerprint,
+                block_class=block_class,
             ),
             "block_reason": block_reason,
             "pre_fingerprint": pre_fingerprint,
@@ -1113,6 +1453,29 @@ def _managed_commit_gate_failure(reason: str, message: str) -> str:
     )
 
 
+def _managed_committing_phase_error(managed_tx: Dict[str, Any]) -> Optional[str]:
+    """Enter ``committing_assisted`` via a merge-write on the FRESH durable tx.
+
+    Returns ``None`` on success. A CORRUPT marker returns the typed failure
+    message WITHOUT writing (synthesis F1): silently replacing an unreadable
+    marker with the caller's stale snapshot would destroy the corruption
+    evidence ``read_update_tx_strict`` fails closed to preserve — the refusal
+    here is consistent with the corrupt-marker block ``managed_assisted_tx_for``
+    already applies at the commit preflight."""
+    from supervisor.update_merge import UpdateTxCorrupt, update_tx_phase
+
+    try:
+        update_tx_phase(managed_tx, {"phase": "committing_assisted"})
+        return None
+    except UpdateTxCorrupt as exc:
+        return (
+            "⚠️ MANAGED_UPDATE_ERROR: the durable update tx marker is corrupt "
+            f"({exc}). Refusing the commit-phase transition: the marker bytes are "
+            "preserved for recovery, nothing was committed, and restart/recovery "
+            "is required."
+        )
+
+
 def _managed_post_commit_tests_gate(
     ctx, commit_message: str, commit_start: float, skip_tests: bool,
     test_warning_ref, managed_tx: Dict[str, Any],
@@ -1122,12 +1485,36 @@ def _managed_post_commit_tests_gate(
     suite rolls the assisted merge back instead of shipping a warning (ordinary
     commits keep the warning-only contract later in the flow). The gate is
     MANDATORY: neither the caller's skip_tests nor OUROBOROS_PRE_PUSH_TESTS=0
-    can wave a managed merge through untested. The terminal record carries the
+    can wave a managed merge through untested — but the mandate is "the full
+    suite provably ran green on the exact committed tree", not "run it twice":
+    when the resolver's pre-commit run (advisory preflight or the compensating
+    bypass preflight) pinned a PROCESS-HELD proof for a tree byte-identical to
+    the committed one, that proof is reused and the duplicate run is skipped
+    (Q10). The authority is the host-written ctx record (synthesis F2) — the
+    durable ``tests_evidence`` tx copy is resolver-writable forensics and a
+    forged tree there never suppresses this run; a restart between the proof
+    and the commit re-runs the suite once. The terminal record carries the
     same review metadata/fingerprints as every sibling failure record, so an
     operator can reconstruct WHICH reviewed revision the gate rejected."""
     if not managed_tx:
         return None
     del skip_tests  # deliberately ignored for managed merges
+    try:
+        committed_tree = run_cmd(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=ctx.repo_dir
+        ).strip()
+    except Exception:
+        committed_tree = ""
+    proofs = getattr(ctx, "_managed_tests_proof_trees", None) or ()
+    if committed_tree and committed_tree in proofs:
+        try:
+            ctx.emit_progress_fn(
+                "Managed post-commit tests: reusing the green pre-commit hermetic "
+                "run (exact tree match) — no duplicate suite run."
+            )
+        except Exception:
+            pass
+        return None
     post_test_error = _post_commit_result(
         ctx, commit_message, False, test_warning_ref, force=True,
     )
@@ -2258,14 +2645,20 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             # entry that --diff-filter=U misses), then mark the crash-window phase before the
             # native 2-parent commit (MERGE_HEAD is still set, so `git commit` records both
             # parents — reviewed pre_update_sha + target).
-            from supervisor.update_merge import managed_assisted_marker_check, write_update_tx
+            from supervisor.update_merge import managed_assisted_marker_check
 
             _mok, _merr = managed_assisted_marker_check()
             if not _mok:
                 return _fail(_merr)
-            _committing = dict(_managed_tx)
-            _committing["phase"] = "committing_assisted"
-            write_update_tx(_committing)
+            # Merge-write onto the FRESH durable tx: ``_managed_tx`` was
+            # snapshotted BEFORE the stage cycle, and the compensating tests
+            # preflight records ``tests_evidence`` into the durable marker
+            # mid-attempt — a wholesale snapshot write here would drop that
+            # record. A CORRUPT marker refuses the transition (F1): nothing
+            # has been committed yet, so fail closed like the preflight does.
+            _phase_error = _managed_committing_phase_error(_managed_tx)
+            if _phase_error:
+                return _fail(_phase_error)
 
         try:
             run_cmd(["git", "commit", "-m", commit_message], cwd=ctx.repo_dir)
@@ -2798,7 +3191,7 @@ def get_tools() -> List[ToolEntry]:
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of task-attributed clean-at-baseline paths. Omitted computes the full attributed candidate set; an empty set never stages the whole tree."},
                 "skip_tests": {"type": "boolean", "default": False, "description": "Skip pre-commit tests."},
                 "review_rebuttal": {"type": "string", "default": "",
-                    "description": "If previous commit was blocked by reviewers and you disagree, include counter-argument."},
+                    "description": "If the previous commit was blocked by reviewers and you disagree, include a counter-argument. The rebuttal is identified by CONTENT: a rebuttal new to the current identical-diff streak buys exactly ONE paid re-review of the unchanged diff; resubmitting the same rebuttal (or none) is refused for free, quoting the recorded verdict."},
                 "skip_advisory_review": {"type": "boolean", "default": False,
                     "description": skip_advisory_description},
                 "goal": {"type": "string", "default": "",
@@ -2814,7 +3207,8 @@ def get_tools() -> List[ToolEntry]:
                 "commit_message": {"type": "string"},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of task-attributed clean-at-baseline paths. Omitted computes candidates; empty never means git add -A."},
                 "skip_tests": {"type": "boolean", "default": False, "description": "Skip pre-commit tests."},
-                "review_rebuttal": {"type": "string", "default": ""},
+                "review_rebuttal": {"type": "string", "default": "",
+                    "description": "Content-hashed counter-argument to a prior review block: a NEW rebuttal buys exactly one paid re-review of an unchanged diff; a repeated one is refused free."},
                 "skip_advisory_review": {"type": "boolean", "default": False,
                     "description": skip_advisory_description},
                 "goal": {"type": "string", "default": ""},

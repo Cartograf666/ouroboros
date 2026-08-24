@@ -48,22 +48,36 @@ from ouroboros.tools.shell_guards import (
     runtime_data_guard_targets,
     shell_writer_targets_protected,
     workspace_executor_state_write_block,
+    directory_destination_child_name,
+    directory_destination_pairs,
     writer_target_tokens,
+)
+from ouroboros.tools.deliverables_shell import (
+    direct_deliverable_target_block,
+    lexical_user_files_block_reason,
 )
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.protected_artifacts import shell_block_reason as protected_artifact_shell_block_reason
 from ouroboros.git_shell_policy import run_shell_git_block_reason, workspace_git_safety_violation
 from ouroboros.tool_access import (
+    active_tool_profile,
     binding_targets_system_repo,
     build_resolved_resource_binding,
     canonical_repo_relative_path,
+    decide_tool_access,
+    _deliverables_root_lexical,
+    _deliverables_root_lexical_alias,
+    _lexical_path_is_relative_to_casefold,
     is_external_workspace,
     light_cognitive_or_root_redirect,
     normalize_root,
     normalize_root_relative,
+    _path_is_relative_to_casefold,
+    resource_root_path,
     resolve_shell_cwd,
     shell_cwd_block_message,
     UserFilesPathBlockedError,
+    user_files_path_block_reason,
     workspace_mode_block_reason,
 )
 from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
@@ -128,9 +142,26 @@ def _executor_backend_candidate_allowed(ctx: Any, candidate: str, allowed_roots:
         if executor_ref is None:
             return False
         resolved = _executor_map_backend_path(executor_ref, candidate)
-        return any(resolved.is_relative_to(root) for root in allowed_roots)
+        return any(
+            resolved.is_relative_to(root) or _path_is_relative_to_casefold(resolved, root)
+            for root in allowed_roots
+        )
     except Exception:
         return False
+
+
+def _executor_backend_candidate_path(ctx: Any, candidate: str) -> pathlib.Path | None:
+    """Map one backend spelling lexically, preserving descendant symlinks."""
+    try:
+        from ouroboros.workspace_executor import executor_ref_from_ctx as _executor_ref_from_ctx
+        from ouroboros.workspace_executor import map_backend_path_lexical as _executor_map_backend_path_lexical
+
+        executor_ref = _executor_ref_from_ctx(ctx)
+        if executor_ref is None:
+            return None
+        return _executor_map_backend_path_lexical(executor_ref, candidate)
+    except Exception:
+        return None
 
 
 def _detect_runtime_mode_elevation(text_lower: str) -> bool:
@@ -149,7 +180,12 @@ _SUBAGENT_SHELL_SECRET_MARKERS = (
     # from a workspace cwd) needs the slash-less marker too.
     "/data/settings.json", "data/settings.json", "ouroboros/data/settings", "file1.txt",
     # Universal credential/secret/control files (relative or absolute).
-    ".env", ".git/config", ".git/credentials", "credentials.json", "tokens.json",
+    # ouroboros-update-tx.json is the managed-update tx marker (.git/…): owner
+    # control state, mirrored on .git/config. Subagent shell only — the
+    # authorized resolver is the MAIN agent and the supervisor/host writers go
+    # through supervisor.update_merge, so neither is affected (synthesis F3).
+    ".env", ".git/config", ".git/credentials", "ouroboros-update-tx.json",
+    "credentials.json", "tokens.json",
     "/.ssh/", ".ssh/", "id_rsa", "id_ed25519", ".netrc", ".npmrc", ".pgpass", ".aws/",
 )
 
@@ -245,15 +281,44 @@ def _managed_update_code_tool_block(ctx: Any, name: str) -> str:
 
 
 def _authorized_managed_update_resolver(ctx: Any) -> bool:
-    """Whether this task is the durable tx-authorized assisted resolver."""
-    try:
-        from supervisor.update_merge import authorized_assisted_task
+    """Whether this task is the durable tx-authorized assisted resolver.
 
-        return bool(authorized_assisted_task(
+    Fail-closed bool for every authority consumer (False = no extra powers).
+    The AUTHORITY-READ failure is additionally distinguished from an honest
+    "not the resolver" via a typed ctx marker (``_managed_authority_read_error``:
+    set on an unreadable read AND on a corrupt tx marker, cleared on every
+    healthy evaluation), so the review-subject builder can fail LOUDLY instead
+    of silently reviewing a possibly-managed candidate as an ordinary full
+    staged capture."""
+    try:
+        from supervisor.update_merge import authorized_assisted_task_strict
+
+        marker_status, tx = authorized_assisted_task_strict(
             getattr(ctx, "task_id", ""),
             getattr(ctx, "task_metadata", None),
-        ))
-    except Exception:
+        )
+        try:
+            if marker_status == "corrupt":
+                # A tx marker EXISTS but cannot be parsed: authority stays
+                # False (fail-closed) for every bool consumer, but the loud
+                # A4 channel must fire — clearing the marker here would let
+                # the review subject silently treat a possibly-managed
+                # candidate as an ordinary full staged diff.
+                setattr(
+                    ctx, "_managed_authority_read_error",
+                    "update_tx_corrupt: the managed update transaction marker "
+                    "exists but could not be parsed",
+                )
+            else:
+                setattr(ctx, "_managed_authority_read_error", "")
+        except Exception:
+            pass
+        return bool(tx)
+    except Exception as exc:
+        try:
+            setattr(ctx, "_managed_authority_read_error", repr(exc))
+        except Exception:
+            pass
         return False
 
 
@@ -871,6 +936,48 @@ def _disabled_tools(ctx: Any) -> frozenset:
     return frozenset(names)
 
 
+def _presence_tool_allowed(ctx: Any, name: str) -> bool:
+    """Positive ceiling for host-admitted presence work; absent is byte-compatible."""
+
+    from ouroboros.presence_authority import (
+        presence_ceiling_allows_tool,
+        presence_ceiling_from_context,
+    )
+
+    ceiling = presence_ceiling_from_context(ctx)
+    if name in {"presence_finish", "presence_cancel_work"}:
+        return ceiling is not None
+    return ceiling is None or presence_ceiling_allows_tool(ceiling, name)
+
+
+def _presence_binding_allowed(ctx: Any, binding: Any) -> bool:
+    from ouroboros.presence_authority import (
+        presence_ceiling_allows_binding,
+        presence_ceiling_from_context,
+    )
+
+    ceiling = presence_ceiling_from_context(ctx)
+    if ceiling is None or binding is None:
+        return True
+    items = binding if isinstance(binding, tuple) else (binding,)
+    return bool(items) and all(presence_ceiling_allows_binding(ceiling, item) for item in items)
+
+
+def _presence_bound_args(ctx: Any, name: str, args: Any) -> tuple[dict[str, Any], str]:
+    try:
+        from ouroboros.presence_authority import apply_presence_argument_bindings
+
+        bound = apply_presence_argument_bindings(ctx, name, dict(args or {}))
+        if not _presence_tool_allowed(ctx, name):
+            return {}, (
+                "⚠️ PRESENCE_CAPABILITY_BLOCKED: "
+                f"{name!r} is outside this presence task's positive capability ceiling."
+            )
+        return bound, ""
+    except Exception as exc:
+        return {}, f"⚠️ PRESENCE_ARGUMENT_BINDING_BLOCKED: {exc}"
+
+
 _GITHUB_TOKEN_TOOLS = frozenset({
     "list_github_prs",
     "get_github_pr",
@@ -1026,7 +1133,18 @@ def _prepare_public_builtin_args(entry: "ToolEntry", args: dict[str, Any]) -> st
 
     _normalize_tool_call_args(entry, args)
     public_params = set(_entry_public_params(entry))
-    if _entry_has_public_param_schema(entry) and any(key not in public_params for key in args):
+    # A handler may name a bounded set of execution-only legacy parameters.  They
+    # remain absent from its model-visible schema and are therefore usable only by
+    # callers replaying the former wire shape through this real registry path.  The
+    # handler still owns deterministic migration/refusal; this generic seam neither
+    # chooses a route nor special-cases a tool name.
+    hidden_legacy = {
+        str(name)
+        for name in (getattr(entry.handler, "_hidden_legacy_params", ()) or ())
+        if str(name)
+    }
+    accepted_params = public_params | hidden_legacy
+    if _entry_has_public_param_schema(entry) and any(key not in accepted_params for key in args):
         return _format_tool_arg_error(entry)
     try:
         inspect.signature(entry.handler).bind(object(), **args)
@@ -1502,8 +1620,9 @@ class ToolRegistry:
 
     _FROZEN_TOOL_MODULES = [
         "antigravity", "browser", "ci", "claude_advisory_review", "compact_context", "control",
-        "core", "delegate", "edit_ops", "evolution_stats", "git", "git_pr", "git_rollback", "github",
-        "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
+        "core", "delegate", "edit_ops", "evolution_stats", "execution_plan", "followup",
+        "git", "git_pr", "git_rollback", "github",
+        "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal", "presence",
         "recent_tasks",
         "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",
         "skill_preflight", "subagent_integration", "task_tree", "tool_discovery", "verify", "vision",
@@ -1578,6 +1697,59 @@ class ToolRegistry:
             and str(getattr(tc, "surface", "") or "") == "self_worktree"
         )
 
+    def _deliverables_shell_target_allowed(
+        self,
+        candidate: pathlib.Path,
+        *,
+        lexical_candidate: pathlib.Path | None = None,
+    ) -> bool:
+        """Return whether a top-level user-files shell may write this target.
+
+        The workspace shell guard owns the process-root boundary.  This narrow
+        exception reuses the user-files policy and the configured Deliverables
+        root for the one existing top-level profile that already has
+        ``user_files:shell``.  Delegated children never inherit the carve-out.
+        """
+        if self._is_acting_subagent() or self._is_local_readonly_subagent():
+            return False
+        profile = active_tool_profile(self._ctx)
+        if not decide_tool_access(
+            profile=profile,
+            root="user_files",
+            operation="shell",
+        ).allow:
+            return False
+        try:
+            if lexical_user_files_block_reason(lexical_candidate or candidate):
+                return False
+            target = pathlib.Path(candidate).resolve(strict=False)
+            deliverables = resource_root_path(self._ctx, "deliverables")
+            # Validate the configured container itself before admitting a child.
+            # A root that contains a protected repo/data drive is not a genuine
+            # sibling; checking only the final file would otherwise turn its
+            # harmless-looking sibling paths into a broad parent escape.
+            if user_files_path_block_reason(self._ctx, deliverables):
+                return False
+            if not (
+                target.is_relative_to(deliverables)
+                or _path_is_relative_to_casefold(target, deliverables)
+            ):
+                return False
+            try:
+                deliverable_binding = build_resolved_resource_binding(
+                    self._ctx,
+                    root="user_files",
+                    operation="shell",
+                    path=str(target),
+                )
+            except (OSError, TypeError, ValueError, RuntimeError):
+                return False
+            if not _presence_binding_allowed(self._ctx, deliverable_binding):
+                return False
+            return not user_files_path_block_reason(self._ctx, target)
+        except (OSError, TypeError, ValueError, RuntimeError):
+            return False
+
     def _acting_tool_grants(self) -> set:
         tc = normalize_task_constraint(getattr(self._ctx, "task_constraint", None))
         return set(getattr(tc, "external_tool_grants", ()) or ()) if tc else set()
@@ -1597,6 +1769,7 @@ class ToolRegistry:
             e.name
             for e in self._entries.values()
             if e.name not in disabled  # declarative tool policy (task_contract.disabled_tools)
+            if _presence_tool_allowed(self._ctx, e.name)
             if _builtin_tool_availability(e.name, self._ctx)[0]
             if not local_readonly_subagent or e.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
             if not acting_subagent or e.name in ACTING_SUBAGENT_TOOL_NAMES
@@ -1637,7 +1810,8 @@ class ToolRegistry:
         elif self._is_acting_subagent():
             # Advertise only what the acting profile can actually execute: writes go
             # ONLY to the isolated surface (active_workspace); reads use the read roots;
-            # browser evaluate is unavailable (rejected at execute time).
+            # browser evaluate remains available on the current page; the browser
+            # handler retains its owner/self-lowering checks.
             if entry.name in _ROOT_ARG_REPO_WRITE_TOOLS or entry.name in _GENERIC_VCS_TARGET_TOOLS:
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
@@ -1651,12 +1825,6 @@ class ToolRegistry:
                 allowed = {"active_workspace"} if entry.name in {"search_code", "query_code"} else {"active_workspace", "runtime_data", "task_drive", "artifact_store"}
                 if isinstance(root_schema.get("enum"), list):
                     root_schema["enum"] = [root for root in root_schema["enum"] if root in allowed]
-            elif entry.name == "browser_action":
-                schema = copy.deepcopy(entry.schema)
-                props = schema.get("parameters", {}).get("properties", {})
-                action_schema = props.get("action", {})
-                if isinstance((action_enum := action_schema.get("enum")), list):
-                    action_schema["enum"] = [name for name in action_enum if name != "evaluate"]
         return {"type": "function", "function": schema}
 
     def _schemas_for_entry(self, entry: ToolEntry) -> List[Dict[str, Any]]:
@@ -1679,6 +1847,7 @@ class ToolRegistry:
             schema
             for entry in self._entries.values()
             if entry.name not in disabled_tools  # declarative tool policy (task_contract.disabled_tools)
+            if _presence_tool_allowed(self._ctx, entry.name)
             if entry.name not in unavailable_tools
             if not local_readonly_subagent or entry.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
             if not acting_subagent or entry.name in ACTING_SUBAGENT_TOOL_NAMES
@@ -1723,6 +1892,7 @@ class ToolRegistry:
                         }
                         for tool in _ext_tools.values()
                         if _ext_is_live(str(tool.get("skill") or ""), capability_root, repo_path=str(tool.get("skills_repo_path") or "") or None)
+                        and _presence_tool_allowed(self._ctx, tool["name"])
                         and (not acting_subagent or tool["name"] in acting_grants)
                     ]
             except Exception as exc:
@@ -1746,6 +1916,7 @@ class ToolRegistry:
                             "function": {"name": tool["name"], "description": tool.get("description", ""), "parameters": tool.get("schema", {"type": "object", "properties": {}})},
                         }
                         for tool in _mgr.list_tools_for_registry()
+                        if _presence_tool_allowed(self._ctx, tool["name"])
                         if not acting_subagent or tool["name"] in acting_grants
                     ]
                     # D1: an enabled+configured server returning zero tools WITHOUT
@@ -1772,6 +1943,8 @@ class ToolRegistry:
         result = []
         for e in self._entries.values():
             if e.name in disabled_tools:  # declarative tool policy (task_contract.disabled_tools)
+                continue
+            if not _presence_tool_allowed(self._ctx, e.name):
                 continue
             if e.name in unavailable_tools:
                 continue
@@ -1816,6 +1989,8 @@ class ToolRegistry:
         # residual, not built.
         if requested in _disabled_tools(self._ctx):
             return "disabled by this task's contract (disabled_tools)"
+        if not _presence_tool_allowed(self._ctx, requested):
+            return "outside this presence task's positive capability ceiling"
         if requested not in self._entries:
             return None
         available, reason, _detail = _builtin_tool_availability(requested, self._ctx)
@@ -1839,6 +2014,8 @@ class ToolRegistry:
         # Declarative tool policy applies across ALL discovery sources (built-in, extension, MCP),
         # so enable_tools/discovery can never surface a disabled name — consistent with schemas()/execute().
         if requested in _disabled_tools(self._ctx):
+            return None
+        if not _presence_tool_allowed(self._ctx, requested):
             return None
         entry = self._entries.get(requested)
         if entry:
@@ -1977,7 +2154,7 @@ class ToolRegistry:
         return f"{safety_msg}\n\n---\n{result}" if safety_msg else result
 
     def _protected_shell_block(
-        self, raw_cmd, cmd_path_lower, binding, acting_self_worktree,
+        self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
     ) -> Optional[str]:
         """Apply payload/core write guards to the selected physical target."""
         items = _binding_items(binding)
@@ -1992,7 +2169,7 @@ class ToolRegistry:
                 *SKILL_PAYLOAD_CONTROL_FILENAMES,
                 *(SKILL_PAYLOAD_CONTROL_DIRNAMES - {"__pycache__"}),
             )
-        ) and shell_has_write_indicator(raw_cmd):
+        ) and writeish:
             return (
                 "⚠️ SAFETY_VIOLATION: Shell command would modify a skill "
                 "provenance / launcher seed / dependency marker (.clawhub.json, "
@@ -2254,6 +2431,7 @@ class ToolRegistry:
         raw_cmd: Any,
         cmd_path_lower: str,
         explicit_write_targets: list[str],
+        write_target_argvs: list[list[str]],
         executable_path_tokens: set[str],
         runtime_mode: str,
         acting_subagent: bool,
@@ -2287,6 +2465,82 @@ class ToolRegistry:
                     allowed_data_roots.append(resolved_root)
         if selected.root in {"task_drive", "artifact_store"}:
             allowed_data_roots.append(selected_base)
+        # Executor-backed commands use backend path spellings (for example
+        # ``/deliverables/report.html``), while the policy roots above are host
+        # paths. Keep the configured Deliverables root separate from the generic
+        # allow-root list: every descendant must still pass the target-specific
+        # user-files policy (hidden/credential/symlink checks) below.
+        deliverables_root_lexical: pathlib.Path | None = None
+        deliverables_root_lexical_alias: pathlib.Path | None = None
+        deliverables_root_physical: pathlib.Path | None = None
+        try:
+            candidate_deliverables = resource_root_path(self._ctx, "deliverables")
+            # Retain the configured spelling even when the root itself is
+            # malformed or protected. Descendants must then take the
+            # target-specific path and fail closed before a broader
+            # workspace/data allow-root can accidentally admit them.
+            deliverables_root_physical = pathlib.Path(candidate_deliverables).resolve(strict=False)
+            deliverables_root_lexical = _deliverables_root_lexical()
+            deliverables_root_lexical_alias = _deliverables_root_lexical_alias()
+        except (OSError, TypeError, ValueError, RuntimeError):
+            pass
+
+        def _deliverables_target_decision(path: pathlib.Path) -> bool | None:
+            """Decide Deliverables descendants before generic root admission.
+
+            Deliverables can be configured inside the selected workspace.  A
+            generic workspace-root fast path must not skip the user-files
+            hidden/credential/symlink checks for such a target. ``None`` means
+            that the candidate is outside Deliverables and may use the normal
+            workspace-root checks.
+            """
+            if deliverables_root_lexical is None:
+                return None
+            try:
+                lexical_path = pathlib.Path(path).expanduser()
+                if not lexical_path.is_absolute():
+                    lexical_path = pathlib.Path(os.path.abspath(lexical_path))
+                in_deliverables = (
+                    deliverables_root_lexical is not None
+                    and (
+                        lexical_path.is_relative_to(deliverables_root_lexical)
+                        or _lexical_path_is_relative_to_casefold(lexical_path, deliverables_root_lexical)
+                        or _lexical_path_is_relative_to_casefold(
+                            lexical_path, deliverables_root_lexical_alias,
+                        )
+                        or _lexical_path_is_relative_to_casefold(
+                            lexical_path, deliverables_root_physical,
+                        )
+                    )
+                )
+            except (OSError, TypeError, ValueError):
+                return False
+            resolved_path = pathlib.Path(path).resolve(strict=False)
+            physically_in_deliverables = (
+                deliverables_root_physical is not None
+                and (
+                    resolved_path.is_relative_to(deliverables_root_physical)
+                    or _path_is_relative_to_casefold(
+                        resolved_path, deliverables_root_physical,
+                    )
+                )
+            )
+            if not in_deliverables and not physically_in_deliverables:
+                return None
+            return self._deliverables_shell_target_allowed(
+                resolved_path,
+                lexical_candidate=lexical_path,
+            )
+
+        if direct_target_block := direct_deliverable_target_block(
+            self._ctx,
+            work_dir,
+            write_target_argvs,
+            deliverables_root_physical,
+            _deliverables_target_decision,
+        ):
+            return direct_target_block
+
         # Acting subagents must write ONLY inside their isolated surface, so pro
         # mode does NOT grant them the outside-workspace absolute-path passthrough.
         pro_workspace_passthrough = (
@@ -2352,6 +2606,24 @@ class ToolRegistry:
                 if candidate == "/dev/null":
                     continue
                 if is_absolute_path_text(candidate):
+                    mapped_executor_lexical = _executor_backend_candidate_path(self._ctx, candidate)
+                    if mapped_executor_lexical is not None:
+                        mapped_executor = mapped_executor_lexical.resolve(strict=False)
+                        deliverables_decision = _deliverables_target_decision(mapped_executor_lexical)
+                        if deliverables_decision is not None:
+                            if deliverables_decision:
+                                continue
+                            return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell target is not an allowed Deliverables path."
+                        if any(mapped_executor.is_relative_to(root) for root in allowed_relative_roots):
+                            continue
+                        if any(mapped_executor.is_relative_to(root) for root in allowed_data_roots):
+                            continue
+                        for protected_path in protected_paths:
+                            try:
+                                mapped_executor.relative_to(protected_path)
+                                return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
+                            except Exception:
+                                pass
                     if _executor_backend_candidate_allowed(
                         self._ctx,
                         candidate,
@@ -2374,6 +2646,14 @@ class ToolRegistry:
                             resolved = pathlib.Path(candidate).resolve(strict=False)
                         except Exception:
                             continue
+                        # Keep the pre-resolution spelling so a symlink child
+                        # cannot resolve into another allowed root and bypass
+                        # the Deliverables policy.
+                        deliverables_decision = _deliverables_target_decision(pathlib.Path(candidate))
+                        if deliverables_decision is not None:
+                            if deliverables_decision:
+                                continue
+                            return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell target is not an allowed Deliverables path."
                         if any(resolved.is_relative_to(root) for root in allowed_relative_roots):
                             continue
                         if any(resolved.is_relative_to(root) for root in allowed_data_roots):
@@ -2387,6 +2667,11 @@ class ToolRegistry:
                         if not pro_workspace_passthrough:
                             return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root."
                         continue
+                    deliverables_decision = _deliverables_target_decision(pathlib.Path(candidate))
+                    if deliverables_decision is not None:
+                        if deliverables_decision:
+                            continue
+                        return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell target is not an allowed Deliverables path."
                     if any(path_text_is_inside(candidate, root) for root in allowed_relative_roots):
                         continue
                     if any(path_text_is_inside(candidate, root) for root in allowed_data_roots):
@@ -2398,6 +2683,16 @@ class ToolRegistry:
                         return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the selected process root."
                     continue
                 resolved = (work_dir / pathlib.Path(candidate)).resolve(strict=False)
+                # The lexical relative spelling is authoritative for detecting
+                # a Deliverables-origin target; the helper then canonicalizes
+                # it and rejects symlink escapes.
+                deliverables_decision = _deliverables_target_decision(
+                    work_dir / pathlib.Path(candidate)
+                )
+                if deliverables_decision is not None:
+                    if deliverables_decision:
+                        continue
+                    return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell target is not an allowed Deliverables path."
                 if any(resolved.is_relative_to(root) for root in allowed_relative_roots):
                     continue
                 if any(resolved.is_relative_to(root) for root in allowed_data_roots):
@@ -2471,6 +2766,20 @@ class ToolRegistry:
             if inline_argv:
                 write_target_argvs.append(inline_argv)
         explicit_write_targets = list(dict.fromkeys(str(token) for target_argv in write_target_argvs for token in writer_target_tokens(target_argv) if str(token or "").strip()))
+        # ``cp source Deliverables/`` (and the equivalent mv/ln form) writes a
+        # child named after the source, while the ordinary writer-target parser
+        # only sees the directory operand. Add those argv-visible child names to
+        # the same target-first policy without attempting to parse inline code,
+        # archive formats, or other deferred Q3 syntax.
+        for target_argv in write_target_argvs:
+            for command, destination, source in directory_destination_pairs(target_argv):
+                source_name = directory_destination_child_name(command, target_argv, source)
+                if source_name in {"", ".", ".."}:
+                    continue
+                explicit_write_targets.append(
+                    destination.rstrip("/\\") + "/" + source_name
+                )
+        explicit_write_targets = list(dict.fromkeys(explicit_write_targets))
         executable_path_tokens = {str(target_argv[0]) for target_argv in write_target_argvs if target_argv}
         # Writer-command membership canonicalizes versioned interpreter spellings to
         # their family (`ruby3.2` is `ruby`), so a versioned basename is exactly as
@@ -2500,6 +2809,7 @@ class ToolRegistry:
                 raw_cmd,
                 cmd_path_lower,
                 explicit_write_targets,
+                write_target_argvs,
                 executable_path_tokens,
                 runtime_mode,
                 acting_subagent,
@@ -2602,7 +2912,7 @@ class ToolRegistry:
                     )
 
         if protected_shell := self._protected_shell_block(
-            raw_cmd, cmd_path_lower, binding, acting_self_worktree,
+            raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
         ):
             return protected_shell
 
@@ -3098,7 +3408,9 @@ class ToolRegistry:
 
     def execute(self, name: str, args: Dict[str, Any]) -> str:
         name = str(name or "").strip()
-        args = dict(args or {})
+        args, presence_arg_error = _presence_bound_args(self._ctx, name, args)
+        if presence_arg_error:
+            return presence_arg_error
         _route_note = ""
         task_constraint = normalize_task_constraint(getattr(self._ctx, "task_constraint", None))
         local_readonly_subagent = self._is_local_readonly_subagent()
@@ -3121,7 +3433,6 @@ class ToolRegistry:
                     ext_tool = None
             except Exception:
                 ext_tool = None
-
         _mcp_is_name = None
         if entry is None and ext_tool is None:
             try:
@@ -3213,6 +3524,11 @@ class ToolRegistry:
                     str(args.get("root") or "active_workspace"),
                     exc,
                 )
+        if not _presence_binding_allowed(self._ctx, resolved_binding):
+            return (
+                "⚠️ PRESENCE_RESOURCE_BLOCKED: the resolved target is outside "
+                "this presence task's positive resource ceiling."
+            )
         # Fail-closed: an acting child WITHOUT a resolved isolated workspace would
         # have active_workspace/system_repo fall back to the LIVE repo. Confine it
         # to data roots and block shell/coding/service (whose default target is the repo).
@@ -3237,7 +3553,6 @@ class ToolRegistry:
             _runtime_mode = _get_runtime_mode()
         except Exception:
             _runtime_mode = "advanced"
-
         if is_mcp:
             return self._dispatch_mcp_tool(name, args)
         if entry is None:
@@ -3291,7 +3606,6 @@ class ToolRegistry:
                 "(data/skills/<bucket>/<skill>/) or skill_repair constraints. "
                 "Switch to advanced/pro only for reviewed Ouroboros self-modification."
             )
-
         protected_write_paths = []
         if name in _ROOT_ARG_REPO_WRITE_TOOLS:
             root_name = str(args.get("root", "") or "active_workspace")
@@ -3375,9 +3689,7 @@ class ToolRegistry:
             if name in _PROCESS_COMMAND_TOOLS and workspace_mode and acting_self_worktree
             else None
         )
-        worktree_before = (
-            self._worktree_status_snapshot() if entry.mutates_worktree else None
-        )
+        worktree_before = self._worktree_status_snapshot() if entry.mutates_worktree else None
         early_error, result = self._invoke_builtin_handler(
             name, entry, args, resolved_binding, python_resolution, worktree_before,
         )

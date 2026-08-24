@@ -310,7 +310,7 @@ def test_data_write_blocks_self_authored_state_marker(tmp_path, monkeypatch):
     assert not (drive_root / "state" / "skills" / "demo" / "self_authored.json").exists()
 
 
-def test_data_write_blocks_unseeded_native_payload(tmp_path, monkeypatch):
+def test_data_write_blocks_missing_native_payload_creation(tmp_path, monkeypatch):
     from ouroboros import config as cfg
     from ouroboros.tools.core import _data_write
 

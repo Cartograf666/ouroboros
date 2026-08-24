@@ -1535,6 +1535,81 @@ body.resizing-panels { user-select: none; }
     margin-right: 20%;
 }
 
+/* Execution-plan proposal: a control the owner answers, not a progress note, so
+   it reads as a decision card rather than another system line. */
+.exec-plan-card {
+    margin-right: 8%;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.exec-plan-head {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.exec-plan-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.exec-plan-headline {
+    font-size: 12px;
+    color: var(--text-secondary, #888);
+}
+
+.exec-plan-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.exec-plan-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.exec-plan-row-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    align-items: baseline;
+}
+
+.exec-plan-row-title {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.exec-plan-row-estimate,
+.exec-plan-row-why,
+.exec-plan-note {
+    font-size: 11px;
+    color: var(--text-secondary, #888);
+}
+
+.exec-plan-select {
+    width: 100%;
+    font-size: 12px;
+}
+
+.exec-plan-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.exec-plan-card[data-exec-plan-approved="1"] .exec-plan-select {
+    pointer-events: none;
+    opacity: 0.6;
+}
+
 .chat-bubble .sender {
     font-size: 11px;
     font-weight: 600;
@@ -3177,6 +3252,11 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
 }
 
+.btn:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+}
+
 .btn:hover {
     transform: scale(1.02);
 }
@@ -4466,6 +4546,56 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     font-size: 11.5px;
 }
 
+.skills-presence-runtime {
+    width: min(100%, 620px);
+    margin-top: 8px;
+    padding: 10px 12px;
+    border: 1px solid rgba(250, 250, 250, 0.08);
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.025);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    gap: 8px 12px;
+}
+
+.skills-presence-runtime-title {
+    flex-basis: 100%;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.skills-presence-runtime label {
+    display: grid;
+    gap: 4px;
+    color: rgba(250, 250, 250, 0.6);
+    font-size: 11.5px;
+}
+
+.skills-presence-runtime select,
+.skills-presence-runtime input {
+    min-height: 32px;
+    border: 1px solid rgba(250, 250, 250, 0.12);
+    border-radius: var(--radius-sm);
+    background: rgba(12, 14, 18, 0.8);
+    color: var(--text-primary);
+    padding: 5px 8px;
+}
+
+.skills-presence-runtime input {
+    width: 110px;
+}
+
+.skills-presence-runtime-actions {
+    display: flex;
+    gap: 6px;
+}
+
+.skills-presence-runtime > .muted {
+    flex-basis: 100%;
+    font-size: 11.5px;
+}
+
 .skills-card-actions {
     display: flex;
     gap: 8px;
@@ -4945,6 +5075,38 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     white-space: pre-line;
 }
 
+.confirm-dialog-details {
+    border-top: 1px solid var(--surface-border);
+    padding-top: 10px;
+}
+
+.confirm-dialog-details > summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+.confirm-dialog-detail-list {
+    display: grid;
+    gap: 8px;
+    margin: 10px 0 0;
+}
+
+.confirm-dialog-detail-row {
+    display: grid;
+    grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
+    gap: 10px;
+}
+
+.confirm-dialog-detail-row dt {
+    font-weight: 600;
+}
+
+.confirm-dialog-detail-row dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
 .marketplace-modal-head {
     display: flex;
     align-items: center;
@@ -5092,7 +5254,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .widgets-frame {
     width: 100%;
+    height: var(--widget-frame-height, 320px);
     min-height: 320px;
+    display: block;
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: var(--radius);
     background: rgba(13, 11, 15, 0.88);

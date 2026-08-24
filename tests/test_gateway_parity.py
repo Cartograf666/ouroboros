@@ -2,28 +2,45 @@ from __future__ import annotations
 
 import pathlib
 import re
-from typing import get_args, get_type_hints
+from typing import get_args, get_origin, get_type_hints
 
 from ouroboros.gateway.contracts import (
     HTTP_ENDPOINTS,
     WS_MESSAGE_TYPES,
+    ActiveChatActivity,
+    ActiveDirectTurn,
+    AvailableSubagentsSettingsMeta,
     ChatInbound,
     ChatOutbound,
+    ClaudexorCredentialProfileDeleteResponse,
+    ClaudexorLoginJobProblem,
+    ClaudexorLoginJobResponse,
+    ClaudexorStatusReads,
+    ClaudexorStatusResponse,
+    ClaudexorVendorCredentialDisposition,
     OnboardingCompleteRequest,
     OnboardingCompleteResponse,
     OnboardingPresetFailureResponse,
     OnboardingPresetProjection,
+    OnboardingSubagentsPreviewResponse,
+    OwnerHurryProjection,
+    OwnerSkillPresenceRuntimeRequest,
+    OwnerSkillPresenceRuntimeResponse,
     OwnerScopeReviewFloorResponse,
     PhotoOutbound,
+    ProviderTestRequest,
+    ProviderTestResponse,
+    SettingsMeta,
     SettingsPostCommitFailureResponse,
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
-    OwnerHurryProjection,
+    SkillPublishPreflightResponse,
     StateResponse,
     TaskCostBreakdown,
     TaskDetailResponse,
     TaskHurryRequest,
     TaskHurryResponse,
+    TypingOutbound,
     UpdateApplyErrorResponse,
     UpdateApplyRequest,
     UpdateApplySuccessResponse,
@@ -32,10 +49,6 @@ from ouroboros.gateway.contracts import (
     UpdatePreflightResponse,
     UpdateStatusReadyOutbound,
     VideoOutbound,
-    ClaudexorLoginJobProblem,
-    ClaudexorLoginJobResponse,
-    ClaudexorStatusReads,
-    ClaudexorStatusResponse,
 )
 from ouroboros.gateway.router import collect_routes
 
@@ -66,6 +79,55 @@ def _contains_none(annotation) -> bool:
     return annotation is type(None) or any(_contains_none(arg) for arg in get_args(annotation))
 
 
+def _notrequired_fields(cls) -> set[str]:
+    """Read NotRequired markers robustly on supported Python 3.10 setups."""
+    marked = set()
+    for name, ann in cls.__annotations__.items():
+        rendered = getattr(ann, "__forward_arg__", None) or str(ann)
+        if rendered.startswith("NotRequired["):
+            marked.add(name)
+    return marked
+
+
+def _js_typedef_properties(text: str, name: str) -> set[tuple[str, str]]:
+    match = re.search(rf"@typedef \{{Object\}} {name}\b(?P<body>.*?)\n \*/", text, re.S)
+    assert match, f"api_types.js missing {name}"
+    return set(re.findall(
+        r"^\s*\*\s+@property\s+\{([^}]*)\}\s+([A-Za-z_][A-Za-z0-9_]*)\s*$",
+        match.group("body"),
+        re.M,
+    ))
+
+
+def test_provider_test_gateway_contract_shape_is_exact():
+    request_hints = get_type_hints(ProviderTestRequest, include_extras=True)
+    response_hints = get_type_hints(ProviderTestResponse, include_extras=True)
+
+    assert set(request_hints) == {"provider_id", "overrides"}
+    assert _notrequired_fields(ProviderTestRequest) == {"overrides"}
+    assert request_hints["provider_id"] is str
+    overrides_type = get_args(request_hints["overrides"])[0]
+    assert get_origin(overrides_type) is dict
+    assert get_args(overrides_type) == (str, str)
+
+    assert set(response_hints) == {"ok", "error"}
+    assert _notrequired_fields(ProviderTestResponse) == {"error"}
+    assert response_hints["ok"] is bool
+    assert get_args(response_hints["error"]) == (str,)
+
+    text = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_types.js").read_text(
+        encoding="utf-8"
+    )
+    assert _js_typedef_properties(text, "ProviderTestRequest") == {
+        ("string", "provider_id"),
+        ("Object<string, string>=", "overrides"),
+    }
+    assert _js_typedef_properties(text, "ProviderTestResponse") == {
+        ("boolean", "ok"),
+        ("string=", "error"),
+    }
+
+
 def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     tokens: set[str] = set()
     for route in collect_routes(data_dir=tmp_path):
@@ -92,11 +154,21 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     )
     version = (pathlib.Path(__file__).resolve().parent.parent / "VERSION").read_text(encoding="utf-8").strip()
     assert f"GATEWAY_CONTRACT_VERSION = '{version}'" in text
+    settings_meta_fields = {
+        "custom_secret_keys", "setup_contract", "available_subagents",
+    }
+    assert settings_meta_fields <= set(SettingsMeta.__annotations__)
+    assert _js_typedef_fields(text, "SettingsMeta") == settings_meta_fields
     for name in (
         "StateResponse",
+        "ActiveDirectTurn",
+        "ActiveChatActivity",
+        "TypingOutbound",
         "HealthResponse",
         "SettingsMeta",
         "OpenAICompatibleModelsResponse",
+        "ProviderTestRequest",
+        "ProviderTestResponse",
         "UiPreferencesResponse",
         "ChatInbound",
         "ChatOutbound",
@@ -113,8 +185,11 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "TaskHurryRequest",
         "TaskHurryResponse",
         "OwnerHurryProjection",
+        "OwnerSkillPresenceRuntimeRequest",
+        "OwnerSkillPresenceRuntimeResponse",
         "LogTailResponse",
         "SkillDeleteResponse",
+        "SkillPublishPreflightResponse",
         "UpdateMergePlan",
         "UpdatePreflightRequest",
         "UpdatePreflightResponse",
@@ -122,13 +197,17 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "UpdateApplySuccessResponse",
         "UpdateApplyErrorResponse",
         "UpdateStatusReadyOutbound",
+        "AvailableSubagentsSettingsMeta",
         "OnboardingCompleteRequest",
+        "OnboardingSubagentsPreviewResponse",
         "OnboardingPresetProjection",
         "OnboardingCompleteResponse",
         "OnboardingPresetFailureResponse",
         "SettingsPostCommitFailureResponse",
         "ClaudexorLoginJobResponse",
         "ClaudexorLoginJobProblem",
+        "ClaudexorCredentialProfileDeleteResponse",
+        "ClaudexorVendorCredentialDisposition",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
@@ -142,15 +221,22 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
     for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound,
+                ActiveDirectTurn, ActiveChatActivity, TypingOutbound,
                 StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
                 UpdateApplySuccessResponse, UpdateApplyErrorResponse,
                 UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse,
                 TaskHurryRequest, TaskHurryResponse, OwnerHurryProjection,
+                OwnerSkillPresenceRuntimeRequest, OwnerSkillPresenceRuntimeResponse,
                 OnboardingCompleteRequest, OnboardingPresetProjection,
-                OnboardingCompleteResponse, OnboardingPresetFailureResponse,
+                OnboardingSubagentsPreviewResponse, OnboardingCompleteResponse,
+                OnboardingPresetFailureResponse, AvailableSubagentsSettingsMeta,
                 SettingsPostCommitFailureResponse,
+                ProviderTestRequest, ProviderTestResponse,
+                SkillPublishPreflightResponse,
                 ClaudexorLoginJobResponse, ClaudexorLoginJobProblem,
+                ClaudexorCredentialProfileDeleteResponse,
+                ClaudexorVendorCredentialDisposition,
                 ClaudexorStatusReads, ClaudexorStatusResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
@@ -163,6 +249,33 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         r"@typedef \{Object\} ClaudexorLoginJobProblem\b([\s\S]*?)\*/", text)
     assert success_decl and "@property {Object} job" in success_decl.group(1)
     assert problem_decl and "@property {string} error" in problem_decl.group(1)
+    delete_decl = re.search(
+        r"@typedef \{Object\} ClaudexorCredentialProfileDeleteResponse\b([\s\S]*?)\*/",
+        text,
+    )
+    assert delete_decl
+    for declaration in (
+        "@property {Object} profile",
+        "@property {boolean} removed",
+        "@property {('config_dir_removed'|'secret_deleted'|'none')} credentialCleanup",
+    ):
+        assert declaration in delete_decl.group(1)
+    delete_optional = {
+        name for name, annotation
+        in ClaudexorCredentialProfileDeleteResponse.__annotations__.items()
+        if (getattr(annotation, "__forward_arg__", None) or str(annotation)).startswith(
+            "NotRequired["
+        )
+    }
+    assert delete_optional == {"cleanupWarning", "vendorCredentialDisposition"}
+    assert set(ClaudexorCredentialProfileDeleteResponse.__annotations__) - delete_optional == {
+        "profile", "removed", "credentialCleanup",
+    }
+    delete_hints = get_type_hints(
+        ClaudexorCredentialProfileDeleteResponse, include_extras=True)
+    assert set(get_args(delete_hints["credentialCleanup"])) == {
+        "config_dir_removed", "secret_deleted", "none",
+    }
     # The client's own list of facets. The shared status store is the ONE reader
     # of the `reads` block (`facetReadState`), and STATUS_FACETS is the list its
     # per-facet map and every "did the daemon answer anything at all?" predicate
@@ -195,6 +308,33 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     ), "STATUS_FACETS drifted from ClaudexorStatusReads; the store's per-facet reads would go blind to a facet"
 
     assert UpdatePreflightResponse.__required_keys__ == frozenset({"merge_plan"})
+    # In-flight turn ABI: field-set parity alone would accept requiredness
+    # drift. Snapshot rows always emit every field (required); typing frames
+    # stamp the typed fields only for registry-tracked turns (optional).
+    # (__required_keys__ ignores NotRequired on some 3.10 setups, so inspect
+    # the declared annotations instead.)
+    assert _notrequired_fields(ActiveDirectTurn) == set(), (
+        "ActiveDirectTurn snapshot rows always emit every field: keep them all required"
+    )
+    assert _notrequired_fields(ActiveChatActivity) == set(), (
+        "ActiveChatActivity snapshot rows always emit every field: keep them all required"
+    )
+    assert ActiveChatActivity.__annotations__.keys() == ActiveDirectTurn.__annotations__.keys(), (
+        "ActiveChatActivity must mirror ActiveDirectTurn's field shape so one client reducer hydrates both"
+    )
+    assert _notrequired_fields(TypingOutbound) == {
+        "chat_id", "activity_id", "client_message_id", "phase", "kind",
+    }, "TypingOutbound typed fields are stamped only for registry-tracked turns: keep them optional"
+    turn_decl = re.search(r"@typedef \{Object\} ActiveDirectTurn\b([\s\S]*?)\*/", text)
+    assert turn_decl and not re.search(r"@property \{[^}]*=\}", turn_decl.group(1)), (
+        "ActiveDirectTurn browser mirror must declare every field required"
+    )
+    typing_decl = re.search(r"@typedef \{Object\} TypingOutbound\b([\s\S]*?)\*/", text)
+    assert typing_decl
+    for optional_field in ("chat_id", "activity_id", "client_message_id", "phase", "kind"):
+        assert re.search(
+            rf"@property \{{[^}}]*=\}} {optional_field}\b", typing_decl.group(1)
+        ), f"TypingOutbound.{optional_field} must stay optional in the browser mirror"
     assert re.search(r"@property \{'auto_merge'\|'assisted'\|'manual'\|'replace'\} strategy\b", text)
     assert re.search(r"@property \{string=\} expected_base_sha\b", text)
     assert re.search(r"@property \{string=\} expected_target_sha\b", text)
@@ -208,6 +348,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "OwnerScopeReviewFloorResponse.deprecation_notice must be declared for the browser"
     )
     assert re.search(r"@property \{boolean=\} force_plan\b", text), "ChatInbound missing force_plan"
+    assert re.search(r"@property \{Object=\} client_surface\b", text), "ChatInbound missing client_surface"
     for field in ("model_lane", "requested_model_lane", "effective_model_lane", "model", "task_group_id"):
         assert re.search(rf"@property \{{string=\}} {field}\b", text), f"ChatOutbound missing {field}"
     for field in ("source", "line", "root"):
@@ -244,8 +385,10 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "client_message_id",
         "action",
         "target",
+        "target_label",
         "status",
         "options",
+        "attachment_manifest",
         "suppress_bubble",
         "ts",
     }

@@ -1,319 +1,805 @@
-// Delegation section (Agents tab, under Review lanes) — the owner-facing face
-// of the delegated-subagent capability, and the ONE place the whole subagent
-// story is configured.
-//
-// Until this section existed the capability shipped invisible: delegation
-// (OUROBOROS_SUBAGENT_HARNESS) and the write permission
-// (OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS) were reachable only by hand-editing
-// settings.json, so the default install ran with delegation off and no control
-// said so. The counts that bound it — how many children per root, how deep the
-// chain — sat two tabs away under Advanced → Runtime Limits, next to process
-// worker counts they have nothing to do with; D-10 moved them here.
-//
-// Shape rules, same house style as Review lanes:
-//  * The harness list comes from the SAME source the Accounts section reads
-//    (accountRows over /api/claudexor/status) — one catalog path, one
-//    login-capable discriminator, no second inventory.
-//  * The MODEL is the owner's default for delegated runs (owner, 2026-08-04):
-//    the `=model` tail of OUROBOROS_SUBAGENT_HARNESS, picked from the same
-//    engine discovery the reviewer rows use — "Engine default model" = empty
-//    tail. Effort stays derived per call; a hand-written `:effort` remainder
-//    rides through verbatim and has no control here.
-//  * With no subscription connected the section says so instead of rendering a
-//    toggle that cannot do anything.
-//
-// Pure helpers live at the top and are node-tested without a DOM.
+// Available subagents editor shared by Settings and first-run onboarding.
+// Reviewer quorum and role policy stay in reviewer_slots.js; only neutral
+// route/model/account/effort presentation is shared.
 
 import {
     FACET_ACCOUNTS,
     FACET_CATALOG,
+    FACET_QUOTA,
     READ_OK,
-    READ_TRANSPORT,
-    READ_UNREAD,
     accountRows,
     bindStatusSurface,
+    boundedStatusRefresh,
     claudexorStatus,
-    facetGapClause,
-    statusUnavailableNote,
 } from './claudexor_status_store.js';
 import { renderSegmentedField } from './page_header.js';
-import { modelsGapNote, sessionModelOptions } from './reviewer_slots.js';
-import { formatRelativeAge } from './ui_helpers.js';
+import {
+    EFFORT_CHOICES,
+    ROUTE_KIND_AGENT_SESSION,
+    ROUTE_KIND_API_MODEL,
+    compoundSessionEffortConflict,
+    composeSessionTarget,
+    decodeRouteChoice,
+    describeExecutionEvidence,
+    effortSelectHtml,
+    encodeRouteChoice,
+    indexProfilesByHarness,
+    mintStableId,
+    modelsGapNote,
+    profileOptionsFor,
+    routeChoiceGroups,
+    selectHtml,
+    serializeRouteSpec,
+    sessionModelOptions,
+    splitSessionTarget,
+} from './route_editor_primitives.js';
+import { sessionRouteAvailability } from './subagent_status_primitives.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
-// The owner's explicit "delegation off" (see subagents.parse_subagent_harness):
-// distinguishable from an empty, never-decided value, which is what lets the
-// connected-subscription default exist without overriding a real decision.
-export const DELEGATION_OFF = 'off';
+export const MAX_AVAILABLE_SUBAGENTS = 10;
+export const SUBAGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 
-// ---------------------------------------------------------------------------
-// Pure helpers.
-// ---------------------------------------------------------------------------
+const SETTING_KEYS = new Set(['enabled', 'items']);
+const ROW_KEYS = new Set(['subagent_id', 'name', 'recommended_use', 'route', 'effort']);
+const ROUTE_KEYS = new Set(['kind', 'target_id', 'credential_profile_id']);
 
-export function parseSubagentRoute(value) {
-    // `harness[=model][:effort]`. This UI authors the harness AND the `=model`
-    // tail (the owner's default model select); a hand-written `:effort`
-    // remainder is carried through VERBATIM rather than silently dropped on
-    // the next save — the owner wrote it on purpose.
-    const raw = String(value || '').trim();
-    if (!raw || raw.toLowerCase() === DELEGATION_OFF) {
-        return { harness: '', suffix: '', decided: Boolean(raw) };
+function ownUnknownKeys(value, allowed) {
+    return Object.keys(value || {}).filter((key) => !allowed.has(key));
+}
+
+function readableName(subagentId) {
+    const words = String(subagentId || '').replace(/[_-]+/g, ' ').trim();
+    return words ? words.replace(/\b\w/g, (letter) => letter.toUpperCase()) : 'Subagent';
+}
+
+function canonicalRow(row) {
+    const route = serializeRouteSpec(row?.route || {}, {
+        apiKind: ROUTE_KIND_API_MODEL,
+        credentialField: 'credential_profile_id',
+    });
+    route.target_id = String(route.target_id || '').trim();
+    if (route.credential_profile_id !== undefined) {
+        route.credential_profile_id = String(route.credential_profile_id || '').trim();
+        if (!route.credential_profile_id) delete route.credential_profile_id;
     }
-    const eq = raw.indexOf('=');
-    if (eq < 0) return { harness: raw, suffix: '', decided: true };
-    return { harness: raw.slice(0, eq), suffix: raw.slice(eq), decided: true };
+    return {
+        subagent_id: String(row?.subagent_id || '').trim(),
+        name: String(row?.name || '').trim(),
+        recommended_use: String(row?.recommended_use || ''),
+        route,
+        ...(row?.effort ? { effort: String(row.effort).trim().toLowerCase() } : {}),
+    };
 }
 
-export function composeSubagentRoute(harness, suffix) {
-    const h = String(harness || '').trim();
-    if (!h) return DELEGATION_OFF;
-    return `${h}${String(suffix || '')}`;
+function attachUiKeys(setting, previousItems = []) {
+    const previous = new Map((previousItems || []).map(
+        (row) => [String(row.subagent_id || ''), row._uiKey],
+    ));
+    const taken = new Set();
+    setting.items = setting.items.map((row) => {
+        let key = previous.get(String(row.subagent_id || '')) || '';
+        if (!key || taken.has(key)) key = mintStableId('actor_row', taken);
+        taken.add(key);
+        return { ...row, _uiKey: key };
+    });
+    return setting;
 }
 
-export function splitSubagentTail(suffix) {
-    // The `=model[:effort]` tail, split at the FIRST ':' exactly like the
-    // backend parser (subagents.parse_subagent_harness): `model` is the owner
-    // default the select now edits, `effortSuffix` is the hand-written effort
-    // remainder — kept VERBATIM, leading ':' included, so composing back is
-    // byte-identical when the model is untouched.
-    const raw = String(suffix || '');
-    const body = raw.startsWith('=') ? raw.slice(1) : raw;
-    const colon = body.indexOf(':');
-    if (colon < 0) return { model: body, effortSuffix: '' };
-    return { model: body.slice(0, colon), effortSuffix: body.slice(colon) };
-}
-
-export function composeSubagentTail(model, effortSuffix) {
-    const m = String(model || '');
-    const e = String(effortSuffix || '');
-    return m || e ? `=${m}${e}` : '';
-}
-
-export function lastDelegationLine(entry) {
-    // ONE muted receipt line under the section: what the last delegated run
-    // REALLY ran as. Absence is shown as absence — no record, no line; an
-    // undisclosed applied model says so instead of echoing the request; a
-    // requested≠applied pair is disclosed loudly (owner decision: the run
-    // completes on what the engine gave, the mismatch is advisory).
-    if (!entry || typeof entry !== 'object' || !entry.run_id) return '';
-    const requested = String(entry.requested_model || '');
-    const applied = String(entry.applied_model || '');
-    const parts = [String(entry.route || '') || 'unknown route'];
-    if (requested && applied && requested !== applied) {
-        parts.push(`requested ${requested} → ran ${applied}`);
-    } else {
-        parts.push(applied || 'model not disclosed');
+/** Parse without replacing malformed saved bytes with an empty list. */
+export function parseAvailableSubagentsSetting(value) {
+    if (value === undefined || value === null || value === '') {
+        return { setting: null, error: 'Available subagents configuration was not loaded' };
     }
-    const when = formatRelativeAge(Date.parse(entry.ts || ''), 'just now');
-    if (when) parts.push(when);
-    return `Last delegated run: ${parts.join(' · ')}`;
+    let input = value;
+    if (typeof input === 'string') {
+        try {
+            input = JSON.parse(input);
+        } catch (error) {
+            return { setting: null, error: `saved value is not valid JSON: ${error.message || error}` };
+        }
+    }
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        return { setting: null, error: 'saved value must be an object' };
+    }
+    const settingUnknown = ownUnknownKeys(input, SETTING_KEYS);
+    if (settingUnknown.length) {
+        return { setting: null, error: `saved value has unknown field: ${settingUnknown[0]}` };
+    }
+    if (typeof input.enabled !== 'boolean' || !Array.isArray(input.items)) {
+        return { setting: null, error: 'saved value needs a boolean enabled flag and an items list' };
+    }
+    if (input.items.length > MAX_AVAILABLE_SUBAGENTS) {
+        return { setting: null, error: `saved value has more than ${MAX_AVAILABLE_SUBAGENTS} rows` };
+    }
+    const canonicalItems = [];
+    for (const [index, row] of input.items.entries()) {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) {
+            return { setting: null, error: `row ${index + 1} must be an object` };
+        }
+        const rowUnknown = ownUnknownKeys(row, ROW_KEYS);
+        if (rowUnknown.length) {
+            return { setting: null, error: `row ${index + 1} has unknown field: ${rowUnknown[0]}` };
+        }
+        if (typeof row.subagent_id !== 'string') {
+            return { setting: null, error: `row ${index + 1} stable ID must be a string` };
+        }
+        if (row.name !== undefined && typeof row.name !== 'string') {
+            return { setting: null, error: `row ${index + 1} name must be a string` };
+        }
+        if (typeof row.recommended_use !== 'string') {
+            return { setting: null, error: `row ${index + 1} recommended use must be a string` };
+        }
+        if (row.effort !== undefined && row.effort !== null && typeof row.effort !== 'string') {
+            return { setting: null, error: `row ${index + 1} effort must be a string` };
+        }
+        if (!row.route || typeof row.route !== 'object' || Array.isArray(row.route)) {
+            return { setting: null, error: `row ${index + 1} needs a route object` };
+        }
+        const routeUnknown = ownUnknownKeys(row.route, ROUTE_KEYS);
+        if (routeUnknown.length) {
+            return { setting: null, error: `row ${index + 1} route has unknown field: ${routeUnknown[0]}` };
+        }
+        if (typeof row.route.kind !== 'string') {
+            return { setting: null, error: `row ${index + 1} route kind must be a string` };
+        }
+        if (typeof row.route.target_id !== 'string') {
+            return { setting: null, error: `row ${index + 1} route target must be a string` };
+        }
+        if (row.route.credential_profile_id !== undefined
+            && row.route.credential_profile_id !== null
+            && typeof row.route.credential_profile_id !== 'string') {
+            return { setting: null, error: `row ${index + 1} account pin must be a string` };
+        }
+        const routeKind = row.route.kind.trim().toLowerCase();
+        if (![ROUTE_KIND_API_MODEL, ROUTE_KIND_AGENT_SESSION].includes(routeKind)) {
+            return { setting: null, error: `row ${index + 1} has unsupported route kind` };
+        }
+        if (routeKind !== ROUTE_KIND_AGENT_SESSION
+            && String(row.route.credential_profile_id || '').trim()) {
+            return { setting: null, error: `row ${index + 1} has an account pin on an API route` };
+        }
+        canonicalItems.push(canonicalRow({
+            ...row,
+            route: { ...row.route, kind: routeKind },
+        }));
+    }
+    const setting = { enabled: input.enabled, items: canonicalItems };
+    const errors = validateAvailableSubagentsSetting(setting);
+    if (errors.length) return { setting: null, error: `saved value is invalid: ${errors[0]}` };
+    return {
+        setting,
+        error: '',
+    };
 }
 
-function harnessRow(payload, harnessId) {
-    // The discovery ROW, not just its models: the row also carries the typed
-    // `models_error` that says the model list itself could not be read, and a
-    // synthetic `{models}` object dropped that fact on the floor.
-    for (const harness of payload?.harnesses || []) {
-        if (String(harness?.id || '') === String(harnessId || '')) return harness;
+export function validateAvailableSubagentsSetting(setting) {
+    const errors = [];
+    if (!setting || typeof setting.enabled !== 'boolean' || !Array.isArray(setting.items)) {
+        return ['Available subagents configuration is not loaded.'];
     }
-    return null;
+    if (setting.items.length > MAX_AVAILABLE_SUBAGENTS) {
+        errors.push(`Available subagents supports at most ${MAX_AVAILABLE_SUBAGENTS} rows.`);
+    }
+    const ids = new Set();
+    setting.items.forEach((row, index) => {
+        const label = `Row ${index + 1}`;
+        const id = String(row?.subagent_id || '').trim();
+        if (!SUBAGENT_ID_PATTERN.test(id)) {
+            errors.push(`${label} needs a stable ID using letters, numbers, ., _ or - (maximum 64 characters).`);
+        } else if (ids.has(id)) {
+            errors.push(`${label} repeats stable ID “${id}”.`);
+        }
+        ids.add(id);
+        const route = row?.route || {};
+        if (![ROUTE_KIND_API_MODEL, ROUTE_KIND_AGENT_SESSION].includes(route.kind)) {
+            errors.push(`${label} must use API model or Agent session.`);
+        }
+        if (!String(route.target_id || '').trim()) {
+            errors.push(`${label} needs a model or agent-session route.`);
+        }
+        if (route.kind !== ROUTE_KIND_AGENT_SESSION && route.credential_profile_id) {
+            errors.push(`${label} can pin an account only for an Agent session.`);
+        }
+        if (route.kind === ROUTE_KIND_AGENT_SESSION) {
+            const target = String(route.target_id || '');
+            const parts = target.split('=');
+            if (/\s|:/.test(target) || parts.length > 2
+                || !SUBAGENT_ID_PATTERN.test(parts[0] || '')
+                || (parts.length === 2 && !parts[1])) {
+                errors.push(`${label} Agent session must use harness or harness=model without whitespace or legacy :effort.`);
+            }
+        }
+        if (row.effort && !EFFORT_CHOICES.includes(String(row.effort))) {
+            errors.push(`${label} has an unsupported reasoning effort.`);
+        }
+        const encodedEffort = route.kind === ROUTE_KIND_AGENT_SESSION
+            ? compoundSessionEffortConflict(route.target_id, row.effort) : '';
+        if (encodedEffort) {
+            errors.push(`${label} effort “${row.effort}” conflicts with compound route effort “${encodedEffort}”.`);
+        }
+    });
+    return errors;
 }
 
-export function connectedHarnesses(payload) {
-    // "Connected" = the accounts panel's own answer, not a second definition:
-    // an account row whose verification the daemon observed AND passed — the
-    // same `=== 'passed'` predicate accountLoginConfirmed applies (native rows
-    // project 'passed' | ''). A failed/expired verification renders red in the
-    // accounts panel; counting it as connected here would let the default-on
-    // rule auto-pin a route whose every dispatch falls back to native.
-    //
-    // OWNER DECISION 2026-08-09 — SUBSCRIPTION-FIRST, do NOT narrow this.
-    // A native/local session counts as connected here even though its
-    // verification_source is `local_store` (detected on disk, not re-proved
-    // against the vendor this second), and that is deliberately enough to turn
-    // delegation on by default. A review pass proposed requiring vendor-level
-    // verification before the default fires; the owner declined it outright:
-    // Ouroboros should PREFER subscriptions over the API budget, and demanding
-    // a live vendor probe would leave delegation off on exactly the machines
-    // that have subscriptions sitting right there. Strengthen this bias, never
-    // trade it for caution. The pin is the node test
-    // 'subscription-first: a local session is enough to turn delegation on by
-    // default' in web/tests/subagents_settings.test.js.
-    const names = {};
-    for (const harness of payload?.harnesses || []) {
-        const id = String(harness?.id || '');
-        if (id) names[id] = String(harness.display_name || id);
+export function buildAvailableSubagentsSetting(setting) {
+    return {
+        enabled: Boolean(setting?.enabled),
+        items: (setting?.items || []).map((row) => {
+            const out = canonicalRow(row);
+            out.subagent_id = out.subagent_id.trim();
+            out.route.target_id = out.route.target_id.trim();
+            if (out.route.credential_profile_id) {
+                out.route.credential_profile_id = out.route.credential_profile_id.trim();
+            }
+            if (out.effort) out.effort = out.effort.trim();
+            if (!out.name.trim()) out.name = readableName(out.subagent_id);
+            return out;
+        }),
+    };
+}
+
+export function subagentSettingsFingerprint(value) {
+    const parsed = parseAvailableSubagentsSetting(value);
+    return parsed.setting
+        ? JSON.stringify(buildAvailableSubagentsSetting(parsed.setting))
+        : JSON.stringify(value ?? null);
+}
+
+export function availableSubagentsSavePayload({ loaded = false, parseError = '', setting } = {}) {
+    if (!loaded || parseError) return {};
+    return { OUROBOROS_SUBAGENTS: buildAvailableSubagentsSetting(setting) };
+}
+
+/** Preview the current Settings draft without turning its generated actor rows into owner input. */
+export function availableSubagentsPreviewPayload(settingsDraft, subscriptionsConnected) {
+    const payload = {
+        ...(settingsDraft || {}),
+        subscriptionsConnected: Boolean(subscriptionsConnected),
+    };
+    delete payload.OUROBOROS_SUBAGENTS;
+    return payload;
+}
+
+export function generatedPreviewCanReplace({
+    dirty = false, outerDraftClean = true, parsedSetting = null,
+} = {}) {
+    return !dirty && outerDraftClean && Boolean(parsedSetting);
+}
+
+function diagnosticsText(diagnostics, out = []) {
+    if (!diagnostics) return out;
+    if (typeof diagnostics === 'string') {
+        if (diagnostics.trim()) out.push(diagnostics.trim());
+        return out;
     }
-    const out = [];
-    for (const row of accountRows(payload)) {
-        if (String(row?.status?.verification || '') !== 'passed') continue;
-        if (out.some((item) => item.id === row.harness)) continue;
-        out.push({ id: row.harness, label: names[row.harness] || row.harness });
+    if (Array.isArray(diagnostics)) {
+        diagnostics.forEach((item) => diagnosticsText(item, out));
+        return out;
     }
+    if (typeof diagnostics !== 'object') return out;
+    const message = diagnostics.message || diagnostics.detail || diagnostics.error;
+    if (message) {
+        const code = String(diagnostics.code || '').trim();
+        out.push(`${code ? `${code}: ` : ''}${String(message)}`);
+        return out;
+    }
+    Object.values(diagnostics).forEach((item) => diagnosticsText(item, out));
     return out;
 }
 
-export function delegationView({ saved = '', payload = null, statusError = '', accountsRead = '',
-    catalogRead = READ_OK, edit = null, loaded = true } = {}) {
-    // The whole section as ONE value: which state to render, what the harness
-    // select offers, and the muted sentence under it. `edit` is the owner's
-    // unsaved choice laid over the saved value — it goes through the same
-    // function so the sentence can never describe a different state than the
-    // controls above it (it did: turning delegation off still read "on by
-    // default", because the note was computed from the saved value alone).
-    const route = parseSubagentRoute(saved);
-    // This section renders TWO facets: the account list decides the whole view,
-    // and the model select rides the CATALOG. Explaining only the accounts left
-    // a catalog gap silently on screen — the model options would quietly narrow
-    // to whatever the last read happened to hold, with nothing saying so. A
-    // catalog is coalesced by SUBJECT, never by enum: dropping it because its
-    // STATE equalled the accounts facet's left the model select unexplained
-    // whenever both reads were in the same trouble — the accounts sentence
-    // says nothing about agent discovery. (The coarse `indeterminate` yields
-    // no clause by construction; its own global sentence covers everything.)
-    const accountsState = statusError ? READ_TRANSPORT : String(accountsRead || '');
-    const catalogClause = facetGapClause({ [FACET_CATALOG]: catalogRead }, [FACET_CATALOG]);
-    const view = (value) => (catalogClause
-        ? { ...value, note: `${value.note} ${catalogClause}`.trim() }
-        : value);
-    if (!loaded) {
-        // Not read YET is not "nothing connected": until the accounts arrive the
-        // section states only that it is reading (collect() already guards on the
-        // same fact, so this renders nothing it would then author).
-        return view({ state: 'loading', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-            note: statusUnavailableNote(READ_UNREAD, { facet: FACET_ACCOUNTS }).text });
-    }
-    // This section renders the ACCOUNTS facet, so that facet alone decides the
-    // whole view. "Nobody could be asked", "never asked" and "asked and
-    // refused" are three different sentences and none of them says anything
-    // about the daemon-side account — so the note stops at what is actually
-    // known. Offering the live control here let Save answer "saved" while
-    // collect() returned {}; and the never-asked case used to fall through to
-    // "no account connected for codex right now", a row-level accusation
-    // earned only by a read that actually happened.
-    const unavailable = (accountsState && accountsState !== READ_OK && accountsState !== READ_UNREAD)
-        ? statusUnavailableNote(accountsState, { error: statusError, facet: FACET_ACCOUNTS })
-        : null;
-    if (unavailable) {
-        return view({ state: 'unknown', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-            note: unavailable.text });
-    }
-    const connected = connectedHarnesses(payload);
-    const savedHarness = route.harness;
-
-    if (!savedHarness && !connected.length) {
-        // Nothing to delegate to, so there is no control to offer. A decided
-        // `off` is the owner's own answer and never re-defaults, so promising
-        // "turns on by itself" over it would announce an override that will not
-        // happen.
-        return view(route.decided
-            ? { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-                note: 'Delegation is off because you turned it off, and it stays off until you turn it back on. No agent subscription is connected right now; connect one under Accounts above to make delegation available again.' }
-            : { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-                note: 'No agent subscription is connected, so there is nothing to delegate to. Connect one under Accounts above and delegation turns on by itself.' });
-    }
-
-    const defaultOn = !route.decided && connected.length > 0;
-    const enabled = edit ? Boolean(edit.enabled) : (Boolean(savedHarness) || defaultOn);
-    const harness = enabled
-        ? String((edit && edit.harness) || savedHarness || connected[0]?.id || '')
-        : '';
-    // A hand-written model/effort tail belongs to the harness it was written
-    // for; carrying it to another one would pin a model that harness may not serve.
-    const savedTail = splitSubagentTail(harness && harness === savedHarness ? route.suffix : '');
-    // The model select's value: the owner's unsaved pick when there is one,
-    // else the saved default. A harness switch drops the saved tail above, so
-    // the reset to "Engine default model" is VISIBLE on screen before Save —
-    // accepted residual, deliberately no per-harness memory. The `:effort`
-    // remainder is never edited here and rides through verbatim.
-    const model = edit && edit.model !== null && edit.model !== undefined
-        ? String(edit.model) : savedTail.model;
-    const suffix = composeSubagentTail(model, savedTail.effortSuffix);
-    // The SAME options fragment the reviewer rows use, "(not in discovery)"
-    // guard included: a Save while the daemon is down must not silently erase
-    // the saved model pin.
-    const row = harness ? harnessRow(payload, harness) : null;
-    const modelOptions = enabled && harness
-        // The MODEL list rides the CATALOG facet, which is independent of the
-        // accounts facet that got us here: with the catalog unread the saved
-        // pin keeps its option and loses only the "(not in discovery)" claim.
-        // The ROW is passed whole so the per-harness model-read gap is seen.
-        ? sessionModelOptions(row, model, { catalogKnown: catalogRead === READ_OK })
-        : [];
-    const modelsGap = enabled && harness
-        ? modelsGapNote(row, catalogRead === READ_OK) : '';
-
-    const options = [...connected];
-    if (savedHarness && !options.some((item) => item.id === savedHarness)) {
-        // A SAVED route keeps an option even when discovery cannot see it right
-        // now (daemon down, account signed out): dropping it would make the
-        // browser redraw the row as the first connected entry, and the next Save
-        // would silently re-point delegation at an account nobody chose.
-        options.push({ id: savedHarness, label: `${savedHarness} (no account connected)` });
-    }
-
-    let state = 'on';
-    let note = 'The delegated work runs on this subscription, on the model picked here '
-        + '("Engine default model" leaves the choice to the agent); the subagent '
-        + 'itself still runs on the API to drive and check it. Reasoning effort is still '
-        + 'derived from each call.';
-    if (!enabled) {
-        state = 'off';
-        note = 'Subagents run entirely on the API. Turn this on to send their work to a connected subscription.';
-    } else if (!connected.some((item) => item.id === harness)) {
-        note = `No connected account for ${harness} right now — delegated work runs as an ordinary subagent on the API until it is signed in again.`;
-    } else if (!savedHarness) {
-        // The owner never authored this; saying "on" without saying it is not
-        // stored yet would misreport where subagents actually run today.
-        state = 'default_on';
-        note = 'On by default now that a subscription is connected. Save Settings to apply it — until then subagents still run on the API.';
-    }
-    if (modelsGap) {
-        // The catalog listed this agent but its MODEL list refused, so the
-        // select below is short for a reason nothing else on the page states.
-        note = `${note} The model list for ${harness} could not be read, so the choices below may be incomplete; your saved model is kept.`;
-    }
-    return view({ state, enabled, harness, model, modelOptions, suffix, options, note });
+function harnessMap(snapshot) {
+    return Object.fromEntries((snapshot?.harnesses || [])
+        .filter((harness) => harness?.id)
+        .map((harness) => [String(harness.id), harness]));
 }
 
-// ---------------------------------------------------------------------------
-// DOM section (Agents → Delegation). State is module-local; collect is synchronous.
-// ---------------------------------------------------------------------------
+function connectedHarnessIds(snapshot) {
+    return new Set(accountRows(snapshot)
+        .filter((row) => row?.enabled !== false
+            && String(row?.status?.verification || '') === 'passed')
+        .map((row) => String(row.harness || '')));
+}
 
-const state = {
-    loaded: false,
-    saved: '',
-    payload: null,
-    statusError: '',
-    // The ACCOUNTS facet's own read state, so this section can tell "we could
-    // not ask" from "never asked" from "asked and refused" from a real, empty
-    // account list. Independent of the catalog facet, which the model select
-    // rides — one can be authoritative while the other was never read.
-    accountsRead: '',
-    catalogRead: READ_OK,
-    store: claudexorStatus,
-    disposers: [],
-    // The owner's unsaved answer only; everything derived from it (which route,
-    // which options, which sentence) stays in delegationView. `model: null`
-    // means "no unsaved model edit" — '' is a real answer (Engine default).
-    enabled: null,
-    harness: '',
-    model: null,
-    onChange: () => {},
-};
+function executionFor(snapshot, subagentId) {
+    const receipt = snapshot?.subagent_last_delegation;
+    if (!receipt || typeof receipt !== 'object') return null;
+    return String(receipt.selected_subagent_id || '') === String(subagentId || '')
+        ? receipt : null;
+}
+
+function savedIntentStatus(row, state) {
+    const intent = state.dirty ? 'Draft intent' : (state.baselineLabel || 'Saved intent');
+    if (row.route.kind !== ROUTE_KIND_AGENT_SESSION) {
+        return `${intent} · API model · availability is checked when a child starts`;
+    }
+    return `${intent} · ${sessionRouteAvailability(row, state)}`;
+}
+
+function focusSnapshot(host, doc) {
+    const active = doc?.activeElement;
+    if (!active || !host?.contains?.(active)) return null;
+    const row = active.closest?.('[data-subagent-row]');
+    return {
+        rowId: row?.dataset?.subagentRow || '',
+        field: active.dataset?.subagentField || '',
+        start: typeof active.selectionStart === 'number' ? active.selectionStart : null,
+        end: typeof active.selectionEnd === 'number' ? active.selectionEnd : null,
+        scrollTop: host.scrollTop,
+    };
+}
+
+function restoreFocus(host, saved) {
+    if (!saved) return;
+    const rows = host.querySelectorAll?.('[data-subagent-row]') || [];
+    const row = [...rows].find((item) => item.dataset?.subagentRow === saved.rowId);
+    const field = row?.querySelector?.(`[data-subagent-field="${saved.field}"]`);
+    if (field?.focus) field.focus({ preventScroll: true });
+    if (saved.start !== null && field?.setSelectionRange) {
+        field.setSelectionRange(saved.start, saved.end);
+    }
+    host.scrollTop = saved.scrollTop;
+}
+
+export function availableSubagentRowMarkup(row, state, index = 0) {
+    const ordinal = index + 1;
+    const rowKey = row._uiKey || row.subagent_id;
+    const headingId = `available-subagent-${rowKey}-heading`;
+    const session = row.route.kind === ROUTE_KIND_AGENT_SESSION;
+    const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
+    const harnesses = harnessMap(state.snapshot);
+    const routeGroups = routeChoiceGroups({
+        harnesses: state.catalogKnown ? (state.snapshot?.harnesses || []) : [],
+        currentChoice: encodeRouteChoice(row),
+        catalogKnown: state.catalogKnown,
+    });
+    const modelOptions = sessionModelOptions(harnesses[split.harness], split.model, {
+        catalogKnown: state.catalogKnown,
+    });
+    const profileOptions = profileOptionsFor(
+        (indexProfilesByHarness(state.snapshot)[split.harness]) || [],
+        row.route.credential_profile_id || '',
+        { accountsKnown: state.accountsKnown },
+    );
+    const evidence = describeExecutionEvidence(executionFor(state.snapshot, row.subagent_id));
+    const gap = session ? modelsGapNote(harnesses[split.harness], state.catalogKnown) : '';
+    const meta = [savedIntentStatus(row, state), gap, evidence ? `Last actual run: ${evidence}` : '']
+        .filter(Boolean).join(' · ');
+    return `
+        <article class="available-subagent-row" data-subagent-row="${escapeHtml(rowKey)}" aria-labelledby="${escapeHtml(headingId)}">
+            <h4 class="available-subagent-heading" id="${escapeHtml(headingId)}">Subagent ${ordinal}</h4>
+            <label class="available-subagent-purpose">Description
+                <textarea data-subagent-field="recommended_use" rows="2" aria-label="Description for Subagent ${ordinal}" placeholder="When should Ouroboros choose this subagent?">${escapeHtml(row.recommended_use)}</textarea>
+            </label>
+            <div class="available-subagent-route">
+                ${selectHtml(`data-subagent-field="route" aria-label="Type for Subagent ${ordinal}"`, routeGroups, encodeRouteChoice(row))}
+                ${session
+                    ? selectHtml(`data-subagent-field="model" aria-label="Agent session model for Subagent ${ordinal}"`, [{ label: '', options: modelOptions }], split.model)
+                    : `<input data-subagent-field="model" list="available-subagent-api-model-catalog" value="${escapeHtml(row.route.target_id || '')}" placeholder="provider/model-id" autocomplete="off" spellcheck="false" aria-label="API model for Subagent ${ordinal}">`}
+                ${session
+                    ? selectHtml(`data-subagent-field="account" aria-label="Agent session account for Subagent ${ordinal}"`, [{ label: '', options: profileOptions }], row.route.credential_profile_id || '')
+                    : ''}
+                ${effortSelectHtml(`data-subagent-field="effort" aria-label="Reasoning effort for Subagent ${ordinal}"`, row.effort || '', 'route default')}
+            </div>
+            <div class="available-subagent-meta">${escapeHtml(meta)}</div>
+            <div class="available-subagent-actions">
+                <button type="button" class="btn btn-default" data-subagent-duplicate aria-label="Duplicate Subagent ${ordinal}">Duplicate</button>
+                <button type="button" class="btn btn-default" data-subagent-remove aria-label="Remove Subagent ${ordinal}">Remove</button>
+            </div>
+        </article>`;
+}
+
+export function availableSubagentsRenderSignature(state, nowMs = Date.now()) {
+    return JSON.stringify([
+        state.loaded,
+        state.parseError,
+        state.setting,
+        state.baselineLabel,
+        state.source,
+        diagnosticsText(state.diagnostics),
+        state.statusError,
+        state.catalogKnown,
+        state.accountsKnown,
+        state.quotaKnown,
+        state.snapshot?.harnesses || [],
+        accountRows(state.snapshot),
+        state.snapshot?.quota || [],
+        state.snapshot?.subagent_last_delegation || null,
+        (state.setting?.items || []).map((row) => row?.route?.kind === ROUTE_KIND_AGENT_SESSION
+            ? sessionRouteAvailability(row, state, nowMs) : ''),
+        state.apiModels,
+    ]);
+}
+
+/** One isolated editor instance; Settings keeps a singleton wrapper below. */
+export function createAvailableSubagentsEditor({
+    hostId = 'available-subagents-editor',
+    doc = () => (typeof document === 'undefined' ? null : document),
+    win = () => (typeof window === 'undefined' ? null : window),
+    store = claudexorStatus,
+    onChange = () => {},
+    onDirtyChange = () => {},
+    isOuterDraftClean = () => true,
+    onGeneratedApply = () => {},
+    allowUnloadedOmission = false,
+    previewGenerated = null,
+    baselineLabel = 'Saved intent',
+} = {}) {
+    const getDoc = typeof doc === 'function' ? doc : () => doc;
+    const getWin = typeof win === 'function' ? win : () => win;
+    const state = {
+        loaded: false,
+        parseError: '',
+        unloadedOmissionAllowed: false,
+        setting: { enabled: true, items: [] },
+        source: '',
+        diagnostics: [],
+        dirty: false,
+        baselineLabel: String(baselineLabel || 'Saved intent'),
+        statusError: '',
+        catalogKnown: false,
+        accountsKnown: false,
+        quotaKnown: false,
+        snapshot: null,
+        apiModels: [],
+        signature: '',
+        statusDisposer: null,
+        catalogDisposer: null,
+        previewSignature: '',
+        previewGeneration: 0,
+    };
+
+    function host() {
+        return getDoc()?.getElementById?.(hostId) || null;
+    }
+
+    function adoptStatus() {
+        state.statusError = store?.error || '';
+        state.catalogKnown = store?.facet?.(FACET_CATALOG) === READ_OK;
+        state.accountsKnown = store?.facet?.(FACET_ACCOUNTS) === READ_OK;
+        state.quotaKnown = store?.facet?.(FACET_QUOTA) === READ_OK;
+        state.snapshot = store?.snapshot || null;
+    }
+
+    function validationErrors() {
+        if (!state.loaded) {
+            // An unrelated Settings save may omit a field the response did not
+            // load at all. Once the response carries saved bytes or an explicit
+            // migration/repair candidate, though, its parse error is actionable
+            // and must block rather than masquerade as an accepted repair.
+            if (state.unloadedOmissionAllowed) return [];
+            return [state.parseError
+                || 'Available subagents draft is still loading. Retry the preview before finishing.'];
+        }
+        if (state.parseError) return [state.parseError];
+        return validateAvailableSubagentsSetting(state.setting);
+    }
+
+    function renderValidation() {
+        const box = host()?.querySelector?.('[data-subagents-validation]');
+        if (!box) return;
+        const errors = validationErrors();
+        box.hidden = !errors.length;
+        box.textContent = errors[0] || '';
+    }
+
+    function markDirty({ structural = false } = {}) {
+        if (!state.dirty) {
+            state.dirty = true;
+            onDirtyChange(true);
+        }
+        // Text inputs already paint their own value. Advancing the signature
+        // here lets an unchanged late status settle skip a destructive
+        // innerHTML rewrite; structural changes deliberately request one.
+        state.signature = structural ? '' : availableSubagentsRenderSignature(state);
+        renderValidation();
+        onChange(buildAvailableSubagentsSetting(state.setting));
+    }
+
+    function bindRows(container) {
+        container.querySelectorAll?.('[data-subagent-row]').forEach((rowElement) => {
+            const row = state.setting.items.find(
+                (item) => (item._uiKey || item.subagent_id) === rowElement.dataset.subagentRow,
+            );
+            if (!row) return;
+            rowElement.querySelector('[data-subagent-field="recommended_use"]')?.addEventListener('input', (event) => {
+                row.recommended_use = String(event.target.value || '');
+                markDirty();
+            });
+            rowElement.querySelector('[data-subagent-field="route"]')?.addEventListener('change', (event) => {
+                const decoded = decodeRouteChoice(event.target.value, { apiKind: ROUTE_KIND_API_MODEL });
+                row.route = decoded.kind === ROUTE_KIND_AGENT_SESSION
+                    ? { kind: ROUTE_KIND_AGENT_SESSION, target_id: decoded.harness }
+                    : { kind: ROUTE_KIND_API_MODEL, target_id: '' };
+                markDirty({ structural: true });
+                paint();
+            });
+            rowElement.querySelector('[data-subagent-field="model"]')?.addEventListener(
+                row.route.kind === ROUTE_KIND_AGENT_SESSION ? 'change' : 'input',
+                (event) => {
+                    if (row.route.kind === ROUTE_KIND_AGENT_SESSION) {
+                        const { harness } = splitSessionTarget(row.route.target_id);
+                        row.route.target_id = composeSessionTarget(harness, event.target.value);
+                    } else {
+                        row.route.target_id = String(event.target.value || '');
+                    }
+                    markDirty();
+                },
+            );
+            rowElement.querySelector('[data-subagent-field="account"]')?.addEventListener('change', (event) => {
+                const pin = String(event.target.value || '');
+                if (pin) row.route.credential_profile_id = pin;
+                else delete row.route.credential_profile_id;
+                markDirty({ structural: true });
+                paint();
+            });
+            rowElement.querySelector('[data-subagent-field="effort"]')?.addEventListener('change', (event) => {
+                const effort = String(event.target.value || '');
+                if (effort) row.effort = effort;
+                else delete row.effort;
+                markDirty();
+            });
+            rowElement.querySelector('[data-subagent-duplicate]')?.addEventListener('click', () => {
+                if (state.setting.items.length >= MAX_AVAILABLE_SUBAGENTS) return;
+                const copy = canonicalRow(row);
+                copy.subagent_id = mintStableId(`${row.subagent_id || 'subagent'}_copy`,
+                    state.setting.items.map((item) => item.subagent_id));
+                copy.name = `${row.name || readableName(row.subagent_id)} copy`;
+                copy._uiKey = mintStableId('actor_row',
+                    state.setting.items.map((item) => item._uiKey));
+                state.setting.items.splice(state.setting.items.indexOf(row) + 1, 0, copy);
+                markDirty({ structural: true });
+                paint();
+            });
+            rowElement.querySelector('[data-subagent-remove]')?.addEventListener('click', () => {
+                const index = state.setting.items.indexOf(row);
+                if (index >= 0) state.setting.items.splice(index, 1);
+                markDirty({ structural: true });
+                paint();
+            });
+        });
+    }
+
+    function paint() {
+        const container = host();
+        if (!container) return false;
+        const nextSignature = availableSubagentsRenderSignature(state);
+        if (nextSignature === state.signature) return false;
+        const focused = focusSnapshot(container, getDoc());
+        state.signature = nextSignature;
+        const errors = validationErrors();
+        const diagnostics = diagnosticsText(state.diagnostics);
+        const source = state.source ? `Source: ${state.source}.` : '';
+        const readProblem = state.statusError
+            ? 'Live agent availability could not be read. Saved rows remain unchanged.' : '';
+        container.innerHTML = `
+            <div class="available-subagents-toolbar">
+                <label class="local-toggle">
+                    <input type="checkbox" data-subagents-enabled ${state.setting.enabled ? 'checked' : ''} ${state.loaded ? '' : 'disabled'}>
+                    Enabled
+                </label>
+                <span class="available-subagents-count">${state.setting.items.length}/${MAX_AVAILABLE_SUBAGENTS}</span>
+                <button type="button" class="btn btn-default" data-subagent-add
+                    ${!state.loaded || state.setting.items.length >= MAX_AVAILABLE_SUBAGENTS ? 'disabled' : ''}>Add subagent</button>
+            </div>
+            <div class="available-subagents-source">${escapeHtml([source, readProblem].filter(Boolean).join(' '))}</div>
+            <div data-subagents-diagnostics class="available-subagents-diagnostics" ${diagnostics.length ? '' : 'hidden'}>${escapeHtml(diagnostics.join(' · '))}</div>
+            <div data-subagents-validation class="available-subagents-diagnostics" data-tone="error" ${errors.length ? '' : 'hidden'}>${escapeHtml(errors[0] || '')}</div>
+            <div class="available-subagents-list">
+                ${state.loaded
+                    ? state.setting.items.map((row, index) => availableSubagentRowMarkup(row, state, index)).join('')
+                        || '<div class="available-subagents-empty">No subagents configured. Add one, or leave the list empty to make no actors available.</div>'
+                    : '<div class="available-subagents-empty">The saved configuration could not be loaded, so this editor will not replace it.</div>'}
+            </div>
+            <datalist id="available-subagent-api-model-catalog">
+                ${state.apiModels.map((model) => `<option value="${escapeHtml(model)}"></option>`).join('')}
+            </datalist>`;
+        container.querySelector('[data-subagents-enabled]')?.addEventListener('change', (event) => {
+            state.setting.enabled = Boolean(event.target.checked);
+            markDirty();
+        });
+        container.querySelector('[data-subagent-add]')?.addEventListener('click', () => {
+            if (state.setting.items.length >= MAX_AVAILABLE_SUBAGENTS) return;
+            const id = mintStableId('subagent', state.setting.items.map((row) => row.subagent_id));
+            state.setting.items.push({
+                subagent_id: id,
+                name: readableName(id),
+                recommended_use: '',
+                route: { kind: ROUTE_KIND_API_MODEL, target_id: '' },
+                _uiKey: mintStableId('actor_row',
+                    state.setting.items.map((row) => row._uiKey)),
+            });
+            markDirty({ structural: true });
+            paint();
+        });
+        bindRows(container);
+        restoreFocus(container, focused);
+        return true;
+    }
+
+    function load(value, { source = '', diagnostics = [], allowOmission = false } = {}) {
+        // Invalidate a preview launched for the previous settings document.
+        // A late response must never overwrite a freshly loaded configured row.
+        state.previewGeneration += 1;
+        state.previewSignature = '';
+        const parsed = parseAvailableSubagentsSetting(value);
+        state.loaded = Boolean(parsed.setting);
+        state.parseError = parsed.error;
+        state.unloadedOmissionAllowed = Boolean(
+            allowUnloadedOmission && allowOmission && !parsed.setting,
+        );
+        if (parsed.setting) state.setting = attachUiKeys(parsed.setting, state.setting.items);
+        state.source = String(source || '');
+        state.diagnostics = diagnostics;
+        state.dirty = false;
+        state.signature = '';
+        onDirtyChange(false);
+        paint();
+        return { loaded: state.loaded, error: state.parseError };
+    }
+
+    function applyGeneratedPreview(response) {
+        const parsed = parseAvailableSubagentsSetting(response?.available_subagents);
+        state.source = String(response?.source || state.source || 'onboarding_default');
+        state.diagnostics = response?.diagnostics || [];
+        let outerDraftClean = false;
+        try {
+            outerDraftClean = Boolean(isOuterDraftClean());
+        } catch (error) {
+            outerDraftClean = false;
+        }
+        const canApply = generatedPreviewCanReplace({
+            dirty: state.dirty,
+            outerDraftClean,
+            parsedSetting: parsed.setting,
+        });
+        if (canApply) {
+            state.loaded = true;
+            state.parseError = '';
+            state.setting = attachUiKeys(parsed.setting, state.setting.items);
+            onDirtyChange(false);
+            onGeneratedApply(buildAvailableSubagentsSetting(state.setting));
+        } else if (!parsed.setting && !state.loaded) {
+            state.parseError = parsed.error;
+        }
+        state.signature = '';
+        paint();
+        return { applied: canApply, error: parsed.error };
+    }
+
+    function setPreviewFailure(error) {
+        const message = String(
+            error?.body?.detail || error?.body?.error || error?.message || error,
+        );
+        const code = String(error?.body?.code || '').trim();
+        state.diagnostics = [
+            `${code ? `${code}: ` : ''}${message}`,
+            ...diagnosticsText(error?.body?.diagnostics),
+        ];
+        if (!state.loaded) {
+            state.parseError = `Available subagents preview failed: ${state.diagnostics.join(' · ')}`;
+        }
+        state.signature = '';
+        paint();
+    }
+
+    async function reloadStatus() {
+        await boundedStatusRefresh(store);
+        adoptStatus();
+        paint();
+        // Generated rows are enrichment, never a second unbounded gate on the
+        // Settings critical path. The response is generation- and clean-gated.
+        void maybeRefreshGeneratedPreview({ force: true });
+    }
+
+    async function maybeRefreshGeneratedPreview({ force = false } = {}) {
+        if (typeof previewGenerated !== 'function' || state.source !== 'undecided' || state.dirty) {
+            return false;
+        }
+        let outerDraftClean = false;
+        try {
+            outerDraftClean = Boolean(isOuterDraftClean());
+        } catch (error) {
+            outerDraftClean = false;
+        }
+        if (!outerDraftClean) return false;
+        const connected = state.accountsKnown
+            ? [...connectedHarnessIds(state.snapshot)].sort()
+            : [];
+        const signature = JSON.stringify([state.accountsKnown, connected]);
+        if (!force && signature === state.previewSignature) return false;
+        state.previewSignature = signature;
+        const generation = ++state.previewGeneration;
+        try {
+            const response = await previewGenerated({
+                subscriptionsConnected: state.accountsKnown && connected.length > 0,
+            });
+            if (generation !== state.previewGeneration) return false;
+            // This is still the unsaved migration/default candidate.  Preserve
+            // that provenance so a later clean account-status change may
+            // refresh it again; onboarding editors keep the endpoint source.
+            const result = applyGeneratedPreview({ ...response, source: state.source });
+            if (!result.applied) state.previewSignature = '';
+            return result.applied;
+        } catch (error) {
+            if (generation !== state.previewGeneration) return false;
+            setPreviewFailure(error);
+            return false;
+        }
+    }
+
+    function mount({ bindStatus = true } = {}) {
+        adoptStatus();
+        if (bindStatus && !state.statusDisposer) {
+            state.statusDisposer = bindStatusSurface(store, {
+                elementId: hostId,
+                includeModels: true,
+                doc: getDoc,
+                win: getWin,
+                listener: () => {
+                    adoptStatus();
+                    paint();
+                    void maybeRefreshGeneratedPreview();
+                },
+            });
+        }
+        if (!state.catalogDisposer) {
+            const target = getDoc();
+            const onCatalog = (event) => {
+                state.apiModels = (event?.detail?.items || [])
+                    .map((item) => String(item.value || item.id || ''))
+                    .filter(Boolean);
+                state.signature = '';
+                paint();
+            };
+            target?.addEventListener?.('settings-model-catalog:updated', onCatalog);
+            state.catalogDisposer = () => target?.removeEventListener?.('settings-model-catalog:updated', onCatalog);
+        }
+        state.signature = '';
+        paint();
+    }
+
+    function destroy() {
+        state.statusDisposer?.();
+        state.catalogDisposer?.();
+        state.statusDisposer = null;
+        state.catalogDisposer = null;
+    }
+
+    return {
+        mount,
+        destroy,
+        load,
+        paint,
+        reloadStatus,
+        refreshGeneratedPreview: maybeRefreshGeneratedPreview,
+        applyGeneratedPreview,
+        setPreviewFailure,
+        validate: validationErrors,
+        collect: () => availableSubagentsSavePayload(state),
+        get setting() { return buildAvailableSubagentsSetting(state.setting); },
+        get loaded() { return state.loaded; },
+        get dirty() { return state.dirty; },
+        get parseError() { return state.parseError; },
+    };
+}
+
+export function availableSubagentsEditorHost(hostId = 'available-subagents-editor') {
+    return `<div id="${escapeHtml(hostId)}" class="available-subagents-editor">
+        <div class="available-subagents-empty">Loading Available subagents…</div>
+    </div>`;
+}
 
 export function renderSubagentsSection() {
     return `
         <div class="form-section" id="subagents-section">
-            <h3>Delegation</h3>
+            <h3>Available subagents</h3>
             <div class="settings-section-copy">
-                Where Ouroboros's subagents run, how many of them there may be, and how far they
-                may write. By default a subagent is an ordinary child on your API budget.
-                Delegation hands its work to a connected agent subscription — that part spends the
-                subscription's window; the subagent itself still runs on the API to drive and
-                check it.
+                Describe when Ouroboros should choose each numbered subagent, then select how it runs.
+                Internal references stay stable automatically. A route that is unavailable stays saved
+                and returns an explicit refusal instead of silently changing actor or model. An unpinned
+                session row may rotate among compatible healthy accounts for that same route.
             </div>
-            <div id="subagents-rows" class="reviewer-slot-rows"></div>
+            ${availableSubagentsEditorHost()}
             <div class="settings-effort-card">
                 <label>Allow mutative subagents</label>
                 <input id="s-allow-mutative-subagents" type="hidden" value="on">
@@ -327,14 +813,9 @@ export function renderSubagentsSection() {
                     ],
                 })}
                 <div class="settings-inline-note">
-                    Whether a subagent may WRITE — in an isolated git worktree of this repo, an external
-                    workspace, or a from-scratch project — and return patches for the parent to review.
-                    Read-only subagents are always allowed, and this applies to delegated and API
-                    subagents alike. With no explicit choice (Auto) the runtime mode decides:
-                    Advanced and Pro allow every surface; Light allows only children that build
-                    OUTSIDE the Ouroboros runtime (external workspaces and from-scratch projects)
-                    and keeps worktree-of-this-repo children off. <strong>Human controlled:</strong>
-                    the agent cannot self-enable it; applies on the next task, no restart.
+                    Whether a subagent may write in an isolated worktree, external workspace, or
+                    from-scratch project. Read-only subagents remain available. Auto follows runtime
+                    mode; this applies to new child tasks without a restart.
                 </div>
             </div>
             <div class="form-grid two">
@@ -345,14 +826,10 @@ export function renderSubagentsSection() {
                 </div>
                 <div class="form-field">
                     <label>Subagent depth</label>
-                    <!-- 0 is a real owner choice ("no delegation at all"), honoured
-                         structurally since v6.79.0 — it must be reachable here. -->
                     <input id="s-subagent-depth" type="number" min="0" max="10" value="2">
-                    <div class="settings-inline-note">How deep the chain of subagents may nest. <code>0</code> turns delegation off entirely.</div>
+                    <div class="settings-inline-note">How deep the chain may nest. <code>0</code> turns delegation off entirely.</div>
                 </div>
             </div>
-            <!-- Two paths nobody edits in a normal week, kept out of the way so
-                 the tab stays scannable (the house "More options" pattern). -->
             <details class="settings-subsection" id="delegation-advanced">
                 <summary>Advanced — where subagents check out their work</summary>
                 <div class="settings-subsection-body">
@@ -367,190 +844,89 @@ export function renderSubagentsSection() {
                         </div>
                     </div>
                     <div class="settings-inline-note">
-                        Where an acting subagent checks out a git worktree of this repo, or builds a
-                        from-scratch (<code>genesis</code>) project. Both live outside the app repo and
-                        data. Genesis projects are durable and never auto-removed; worktrees are
-                        cleaned by the GC retention setting in Advanced. Leave a root blank for the
-                        default under <code>~/Ouroboros/</code>.
+                        Leave either root blank for its default under <code>~/Ouroboros/</code>.
+                        Genesis projects are durable; worktrees follow the GC retention setting.
                     </div>
                 </div>
             </details>
-        </div>
-    `;
+        </div>`;
 }
 
-function currentView() {
-    // The model select renders only while delegation is enabled, and its
-    // handler re-asserts enabled=true (same as the harness handler), so a
-    // non-null model edit never rides a null enabled.
-    return delegationView({
-        saved: state.saved,
-        payload: state.payload,
-        statusError: state.statusError,
-        accountsRead: state.accountsRead,
-        catalogRead: state.catalogRead,
-        edit: state.enabled === null
-            ? null
-            : { enabled: state.enabled, harness: state.harness, model: state.model },
-        loaded: state.loaded,
-    });
+let settingsEditor = null;
+
+function settingsSource(settings) {
+    return String(settings?._meta?.available_subagents?.source
+        || settings?._meta?.available_subagents_source
+        || settings?.OUROBOROS_SUBAGENTS_SOURCE
+        || 'configured');
 }
 
-function renderRows() {
-    const host = document.getElementById('subagents-rows');
-    if (!host) return;
-    const view = currentView();
-    const offerControls = view.state !== 'no_subscription' && view.state !== 'unknown' && view.state !== 'loading';
-    const options = view.options.map((item) => {
-        const selected = item.id === view.harness ? ' selected' : '';
-        return `<option value="${escapeHtml(item.id)}"${selected}>${escapeHtml(item.label)}</option>`;
-    }).join('');
-    const modelOptions = view.modelOptions.map((opt) => {
-        const selected = opt.value === view.model ? ' selected' : '';
-        return `<option value="${escapeHtml(opt.value)}"${selected}>${escapeHtml(opt.label)}</option>`;
-    }).join('');
-    const lastLine = lastDelegationLine(state.payload?.subagent_last_delegation);
-    host.innerHTML = `
-        <div class="reviewer-slot-row" data-subagent-row>
-            ${offerControls ? `
-            <div class="reviewer-slot-controls">
-                <select data-subagent-delegation aria-label="Delegate subagents">
-                    <option value="off"${view.enabled ? '' : ' selected'}>Subagents run on the API</option>
-                    <option value="on"${view.enabled ? ' selected' : ''}>Delegate to an agent subscription</option>
-                </select>
-                ${view.enabled ? `<select data-subagent-harness aria-label="Agent">${options}</select>` : ''}
-                ${view.enabled ? `<select data-subagent-model aria-label="Agent model">${modelOptions}</select>` : ''}
-            </div>` : ''}
-            <div class="reviewer-slot-meta muted">${escapeHtml(view.note)}</div>
-            ${lastLine ? `<div class="reviewer-slot-meta muted">${escapeHtml(lastLine)}</div>` : ''}
-        </div>
-    `;
-    bindRowEvents();
+export function availableSubagentsLoadValue(settings) {
+    const raw = settings?.OUROBOROS_SUBAGENTS;
+    if (raw !== undefined && raw !== null && raw !== '') return raw;
+    return settings?._meta?.available_subagents?.candidate ?? raw;
 }
 
-function bindRowEvents() {
-    const host = document.getElementById('subagents-rows');
-    if (!host) return;
-    host.querySelector('[data-subagent-delegation]')?.addEventListener('change', (event) => {
-        // Only the ANSWER is stored; which route that resolves to (the saved one,
-        // or the first connected subscription) stays delegationView's decision.
-        state.enabled = event.target.value === 'on';
-        renderRows();
-        state.onChange();
+/** Whether this response carries owner or repair bytes that must be fixed in-place. */
+export function availableSubagentsHasExplicitDraft(settings) {
+    const raw = settings?.OUROBOROS_SUBAGENTS;
+    if (raw !== undefined && raw !== null && raw !== '') return true;
+    const meta = settings?._meta?.available_subagents;
+    return meta != null
+        && Object.prototype.hasOwnProperty.call(meta, 'candidate')
+        && meta.candidate !== undefined
+        && meta.candidate !== null
+        && meta.candidate !== '';
+}
+
+export function initSubagentsSection({
+    onChange,
+    isOuterDraftClean,
+    onGeneratedApply,
+    previewGenerated = null,
+    store = claudexorStatus,
+} = {}) {
+    destroySubagentsSection();
+    settingsEditor = createAvailableSubagentsEditor({
+        store,
+        onChange: typeof onChange === 'function' ? onChange : () => {},
+        isOuterDraftClean: typeof isOuterDraftClean === 'function'
+            ? isOuterDraftClean : () => true,
+        onGeneratedApply: typeof onGeneratedApply === 'function'
+            ? onGeneratedApply : () => {},
+        allowUnloadedOmission: true,
+        previewGenerated,
     });
-    host.querySelector('[data-subagent-harness]')?.addEventListener('change', (event) => {
-        state.enabled = true;
-        state.harness = String(event.target.value || '');
-        // The model belongs to the harness it was picked for: switching resets
-        // the unsaved pick, and delegationView drops the saved tail, so the
-        // select visibly shows "Engine default model" (accepted residual).
-        state.model = null;
-        renderRows();
-        state.onChange();
-    });
-    host.querySelector('[data-subagent-model]')?.addEventListener('change', (event) => {
-        state.enabled = true;
-        state.model = String(event.target.value || '');
-        renderRows();
-        state.onChange();
-    });
+    settingsEditor.mount();
 }
 
 export function applySubagentsSettings(settings) {
-    state.saved = String(settings?.OUROBOROS_SUBAGENT_HARNESS ?? '').trim();
-    state.enabled = null;
-    state.harness = '';
-    state.model = null;
-    renderRows();
-}
-
-export function renderSignature(store) {
-    // Everything this section RENDERS, so a repaint is skipped only when the
-    // pixels would really be identical. The model list was keyed on its LENGTH,
-    // and a swap at equal count (a harness renaming or replacing a model)
-    // therefore left the section showing the model that no longer exists and
-    // never offering the one that does — the select is built from these very
-    // ids. Compare the ids, not how many of them there are.
-    const snapshot = store.snapshot || {};
-    return [
-        store.reads,
-        store.error,
-        connectedHarnesses(snapshot),
-        (snapshot.harnesses || []).map((harness) => [
-            String(harness?.id || ''),
-            (harness?.models || []).map((model) => String(model?.id || model?.value || model || '')),
-            // The typed model-read gap is RENDERED (it adds a sentence to the
-            // note and withdraws the not-in-discovery label), so a later probe
-            // that succeeds must repaint even when the list stays the same.
-            String(harness?.models_error || ''),
-        ]),
-        snapshot.subagent_last_delegation || null,
-    ];
-}
-
-function adoptStoreSnapshot() {
-    // includeModels: the same status payload, plus per-harness model discovery
-    // for the default-model select. The flag is STICKY on the store, so the
-    // accounts panel's own polls keep carrying models once this section has
-    // asked once — no surface can silently downgrade another's snapshot.
-    state.accountsRead = state.store.facet(FACET_ACCOUNTS);
-    state.catalogRead = state.store.facet(FACET_CATALOG);
-    state.statusError = state.store.error || '';
-    state.payload = state.statusError ? null : state.store.snapshot;
-    // "Not read YET" is not "read and found nothing": the pre-request paint
-    // must keep saying it is reading, or a connected owner briefly sees
-    // "No agent subscription is connected".
-    state.loaded = state.store.everSettled;
+    if (!settingsEditor) return;
+    const meta = settings?._meta?.available_subagents || {};
+    settingsEditor.load(availableSubagentsLoadValue(settings), {
+        source: settingsSource(settings),
+        diagnostics: meta.diagnostics || meta.diagnostic || [],
+        allowOmission: !availableSubagentsHasExplicitDraft(settings),
+    });
 }
 
 export async function reloadSubagentsSection() {
-    await state.store.refresh({ includeModels: true });
-    adoptStoreSnapshot();
-    renderRows();
-}
-
-export function initSubagentsSection({ onChange, store = claudexorStatus } = {}) {
-    destroySubagentsSection();
-    state.onChange = typeof onChange === 'function' ? onChange : () => {};
-    state.store = store;
-    // Stay in sync with the ONE status read: when the daemon comes up while
-    // Settings is open, this section stops saying "could not be listed" without
-    // the owner reloading the page. That needs the SHARED surface binding — a
-    // bare subscribe() carries no visibility predicate, and the store never
-    // polls for a subscriber that cannot say it is on screen, so nothing ever
-    // arrived to react to. Re-render only on a state change that this section
-    // actually renders: a repaint on every poll tick would drop the caret out
-    // of a control the owner is using.
-    let signature = '';
-    state.disposers.push(bindStatusSurface(state.store, {
-        elementId: 'subagents-rows',
-        includeModels: true,
-        listener: () => {
-            const next = JSON.stringify(renderSignature(state.store));
-            adoptStoreSnapshot();
-            if (next === signature) return;
-            signature = next;
-            renderRows();
-        },
-    }));
-    // The initial load is driven by settings.js loadSettings(), which awaits
-    // reloadSubagentsSection() BEFORE taking the clean-draft baseline — otherwise
-    // the async arrival of the accounts would read as an unsaved edit.
+    await settingsEditor?.reloadStatus();
 }
 
 export function destroySubagentsSection() {
-    for (const dispose of state.disposers.splice(0)) {
-        try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
-    }
+    settingsEditor?.destroy();
+    settingsEditor = null;
 }
 
 export function collectSubagentsSettings() {
-    // Never author the route from an UNLOADED or unreadable view: an unrelated
-    // save must not turn delegation off because this page could not reach the
-    // daemon (same rule as collectReviewerSlots). A STOPPED daemon is the same
-    // class — the section rendered no control, so it has no answer to save.
-    if (!state.loaded || state.statusError) return {};
-    const view = currentView();
-    if (view.state === 'no_subscription' || view.state === 'unknown' || view.state === 'loading') return {};
-    return { OUROBOROS_SUBAGENT_HARNESS: composeSubagentRoute(view.harness, view.suffix) };
+    return settingsEditor?.collect() || {};
 }
+
+export function validateSubagentsDraft() {
+    return settingsEditor?.validate() || ['Available subagents editor is not loaded.'];
+}
+
+// Compatibility name retained for focused callers; the signature now covers
+// the actor list rather than the retired singleton route.
+export const renderSignature = availableSubagentsRenderSignature;

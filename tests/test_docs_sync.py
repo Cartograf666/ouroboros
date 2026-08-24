@@ -121,6 +121,34 @@ def test_phase3_governance_language_is_pinned_without_new_qa_surface():
     assert "No visual-QA runner, endpoint, ledger" in " ".join(architecture.split())
 
 
+def test_continuity_projection_contract_is_mirrored_across_governance_docs():
+    """Keep the partial-input rule and its concrete data-flow map from drifting."""
+    bible = " ".join(_read("BIBLE.md").split()).replace("**", "")
+    architecture = " ".join(_read("docs/ARCHITECTURE.md").split())
+    development = " ".join(_read("docs/DEVELOPMENT.md").split())
+    checklists = _read("docs/CHECKLISTS.md")
+
+    assert (
+        "Disclosure is not sufficiency. An omission marker keeps a record honest; "
+        "it does not make the record complete. Where material is omitted, the "
+        "disclosure must name a source this actor can actually resolve. A view known "
+        "to be partial may not authorize PASS, a destructive rewrite, or replacement "
+        "of the full contract it was cut from."
+    ) in bible
+    assert "Continuity data-flow map" in architecture
+    assert "state/consciousness_observations.jsonl" in architecture
+    assert "Source-complete decision pipeline" in development
+    assert "Context and growth matrix" in development
+    for item in (
+        "source_completeness",
+        "actor_readable_projection",
+        "canonical_memory_fork",
+        "review_artifact_continuity",
+        "display_identity_replay",
+    ):
+        assert item in checklists
+
+
 def test_phase3_widget_authoring_docs_match_recursive_schema_v1():
     development = _read("docs/DEVELOPMENT.md")
     authoring = _read("docs/CREATING_SKILLS.md")
@@ -163,7 +191,7 @@ def test_architecture_mirror_matches_the_split_axes_contracts():
     assert "compact_task_group" not in arch
     # schedule_subagent reports the request only; the axes resolve at dispatch.
     assert "schedule_subagent surfaces effective_lane(s)" not in arch_flat
-    assert "schedule_subagent reports the requested lane only" in arch_flat
+    assert "`schedule_subagent` reports the requested lane only" in arch_flat
     # swarm_fanout carries the requested lane; a wave event written before any
     # child starts cannot know what the children ran on.
     assert "requested/effective lanes" not in arch

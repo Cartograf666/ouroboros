@@ -20,9 +20,11 @@ import {
     familyListHtml,
     familyStatusText,
     ladderHtml,
+    onboardingSettingsDraft,
     readCompletionAnswer,
     rotationDiagramSvg,
     subscriptionDeclaration,
+    subagentPreviewStatusSignature,
 } from '../modules/onboarding_agents_step.js';
 
 const json = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
@@ -38,7 +40,7 @@ function snapshotWith(harnesses) {
     return {
         daemon: { state: 'running' },
         reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
-        harnesses: [{ id: 'claude' }, { id: 'codex' }, { id: 'cursor' }],
+        harnesses: [{ id: 'claude' }, { id: 'codex' }, { id: 'cursor' }, { id: 'agy' }],
         profiles: {
             harnessAccounts: harnesses.map((harness) => ({
                 harness_id: harness, native_login_detected: true,
@@ -80,12 +82,14 @@ test('the footnote refuses both easy lies: "free", and "every reviewer moves"', 
     assert.match(LADDER_FOOTNOTE, /not free/i);
     assert.match(LADDER_FOOTNOTE, /already\s+pay for/i);
     // The surfaces that stay on the API key are NAMED (D15), not glossed over.
-    assert.match(LADDER_FOOTNOTE, /Plan review, task acceptance and skill review/i);
+    assert.match(LADDER_FOOTNOTE, /Task acceptance and skill review/i);
+    // plan review is NOT API-pinned any more: it rides each triad row (spec-gate redesign)
+    assert.match(LADDER_FOOTNOTE, /plan review follows each triad row/i);
     assert.match(LADDER_FOOTNOTE, /stay on the API key/i);
     assert.doesNotMatch(LADDER_FOOTNOTE, /all reviewers|every reviewer/i);
 });
 
-test('the step renders the ladder, one row per family, and blocks nothing', () => {
+test('the step renders the ladder, one row per family, and the editable actor host', () => {
     const html = agentsStepHtml();
     const rows = familyListHtml(snapshotWith([]));
 
@@ -96,9 +100,10 @@ test('the step renders the ladder, one row per family, and blocks nothing', () =
     }
     assert.ok(html.includes('id="agents-login-host"'));
     assert.ok(html.includes('id="agents-outcome"'));
-    // SKIPPABLE: the step owns no input at all, so nothing on it can be
-    // required, invalid, or in the way of Continue.
-    assert.doesNotMatch(html + rows, /<input|required/);
+    assert.ok(html.includes('id="onboarding-available-subagents"'));
+    // Continue stays non-blocking on this step; final completion validates the
+    // canonical draft once it has been previewed.
+    assert.doesNotMatch(html + rows, /\srequired(?:\s|>)/);
 });
 
 // ---------------------------------------------------------------------------
@@ -163,11 +168,31 @@ test('one connected account declares the preset request and promises nothing cer
     const text = agentsOutcomeText(['claude']);
     assert.match(text, /Claude Code is connected/);
     assert.match(text, /commit review/);
-    assert.match(text, /delegated subagents/);
+    assert.match(text, /Available subagents/);
     // Conditional by construction: the compiler may still refuse a seat.
     assert.match(text, /will try to/);
     assert.match(text, /nothing is changed/);
     assert.doesNotMatch(text, /guarantee|always/i);
+});
+
+test('an Antigravity-only setup promises task actors but no reviewer migration', () => {
+    const snapshot = snapshotWith(['agy']);
+    assert.deepEqual(connectedHarnesses(snapshot), ['agy']);
+    const text = agentsOutcomeText(['agy'], { snapshot });
+    assert.match(text, /Antigravity is connected/);
+    assert.match(text, /subscription-backed choices to Available subagents/);
+    assert.match(text, /task-only/);
+    assert.match(text, /does not change reviewer routes/);
+    assert.doesNotMatch(text, /move commit review|scope pass|advisory pre-review/);
+});
+
+test('a mixed reviewer-capable and task-only setup names each capability separately', () => {
+    const snapshot = snapshotWith(['codex', 'agy']);
+    const text = agentsOutcomeText(['codex', 'agy'], { snapshot });
+    assert.match(text, /Codex and Antigravity are connected/);
+    assert.match(text, /Codex can also move commit review/);
+    assert.match(text, /Antigravity is task-only/);
+    assert.doesNotMatch(text, /Antigravity can also move commit review/);
 });
 
 test('several accounts are named in family order and the rows say they rotate', () => {
@@ -185,6 +210,33 @@ test('several accounts are named in family order and the rows say they rotate', 
         tone: 'ok', text: '2 accounts connected · they rotate',
     });
     assert.deepEqual(familyStatusText(twoInOne, 'claude'), { tone: 'muted', text: 'Not connected' });
+});
+
+test('an all-disabled family is not connected — the aggregate reads the enabled fact', () => {
+    // The owner switched every codex account OFF: rotation never takes them,
+    // so the wizard must not declare the family connected under a header that
+    // says the opposite (the same rule the Subagents section applies).
+    const allOff = snapshotWith([]);
+    allOff.profiles.profiles = [
+        { profile: { harness_id: 'codex', profile_id: 'a', enabled: false }, status: { verification: 'passed' } },
+        { profile: { harness_id: 'codex', profile_id: 'b', enabled: false }, status: { verification: 'passed' } },
+    ];
+    assert.deepEqual(connectedHarnesses(allOff), []);
+    assert.deepEqual(familyStatusText(allOff, 'codex'), { tone: 'muted', text: 'Not connected' });
+
+    // One row re-enabled: enabled+passed still connects and counts — and the
+    // count excludes the disabled sibling instead of over-promising the pool.
+    const oneOn = snapshotWith([]);
+    oneOn.profiles.profiles = [
+        { profile: { harness_id: 'codex', profile_id: 'a', enabled: false }, status: { verification: 'passed' } },
+        { profile: { harness_id: 'codex', profile_id: 'b', enabled: true }, status: { verification: 'passed' } },
+    ];
+    assert.deepEqual(connectedHarnesses(oneOn), ['codex']);
+    assert.deepEqual(familyStatusText(oneOn, 'codex'), { tone: 'ok', text: 'Connected' });
+
+    // Absent stays connected: the fail-open default, exactly like the panel.
+    const legacy = snapshotWith(['claude']);
+    assert.deepEqual(connectedHarnesses(legacy), ['claude']);
 });
 
 test('a family the engine renames is spoken in the engine words, never as a raw id', () => {
@@ -223,8 +275,45 @@ test('the owner skip produces a declaration that asks for NO preset', () => {
         subscriptionsConnected: true, skipSubscriptionPresets: true,
     });
     const text = agentsOutcomeText(['claude'], { skipPresets: true });
-    assert.match(text, /finish without agent defaults/i);
-    assert.match(text, /stay on your API access/i);
+    assert.match(text, /skip the automatic subscription preset/i);
+    assert.match(text, /saved exactly as you edit it/i);
+    assert.match(text, /Available subagents draft/i);
+    assert.doesNotMatch(text, /subagents stay on your API access/i);
+});
+
+test('preview and completion can share one open provider/local/model draft', () => {
+    const draft = onboardingSettingsDraft({
+        state: {
+            openaiKey: ' key ', totalBudget: '25', reviewEnforcement: 'blocking',
+            localSource: '', localRoutingMode: 'cloud', mainModel: 'openai/gpt-5.6-sol',
+            runtimeMode: 'advanced',
+        },
+        providerFields: [{ settingKey: 'OPENAI_API_KEY', stateKey: 'openaiKey' }],
+        budgetFields: [{ settingKey: 'OUROBOROS_TOTAL_BUDGET_USD', stateKey: 'totalBudget' }],
+        modelSlots: [{ settingKey: 'OUROBOROS_MODEL', stateKey: 'mainModel' }],
+        trim: (value) => String(value || '').trim(),
+    });
+    assert.equal(draft.OPENAI_API_KEY, 'key');
+    assert.equal(draft.OUROBOROS_TOTAL_BUDGET_USD, 25);
+    assert.equal(draft.OUROBOROS_MODEL, 'openai/gpt-5.6-sol');
+    assert.equal(draft.OUROBOROS_REVIEW_ENFORCEMENT, 'blocking');
+    assert.equal(draft.OUROBOROS_RUNTIME_MODE, 'advanced');
+    assert.equal('OUROBOROS_MODEL_HEAVY' in draft, false);
+});
+
+test('a late status settle invalidates preview on model/account facts, not timestamps', () => {
+    const base = snapshotWith(['codex']);
+    base.harnesses = [{ id: 'codex', models: [{ id: 'model-a' }] }];
+    const view = { reads: { catalog: 'ok', accounts: 'ok' } };
+    const first = subagentPreviewStatusSignature(view, base);
+
+    const modelChanged = structuredClone(base);
+    modelChanged.harnesses[0].models = [{ id: 'model-b' }];
+    assert.notEqual(subagentPreviewStatusSignature(view, modelChanged), first);
+
+    const timestampOnly = structuredClone(base);
+    timestampOnly.profiles.harnessAccounts[0].last_verified_at = '2099-01-01T00:00:00Z';
+    assert.equal(subagentPreviewStatusSignature(view, timestampOnly), first);
 });
 
 // ---------------------------------------------------------------------------
@@ -366,7 +455,10 @@ function fakeDom() {
         };
         return node;
     };
-    for (const id of ['agents-family-list', 'agents-status-note', 'agents-outcome', 'agents-login-host']) {
+    for (const id of [
+        'agents-family-list', 'agents-status-note', 'agents-outcome',
+        'agents-login-host', 'onboarding-available-subagents',
+    ]) {
         nodes.set(id, make(id));
     }
     const defaultView = {
@@ -423,6 +515,107 @@ test('the step reads the shared store — it never fetches the status endpoint i
     assert.equal(store.subscriberCount, 0);
     assert.equal(dom.documentListeners.length, 0, 'pagehide must never bind to Document');
     assert.equal(dom.windowListeners.length, 0, 'the step must leave no Window listener behind');
+    store.dispose();
+});
+
+test('the generated onboarding draft shows a credentialed one-harness API scout and stays editable', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, snapshotWith(['codex'])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const dom = fakeDom();
+    const previews = [];
+    const step = createAgentsStep({
+        doc: dom.doc,
+        store,
+        previewPayload: () => ({ OPENAI_API_KEY: 'MASKED', OUROBOROS_MODEL: 'openai/gpt-5.6-sol' }),
+        previewTransport: async (payload) => {
+            previews.push(payload);
+            return {
+                source: 'onboarding_default',
+                diagnostics: [],
+                available_subagents: {
+                    enabled: true,
+                    items: [
+                        {
+                            subagent_id: 'api_fast_scout',
+                            name: 'Fast API scout',
+                            recommended_use: 'Fast independent research before implementation.',
+                            route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' },
+                            effort: 'high',
+                        },
+                        {
+                            subagent_id: 'codex_builder',
+                            name: 'Codex builder',
+                            recommended_use: 'Workspace implementation.',
+                            route: { kind: 'agent_session', target_id: 'codex=gpt-5.6-sol-high' },
+                        },
+                    ],
+                },
+            };
+        },
+    });
+    step.mount();
+    await flush();
+    await flush();
+
+    assert.equal(previews.length >= 1, true);
+    assert.equal(previews.at(-1).subscriptionsConnected, true);
+    assert.equal(step.availableSubagents.items[0].subagent_id, 'api_fast_scout');
+    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Subagent 1/);
+    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Fast independent research before implementation/);
+    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Subagent 2/);
+    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Workspace implementation/);
+    assert.doesNotMatch(dom.nodes.get('onboarding-available-subagents').innerHTML, /data-subagent-field="(?:id|name)"/);
+    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Generated draft/);
+    assert.deepEqual(step.validateSubagents(), []);
+
+    step.detach();
+    store.dispose();
+});
+
+test('a model change regenerates a clean onboarding draft and invalidates the older receipt', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, snapshotWith([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const dom = fakeDom();
+    let model = 'openai/model-a';
+    const step = createAgentsStep({
+        doc: dom.doc,
+        store,
+        previewPayload: () => ({ OUROBOROS_MODEL: model }),
+        previewTransport: async (payload) => ({
+            source: 'onboarding_default',
+            diagnostics: [],
+            available_subagents: {
+                enabled: true,
+                items: [
+                    {
+                        subagent_id: 'main-builder',
+                        name: 'Main builder',
+                        recommended_use: 'Use the current main model.',
+                        route: { kind: 'api_model', target_id: payload.OUROBOROS_MODEL },
+                    },
+                ],
+            },
+        }),
+    });
+    step.mount();
+    await flush();
+    assert.equal(step.availableSubagents.items[0].route.target_id, 'openai/model-a');
+    assert.equal(step.generatedPreviewReady, true);
+
+    model = 'openai/model-b';
+    step.invalidateGeneratedPreview();
+    assert.equal(step.generatedPreviewReady, false);
+    assert.equal(await step.refreshSubagentsPreview({ force: true }), true);
+    assert.equal(step.availableSubagents.items[0].route.target_id, 'openai/model-b');
+    assert.equal(step.generatedPreviewReady, true);
+
+    step.detach();
     store.dispose();
 });
 
@@ -591,15 +784,17 @@ test('pagehide binds to Window, preserves bfcache, and detaches late work synchr
     step.mount();
     await flush();
 
-    assert.deepEqual(dom.documentListeners, [], 'Document is not the pagehide target');
-    assert.equal(dom.windowListeners.length, 1);
+    assert.equal(dom.documentListeners.some(([event]) => event === 'pagehide'), false,
+        'Document is not the pagehide target');
+    assert.equal(dom.windowListeners.length, 3,
+        'pagehide plus the shared status surface activation hooks are bounded');
     const [type, onPageHide] = dom.windowListeners[0];
     assert.equal(type, 'pagehide');
     handlers[handlers.length - 1]();
     await flush();
 
     onPageHide({ persisted: true });
-    assert.equal(dom.windowListeners.length, 1, 'bfcache keeps the live step mounted');
+    assert.equal(dom.windowListeners.length, 3, 'bfcache keeps the live step mounted');
 
     const lifecycleBefore = calls.filter(([url]) => url.startsWith('/api/claudexor/login')).length;
     onPageHide({ persisted: false });
@@ -640,11 +835,53 @@ test('the skip choice is reflected in the outcome the owner reads before finishi
     step.mount();
     await flush();
 
-    step.setSkipPresets(true);
-    assert.match(dom.nodes.get('agents-outcome').textContent, /finish without agent defaults/i);
+    await step.setSkipPresets(true);
+    assert.match(dom.nodes.get('agents-outcome').textContent, /skip the automatic subscription preset/i);
     assert.deepEqual(step.declaration(), {
         subscriptionsConnected: true, skipSubscriptionPresets: true,
     });
+    step.detach();
+    store.dispose();
+});
+
+test('the skip choice refreshes a failed subscription preview before completion', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, snapshotWith(['claude'])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const dom = fakeDom();
+    const previews = [];
+    const step = createAgentsStep({
+        doc: dom.doc,
+        store,
+        previewTransport: async (payload) => {
+            previews.push(payload);
+            if (!payload.skipSubscriptionPresets) throw new Error('subscription preview unavailable');
+            return {
+                source: 'api_default',
+                diagnostics: [],
+                available_subagents: {
+                    enabled: true,
+                    items: [{
+                        subagent_id: 'api-scout',
+                        name: 'API scout',
+                        recommended_use: 'Use when subscription presets are skipped.',
+                        route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' },
+                    }],
+                },
+            };
+        },
+    });
+    step.mount();
+    await flush();
+    assert.equal(step.generatedPreviewReady, false);
+
+    assert.equal(await step.setSkipPresets(true), true);
+    assert.equal(previews.at(-1).skipSubscriptionPresets, true);
+    assert.equal(step.generatedPreviewReady, true);
+    assert.equal(step.availableSubagents.items[0].subagent_id, 'api-scout');
+
     step.detach();
     store.dispose();
 });

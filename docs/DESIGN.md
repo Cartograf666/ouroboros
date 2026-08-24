@@ -167,6 +167,11 @@ a server entry):
    secondary ink reads as disabled; if the owner can click it, it is
    `--text-primary`.
 
+For a row with one action and a durable result, the result occupies the flexible
+left side and the neutral action stays docked on the right. Field-level actions
+(for example Show/Clear) keep the field's control height; they are not reused as
+the compact result-row action.
+
 Rows of the same kind are equivalent: no row gets extra visual weight for
 being first, default, or native. Grouping and section-level actions express
 which family a row belongs to, and a section-level action (add, connect)

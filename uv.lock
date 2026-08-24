@@ -1554,7 +1554,7 @@ wheels = [
 
 [[package]]
 name = "ouroboros"
-version = "6.102.0"
+version = "6.111.0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
@@ -1564,6 +1564,7 @@ dependencies = [
     { name = "gigachat" },
     { name = "httpx" },
     { name = "huggingface-hub" },
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "openai" },
     { name = "pillow" },
@@ -1634,6 +1635,7 @@ requires-dist = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "huggingface-hub", marker = "extra == 'all'" },
+    { name = "jsonschema", specifier = ">=4.0" },
     { name = "llama-cpp-python", marker = "extra == 'all'" },
     { name = "llama-cpp-python", marker = "extra == 'local-model'" },
     { name = "mcp", specifier = ">=1.6,<2.0" },

@@ -57,6 +57,12 @@
   --status-error-bg: var(--red-dim);
   --status-neutral-fg: var(--text-meta);
   --status-neutral-bg: rgba(255, 255, 255, 0.08);
+  --radius-sm: 8px;
+  --button-padding-y: 8px;
+  --button-padding-x: 16px;
+  --button-font-size: 13px;
+  --button-min-height: 34px;
+  --focus-accent-border: rgba(232, 93, 111, 0.4);
 }
 
 * {
@@ -82,7 +88,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -401,7 +408,8 @@ textarea::placeholder {
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   min-width: 0;
   padding: 10px 12px;
@@ -434,7 +442,8 @@ select {
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   border-color: var(--border-strong);
   box-shadow: 0 0 0 3px rgba(232, 93, 111, 0.12);
 }
@@ -650,10 +659,15 @@ select:focus {
 
 .btn {
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  padding: var(--button-padding-y) var(--button-padding-x);
   cursor: pointer;
-  font-size: var(--type-body);
+  font-size: var(--button-font-size);
+  min-height: var(--button-min-height);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 
@@ -673,6 +687,22 @@ select:focus {
 .btn-ghost {
   background: rgba(255, 255, 255, 0.03);
   color: var(--text);
+}
+
+.btn-default {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.10);
+}
+
+.btn-default:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: var(--border-strong);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--focus-accent-border);
+  outline-offset: 2px;
 }
 
 .btn:disabled {
@@ -892,6 +922,87 @@ select:focus {
   margin-top: 10px;
 }
 
+.available-subagents-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-top: 12px;
+}
+
+.available-subagents-toolbar,
+.available-subagent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.available-subagents-toolbar .btn-default { margin-left: auto; }
+
+.available-subagents-count,
+.available-subagents-source,
+.available-subagents-diagnostics,
+.available-subagents-empty,
+.available-subagent-meta {
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  line-height: var(--line-body);
+}
+
+.available-subagents-diagnostics[data-tone="error"] { color: var(--status-error-fg); }
+
+.available-subagents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.available-subagent-row {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-3);
+}
+
+.available-subagent-route {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.available-subagent-route { grid-template-columns: repeat(4, minmax(120px, 1fr)); }
+
+.available-subagent-heading {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--type-body);
+  font-weight: 600;
+}
+
+.available-subagent-purpose {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+}
+
+.available-subagent-purpose textarea {
+  width: 100%;
+  min-height: 60px;
+  resize: vertical;
+}
+
+.available-subagent-actions { justify-content: flex-end; }
+
+.available-subagent-actions .btn-default {
+  min-height: 34px;
+  padding: 0 11px;
+}
+
 /* The shared login card (harness_login_cards.js) renders the same markup here
    as in Settings, but Settings' stylesheets are never loaded by this page — so
    its classes are given the same anatomy against the wizard's own tokens. */
@@ -1041,20 +1152,6 @@ select:focus {
   top: -1px;
 }
 
-.settings-ghost-btn {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
-  padding: 8px 14px;
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text);
-  font-size: var(--type-body);
-  cursor: pointer;
-}
-
-.settings-ghost-btn:hover {
-  border-color: var(--border-strong);
-}
-
 @media (max-height: 820px), (max-width: 900px) {
   .wizard-shell {
     gap: 10px;
@@ -1123,6 +1220,10 @@ select:focus {
     margin-top: 8px;
   }
 
+  .available-subagent-route {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .harness-login-card p {
     display: block;
   }
@@ -1154,6 +1255,7 @@ select:focus {
 
   input,
   select,
+  textarea,
   .btn {
     padding: 8px 10px;
   }
@@ -1196,6 +1298,14 @@ select:focus {
 
   .summary-kv {
     grid-template-columns: 1fr;
+  }
+
+  .available-subagent-route {
+    grid-template-columns: 1fr;
+  }
+
+  .available-subagents-toolbar .btn-default {
+    margin-left: 0;
   }
 }
 
