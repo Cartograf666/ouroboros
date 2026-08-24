@@ -94,6 +94,10 @@ def test_cost_breakdown_uses_ledger_not_later_compatibility_events(tmp_path, mon
     assert "fabricated/compatibility-only" not in payload["by_model"]
     assert payload["by_model"]["openai/gpt-5.2"]["cost"] == 0.25
     assert payload["by_task_category"]["review"]["calls"] == 1
+    external = payload["by_api_key"]["external-skill"]
+    assert external["cost"] == 0.0
+    assert external["unknown_unmetered"] == 1
+    assert external["cost_final"] is False
     assert payload["accounting"] == {
         "available": True,
         "settled_usd": 0.25,
@@ -384,6 +388,19 @@ def test_task_detail_cost_breakdown_view_absent_when_nothing_was_accounted(tmp_p
     view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
     assert view is not None
     assert view["own_usd"] == 0.0 and view["children_usd"] == 0.25
+
+
+def test_task_detail_unknown_zero_subtree_is_omitted_not_reported_free(tmp_path, monkeypatch):
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    ua.record_unmetered_external_dispatch(
+        "detail-opaque", drive_root=root, provider="external-skill",
+        task_id="root-1", root_task_id="root-1",
+    )
+    assert _task_cost_breakdown_view(
+        root, {"task_id": "root-1", "root_task_id": "root-1"},
+    ) is None
 
 
 def test_task_detail_cost_breakdown_view_discloses_unattributed_money(tmp_path, monkeypatch):

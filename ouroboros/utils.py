@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import pathlib
+import re as _re
 import subprocess
 import threading
 import time
@@ -81,7 +82,7 @@ def jsonl_generation_signature(path: pathlib.Path) -> dict:
         return {}
     try:
         stat = path.stat()
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
             first = next((line.strip() for line in handle if line.strip()), "")
         return {
             "first_line_sha256": hashlib.sha256(first.encode("utf-8", errors="replace")).hexdigest(),
@@ -120,19 +121,45 @@ def write_text(path: pathlib.Path, content: str) -> None:
     write_text_atomic(pathlib.Path(path), content)
 
 
-def write_text_atomic(
-    path: pathlib.Path,
-    content: str,
-    *,
-    fsync: bool = False,
-) -> None:
-    """Atomically overwrite ``path`` with ``content`` via a sibling temp file + os.replace.
+# Windows sharing-violation retry bound: os.replace over a file that another
+# thread/process holds open (CPython opens files WITHOUT FILE_SHARE_DELETE)
+# raises PermissionError (winerror 5/32) even though the reader is transient —
+# e.g. the skill-review heartbeat replacing review_job.json while a poller
+# reads it. ~10 attempts with doubling backoff ≈ 0.5s total, then the original
+# PermissionError is raised honestly.
+_REPLACE_RETRY_ATTEMPTS = 10
+_REPLACE_RETRY_INITIAL_DELAY_SEC = 0.002
+_REPLACE_RETRY_MAX_DELAY_SEC = 0.1
+
+
+def replace_atomic(src: pathlib.Path | str, dst: pathlib.Path | str) -> None:
+    """``os.replace`` with a bounded retry on Windows sharing violations.
+
+    Retries ONLY on PermissionError, which POSIX rename(2) never raises for an
+    open destination — so POSIX behavior is byte-identical (one syscall, no
+    sleeps). After the bound is exhausted the last PermissionError propagates
+    unchanged; every other exception propagates immediately.
+    """
+    delay = _REPLACE_RETRY_INITIAL_DELAY_SEC
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, _REPLACE_RETRY_MAX_DELAY_SEC)
+
+
+def _atomic_overwrite(path: pathlib.Path, write_temp: Callable[[pathlib.Path], None]) -> None:
+    """Run ``write_temp`` against a sibling file, then atomically replace ``path``.
 
     A crash (SIGKILL / power loss) between the temp create and the replace leaves the
     EXISTING file fully intact — never a half-written/truncated file (G, v6.39). The temp
     name carries the ``.tmp.<pid>.<tid>.<uuid>`` atomic signature so the stale-temp sweep
     (`sweep_stale_temp_files`) reclaims an orphaned temp. Shared SSOT for every full-file
-    overwrite (atomic_write_json layers JSON serialization on top).
+    overwrite.
 
     The existing file's permission bits are PRESERVED across the replace (os.replace
     creates a new inode, so without this a tracked executable script would lose its +x);
@@ -154,6 +181,58 @@ def write_text_atomic(
     )
     tmp = path.with_name(tmp_name)
     try:
+        write_temp(tmp)
+        if existing_mode is not None:
+            try:
+                os.chmod(tmp, existing_mode)
+            except OSError:
+                pass
+        replace_atomic(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def write_bytes_atomic(
+    path: pathlib.Path,
+    content: bytes,
+    *,
+    fsync: bool = False,
+) -> None:
+    """Atomically overwrite ``path`` with exact bytes."""
+
+    def _write(tmp: pathlib.Path) -> None:
+        if not fsync:
+            tmp.write_bytes(content)
+            return
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+        fd = os.open(str(tmp), flags, 0o644)
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError(f"short write to {tmp}")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    _atomic_overwrite(path, _write)
+
+
+def write_text_atomic(
+    path: pathlib.Path,
+    content: str,
+    *,
+    fsync: bool = False,
+) -> None:
+    """Atomically overwrite UTF-8 text with platform newline semantics."""
+
+    def _write(tmp: pathlib.Path) -> None:
         if fsync:
             fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             try:
@@ -163,18 +242,8 @@ def write_text_atomic(
                 os.close(fd)
         else:
             tmp.write_text(content, encoding="utf-8")
-        if existing_mode is not None:
-            try:
-                os.chmod(tmp, existing_mode)
-            except OSError:
-                pass
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+
+    _atomic_overwrite(path, _write)
 
 
 def atomic_write_json(
@@ -253,6 +322,7 @@ def update_json_locked(
     timeout_sec: float = 4.0,
     stale_sec: float = 90.0,
     strict_existing_dict: bool = False,
+    reject_existing_empty_dict: bool = False,
 ) -> Dict[str, Any]:
     """Locked read-modify-write of a durable JSON dict file.
 
@@ -267,6 +337,9 @@ def update_json_locked(
     silently reintroduce the exact lost-update class this helper removes.
     When ``strict_existing_dict`` is true, an existing malformed/non-object
     JSON file raises ``ValueError`` instead of being mistaken for a new file.
+    ``reject_existing_empty_dict`` additionally distinguishes an absent store
+    from an existing empty object for schema-bearing callers: only absence may
+    initialize a new schema.
     """
     from ouroboros.platform_layer import (
         acquire_exclusive_file_lock,
@@ -283,6 +356,7 @@ def update_json_locked(
             f"update_json_locked: could not acquire {lock_path} within {timeout_sec}s"
         )
     try:
+        existed = path.exists()
         current = read_json_dict(path)
         if current is None:
             if strict_existing_dict and path.exists():
@@ -290,6 +364,10 @@ def update_json_locked(
                     "update_json_locked: existing JSON is malformed or is not an object"
                 )
             current = {}
+        if reject_existing_empty_dict and existed and not current:
+            raise ValueError(
+                "update_json_locked: existing empty JSON object has no schema"
+            )
         updated = mutator(current)
         if updated is None:
             return current
@@ -404,6 +482,7 @@ def iter_jsonl_objects(
     max_entries: Optional[int] = None,
     tail_bytes: Optional[int] = None,
     dict_only: bool = True,
+    gap_reasons: Optional[set[str]] = None,
 ) -> Iterator[Any]:
     """Yield parseable JSONL entries; max_entries applies to raw tail lines."""
     path = pathlib.Path(path)
@@ -420,15 +499,25 @@ def iter_jsonl_objects(
                         handle.readline()
             lines = deque(handle, maxlen=max_entries) if max_entries else handle
             for raw in lines:
-                line = raw.decode("utf-8", errors="replace").strip()
+                try:
+                    line = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    if gap_reasons is not None:
+                        gap_reasons.add("unreadable_bytes")
+                    line = raw.decode("utf-8", errors="replace")
+                line = line.strip()
                 if not line:
                     continue
                 try:
                     entry = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
+                    if gap_reasons is not None:
+                        gap_reasons.add("malformed_jsonl")
                     continue
                 if not dict_only or isinstance(entry, dict):
                     yield entry
+                elif gap_reasons is not None:
+                    gap_reasons.add("invalid_jsonl_row")
     except FileNotFoundError:
         return
 
@@ -600,7 +689,6 @@ _SECRET_KEYS = frozenset([
     "token", "api_key", "apikey", "authorization", "secret", "password", "passwd", "passphrase",
 ])
 
-import re as _re
 _SECRET_PATTERNS = _re.compile(
     r'ghp_[A-Za-z0-9]{30,}'       # GitHub personal access token
     r'|gh[ousr]_[A-Za-z0-9]{30,}' # GitHub OAuth/user/server/refresh tokens
@@ -617,7 +705,6 @@ _SECRET_PATTERNS = _re.compile(
     r'|sk-[A-Za-z0-9]{40,}'       # OpenAI API key
     r'|(?:(?<=bot)|\b)[0-9]{8,}:[A-Za-z0-9_\-]{20,}\b'  # Telegram bot token (digits:secret; matches the /bot<id>:<secret>/ URL form — no \b exists between 'bot' and a digit)
 )
-_SECRET_BEARER_RE = _re.compile(r'(?i)\bBearer\s+([A-Za-z0-9_\-./+=]{24,})')
 _SECRET_URL_CREDENTIAL_RE = _re.compile(
     r'(?i)\b(?:postgres|postgresql|mysql|mariadb|mongodb(?:\+srv)?|redis)://[^/\s:@]+:[^/\s@]+@'
 )
@@ -649,6 +736,29 @@ def _secret_key_name(key: str) -> bool:
     snake = raw.lower() if raw.upper() == raw else _re.sub(r"(?<!^)(?=[A-Z])", "_", raw).lower()
     normalized = _re.sub(r"[^a-z0-9]+", "_", snake).strip("_")
     return bool(_SECRET_KEY_NAME_RE.match(normalized))
+
+
+CREDENTIAL_HEADER_NAMES = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "api-key",
+    "x-api-key",
+    "x-goog-api-key",
+    "anthropic-api-key",
+    "openai-api-key",
+    "cookie",
+})
+
+
+def is_secret_key_name(key: Any) -> bool:
+    """Public credential-name classifier shared by durable identity builders."""
+    return _secret_key_name(str(key or ""))
+
+
+def is_credential_header_name(key: Any) -> bool:
+    """Whether a header is authentication state rather than route capability."""
+    normalized = str(key or "").strip().lower()
+    return normalized in CREDENTIAL_HEADER_NAMES or is_secret_key_name(normalized)
 
 
 def _secret_placeholder_value(value: str) -> bool:
@@ -701,47 +811,23 @@ def _secret_placeholder_value(value: str) -> bool:
 
 
 def sanitize_tool_result_for_log(result: str) -> str:
-    """Redact potential secrets from tool result before logging."""
+    """Redact potential secrets before a public or durable projection."""
     if not isinstance(result, str) or len(result) < 20:
         return result
     redacted = _SECRET_PATTERNS.sub("***REDACTED***", result)
-    return _SECRET_URL_CREDENTIAL_RE.sub(
+    redacted = _SECRET_URL_CREDENTIAL_RE.sub(
         lambda match: match.group(0).split("://", 1)[0] + "://***REDACTED***@",
         redacted,
     )
+    try:
+        from ouroboros.observability import redact_projection
 
-
-def contains_real_secret_value(text: str) -> tuple[bool, List[str]]:
-    """Detect concrete secret values by format and simple literal assignments."""
-    if not isinstance(text, str) or not text:
-        return False, []
-    matches = [
-        *_SECRET_PATTERNS.findall(text),
-        *_SECRET_BEARER_RE.findall(text),
-        *_SECRET_URL_CREDENTIAL_RE.findall(text),
-    ]
-    matches.extend(
-        literal
-        for env_key, env_literal, api_key, api_literal, js_key, js_literal in _SECRET_FALLBACK_LITERAL_RE.findall(text)
-        for key, literal in ((env_key, env_literal), (api_key, api_literal), (js_key, js_literal))
-        if key and literal and _secret_key_name(key) and not _secret_placeholder_value(literal)
-    )
-    matches.extend(
-        value.strip()
-        for key, value in _SECRET_LITERAL_FIELDS_RE.findall(text)
-        if _secret_key_name(key) and not _secret_placeholder_value(value)
-    )
-    matches.extend(
-        value.strip()
-        for key, value in _SECRET_BRACKET_LITERAL_RE.findall(text)
-        if _secret_key_name(key) and not _secret_placeholder_value(value)
-    )
-    matches.extend(
-        value.strip()
-        for key, value in _SECRET_UNQUOTED_ASSIGNMENT_RE.findall(text)
-        if _secret_key_name(key) and not _secret_placeholder_value(value)
-    )
-    return bool(matches), list(matches)
+        projected = redact_projection(redacted).value
+        if isinstance(projected, str):
+            return projected
+    except Exception:
+        log.debug("Failed to run observability redactor for tool result", exc_info=True)
+    return redacted
 
 
 def sanitize_tool_args_for_log(

@@ -75,6 +75,21 @@ test('a saved account pin survives a discovery list that no longer contains it',
     assert.deepEqual(profileOptionsFor(null, '').map((o) => o.value), ['']);
 });
 
+test('a disabled account is offered with a "(disabled)" label, still selectable', () => {
+    // The index carries {id, enabled} entries; the shared builder says the
+    // fact instead of offering a disabled account bare. The option stays
+    // SELECTABLE: the engine's typed refusal is the authority on a pin it
+    // will not serve (D-U6) — this is honesty, not a client-side gate.
+    const options = profileOptionsFor([
+        { id: 'koshak', enabled: true },
+        { id: 'retired', enabled: false },
+    ], '');
+    assert.deepEqual(options.map((o) => o.value), ['', 'koshak', 'retired']);
+    assert.equal(options[1].label, 'Account: koshak (pinned)');
+    assert.equal(options[2].label, 'Account: retired (pinned) (disabled)');
+    assert.ok(options.every((o) => !o.disabled), 'every account stays selectable');
+});
+
 test('the provider shown for a delegated row is the harness name, never Claudexor', () => {
     const groups = routeChoiceGroups({
         harnesses: [{ id: 'codex', display_name: 'Codex CLI', status: 'ok', enabled: true }],

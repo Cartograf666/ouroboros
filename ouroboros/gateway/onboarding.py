@@ -12,16 +12,15 @@ transaction:
    never an authority;
 2. validate the wizard payload through the SHARED setup validator and the
    startup gate (a subscription alone never satisfies it, D-1);
-3. read ONE fresh Claudexor snapshot when the payload declares subscriptions
-   were connected, and compile the preset from LIVE discovery;
-4. apply the ordinary provider normalization FIRST, then add the structured
-   preset keys on top (R8: normalization is continuous re-derivation, the
-   preset is an install-time transaction — they must not be taught about each
-   other);
-5. persist settings + runtime mode + safety default + the one-shot preset
-   marker in a single write whose eligibility is re-proved under the settings
+3. apply the ordinary provider normalization before compiling task routes;
+4. compile truthful API/local task actors with zero daemon reads, or read ONE
+   fresh Claudexor snapshot when subscriptions were declared;
+5. validate an owner-edited ``OUROBOROS_SUBAGENTS`` object without replacing
+   its rows, while compiling reviewer rows as an independent sibling;
+6. persist settings + runtime mode + safety default + actor fingerprint/source
+   receipt in a single write whose eligibility is re-proved under the settings
    lock;
-6. only then start the supervisor.
+7. only then start the supervisor.
 
 A daemon that cannot answer at save time is a TYPED failure that persists
 NOTHING and keeps the wizard open, with an explicit "finish without agent
@@ -35,18 +34,29 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+from ouroboros.configured_subagents import (
+    SOURCE_CONFIGURED,
+    SOURCE_ONBOARDING_DEFAULT,
+    SUBAGENTS_SETTING,
+    ConfiguredSubagents,
+    configured_subagents_dict,
+    normalize_configured_subagents,
+)
 
 from ouroboros.gateway.owner_settings import (
     CommitBoundary,
     SettingsLockUnavailable,
     SettingsPreconditionFailed,
     _owner_audit,
+    _owner_read_settings_raw,
     _owner_write_settings,
     post_commit_failure_response,
+    settings_document_mutation,
     unsaved_error,
 )
 from ouroboros.server_runtime import (
@@ -60,6 +70,7 @@ from ouroboros.settings_setup_contract import (
 from ouroboros.subscription_install_presets import (
     PRESET_HARNESSES,
     PRESET_MARKER_KEY,
+    REVIEWER_PRESET_HARNESSES,
     HarnessDiscovery,
     SubscriptionInstallPreset,
     compile_install_preset,
@@ -77,10 +88,14 @@ log = logging.getLogger(__name__)
 # stale, or the account was removed between the Agents step and Save. Nor does
 # it prescribe repairing the engine, because the typed `detail` beside it may
 # simply read "claude: not signed in", which no repair addresses.
+# The copy promises no action the detail cannot deliver: "finish without
+# agent defaults" is always true, while "fix the cause and try again" is
+# conditional — an exact required model missing from discovery may need an
+# owner edit rather than a retry, unlike daemon_unavailable.
 PRESET_UNVERIFIED_MESSAGE = (
-    "Agent defaults could not be verified right now, so nothing was saved. "
-    "The detail below says why. Fix that and try again, or finish without "
-    "agent defaults."
+    "Agent defaults could not be applied, and nothing was saved. "
+    "The detail below says why. You can finish without agent defaults, "
+    "or fix the cause — where it names one — and try again."
 )
 
 
@@ -166,19 +181,33 @@ def _profile_seat_verdict(
 
 
 def _next_up_verdict(
-    harness: str, account: Dict[str, Any], profiles: Dict[Tuple[str, str], Dict[str, Any]],
+    harness: str, next_up: Dict[str, Any], account: Dict[str, Any],
+    profiles: Dict[Tuple[str, str], Dict[str, Any]],
 ) -> Tuple[bool, str]:
     """Would an UNPINNED run of this harness route through a subscription seat
     RIGHT NOW? The daemon's own server-computed answer; Ouroboros does not
     re-derive the rotation (D28), it only judges whether the seat the engine
     names is a SUBSCRIPTION or an API key.
 
+    ``next_up`` is the verdict the caller already resolved off the wire —
+    the unified ``accountPools`` row first, the legacy per-harness
+    ``harnessAccounts[].next_up`` second (dual-read, sprint plan §K.7) — and
+    the two unions are judged side by side here: ``profile``/``none`` are
+    shared spellings, ``native`` exists only on the legacy wire (it reads the
+    legacy ``account`` row's own facts), ``api_key_route`` only in the pool
+    union (frozen contract §L.1). An UNKNOWN kind — either wire growing a
+    spelling this reader predates — is fail-safe: not a subscription verdict,
+    and the caller's configured-seat scan still gets its say.
+
     This answers a MOMENT-IN-TIME question — see ``_configured_subscription_seat``
     for why the install-time preset cannot be decided by it alone."""
-    next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
     kind = str(next_up.get("kind") or "")
     if kind == "none":
         return False, str(next_up.get("reason") or "the engine has nothing routable for it")
+    if kind == "api_key_route":
+        # The pool union's explicit API-key verdict (Q2=A: allowed under
+        # auth_preference=auto, disclosed) — a maintained route, never a seat.
+        return False, "an unpinned run would route through an API key, not a subscription"
     if kind == "native":
         if not account.get("native_login_detected"):
             return False, "no signed-in session is detected for the default account"
@@ -194,9 +223,15 @@ def _next_up_verdict(
 
 
 def _configured_subscription_seat(
-    harness: str, account: Dict[str, Any], profiles: Dict[Tuple[str, str], Dict[str, Any]],
+    harness: str, next_up: Dict[str, Any], account: Dict[str, Any],
+    profiles: Dict[Tuple[str, str], Dict[str, Any]],
+    *, native_allowed: bool = True,
 ) -> Tuple[bool, str]:
     """Is a subscription seat CONFIGURED here — regardless of capacity right now?
+
+    ``native_allowed=False`` is the unrunnable-harness-row case: a native
+    default seat's only runnability signal is that row, so it cannot count
+    there, while a named profile's own probe still can.
 
     Two questions the engine answers differently, and the preset must not
     collapse them into one:
@@ -216,15 +251,22 @@ def _configured_subscription_seat(
     falls back to API spend and it must not silently vanish from the
     configuration either. Out of capacity is not evidence of not-a-subscription.
 
-    ``next_up`` is still consulted here for the ONE thing only it can answer:
-    whether the default login's EFFECTIVE route is the vendor session or an API
-    key. A harness's ``auth_preference`` can put a key ahead of a session that is
-    signed in, and that IS durable — a seat billing the owner's API key is what
-    D-3 forbids, spent window or not."""
-    next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
-    if account.get("native_login_detected") and account.get("native_credentials_enabled"):
-        effective_api_key = (str(next_up.get("kind") or "") == "native"
-                             and str(next_up.get("route") or "") == _API_KEY_NATIVE_ROUTE)
+    ``next_up`` — the caller's ALREADY-RESOLVED routing verdict (pool first,
+    legacy second, same dual-read as the caller) — is still consulted here for
+    the ONE thing only it can answer: whether the default login's EFFECTIVE
+    route is the vendor session or an API key. A harness's ``auth_preference``
+    can put a key ahead of a session that is signed in, and that IS durable —
+    a seat billing the owner's API key is what D-3 forbids, spent window or
+    not. Both unions spell it: the legacy ``native`` verdict's ``api_key``
+    route, and the pool union's ``api_key_route`` kind (§L.1). On a purely
+    unified payload ``account`` is empty, so the native short-circuit never
+    fires and the named-profile scan below is the whole answer."""
+    if (native_allowed and account.get("native_login_detected")
+            and account.get("native_credentials_enabled")):
+        kind = str(next_up.get("kind") or "")
+        effective_api_key = (
+            (kind == "native" and str(next_up.get("route") or "") == _API_KEY_NATIVE_ROUTE)
+            or kind == "api_key_route")
         if not effective_api_key:
             return True, "signed-in default session"
     for (row_harness, profile_id) in sorted(profiles):
@@ -244,11 +286,28 @@ def subscription_routable_harnesses(
 
     An account being SIGNED IN is not the question, and neither is "would a run
     start this second". A once-only install-time decision needs the DURABLE one:
-    the harness row must be enabled and runnable, and a subscription seat must be
-    configured for it. The engine's `next_up` answers first, because when it does
+    the harness row must be enabled, and a subscription seat must be configured
+    for it — where a NATIVE default seat also needs the row RUNNABLE (the row is
+    that seat's only runnability signal), while a NAMED-profile seat is vouched
+    by its own doctor probe and counts even on a structurally unavailable row
+    (a harness with no default credential store, agy/Claudexor INV-135).
+    The engine's `next_up` answers first, because when it does
     say yes the receipt records the seat a real run would take; when it says no,
     a configured seat still counts and the refusal is recorded as a capacity
-    note. Everything the verdict rests on comes from the engine."""
+    note. Everything the verdict rests on comes from the engine.
+
+    DUAL-READ (unified account model, sprint plan §K.7 + frozen contract §L):
+    a unified engine emits ``harnessAccounts: []`` — every account a named
+    registry row — and carries the routing verdict in the ADDITIVE top-level
+    ``accountPools: [{harness_id, next_up}]`` key instead. That pool row is
+    the accounts authority there (skipping the harness because its legacy row
+    is absent would silently drop every unified harness from the preset); on a
+    legacy engine the per-harness account row keeps answering exactly as
+    before. When both carry a verdict, the pool wins — profiles own account
+    facts, the pool owns routing facts. Routing is NEVER re-derived from the
+    profile list client-side; a unified harness with an unknown or refusing
+    pool verdict falls to the configured-seat scan, which on that wire is the
+    named-profile scan alone (there is no native fact to read)."""
     routable: Dict[str, str] = {}
     refused: Dict[str, str] = {}
     rows = _discovery_rows(snapshot.get("harnesses"))
@@ -259,10 +318,17 @@ def subscription_routable_harnesses(
         for row in (payload.get("harnessAccounts") or [])
         if isinstance(row, dict)
     }
+    pools = {
+        str(row.get("harness_id") or ""): row.get("next_up")
+        for row in (payload.get("accountPools") or [])
+        if isinstance(row, dict) and isinstance(row.get("next_up"), dict)
+    }
     for harness in PRESET_HARNESSES:
         account = accounts.get(harness)
-        if account is None:
+        pool_next_up = pools.get(harness)
+        if account is None and pool_next_up is None:
             continue  # the engine publishes no accounts authority for it: silent absence
+        account = account if isinstance(account, dict) else {}
         row = rows.get(harness)
         if row is None:
             refused[harness] = "the engine does not list this harness"
@@ -271,16 +337,37 @@ def subscription_routable_harnesses(
             refused[harness] = "the engine has this harness disabled"
             continue
         status = str(row.get("status") or "")
-        if status in _UNRUNNABLE_HARNESS_STATUS:
-            refused[harness] = f"the engine reports it {status}"
+        unrunnable = status in _UNRUNNABLE_HARNESS_STATUS
+        # A harness-level "unavailable" is no longer an outright refusal: an
+        # engine whose harness has NO default credential store (agy — Claudexor
+        # INV-135) reports the harness row STRUCTURALLY unavailable while its
+        # named profiles run fine, and their per-profile doctor probes are the
+        # runnability proof the harness row cannot give. A NATIVE default seat
+        # still requires a runnable harness row — the row is that seat's only
+        # runnability signal — which keeps the deliberate
+        # signed-in-but-unavailable refusal for the classic harnesses.
+        legacy_next_up = (account.get("next_up")
+                          if isinstance(account.get("next_up"), dict) else {})
+        next_up = pool_next_up if pool_next_up is not None else legacy_next_up
+        next_kind = str(next_up.get("kind") or "")
+        ok, evidence = _next_up_verdict(harness, next_up, account, profiles)
+        if ok and (not unrunnable or next_kind == "profile"):
+            routable[harness] = evidence if not unrunnable else (
+                f"{evidence} (the harness row reads {status}: it has no default "
+                "credential store, and the named-profile probe vouches the seat)")
             continue
-        ok, evidence = _next_up_verdict(harness, account, profiles)
-        if ok:
-            routable[harness] = evidence
-            continue
-        seated, seat = _configured_subscription_seat(harness, account, profiles)
+        seated, seat = _configured_subscription_seat(
+            harness, next_up, account, profiles, native_allowed=not unrunnable)
         if seated:
-            routable[harness] = f"{seat}; no capacity right now ({evidence})"
+            # "No capacity" wording is reserved for genuine temporary
+            # exhaustion; a structurally unavailable row (no default
+            # credential store) discloses the structural cause instead.
+            routable[harness] = (
+                f"{seat} (the harness row reads {status}: it has no default "
+                f"credential store, and the named-profile probe vouches the seat; {evidence})"
+                if unrunnable else f"{seat}; no capacity right now ({evidence})")
+        elif unrunnable:
+            refused[harness] = f"the engine reports it {status}"
         else:
             refused[harness] = evidence
     return routable, refused
@@ -288,6 +375,8 @@ def subscription_routable_harnesses(
 
 def verified_harness_discoveries(
     snapshot: Dict[str, Any],
+    *,
+    required_models_for: Optional[set[str]] = None,
 ) -> Tuple[Tuple[HarnessDiscovery, ...], Optional[PresetFailure]]:
     """Turn one ``/api/claudexor/status?include=models`` snapshot into the
     compiler's input, or a typed failure. PURE — unit-testable with no daemon."""
@@ -310,9 +399,10 @@ def verified_harness_discoveries(
             f"{', '.join(PRESET_HARNESSES)}." + (f" {detail}" if detail else ""),
         )
     discoveries: List[HarnessDiscovery] = []
+    required = set(wanted) if required_models_for is None else set(required_models_for)
     for harness in wanted:
         row = rows.get(harness) or {}
-        if row.get("models_error"):
+        if row.get("models_error") and harness in required:
             return (), PresetFailure(
                 "models_unavailable",
                 f"Model discovery for {harness} failed: {row.get('models_error')}",
@@ -322,7 +412,7 @@ def verified_harness_discoveries(
             for model in (row.get("models") or [])
             if isinstance(model, dict) and str(model.get("id") or "")
         )
-        if not model_ids:
+        if not model_ids and harness in required:
             return (), PresetFailure(
                 "models_unavailable",
                 f"The engine listed no models for {harness}.",
@@ -357,19 +447,37 @@ def _read_harness_snapshot() -> Dict[str, Any]:
 
 
 async def resolve_install_preset(
+    settings: Optional[Dict[str, Any]] = None,
+    *,
+    subscriptions_connected: bool = True,
+    owner_draft: Optional[ConfiguredSubagents] = None,
 ) -> Tuple[Optional[SubscriptionInstallPreset], Optional[PresetFailure]]:
-    """One fresh snapshot -> one compiled preset, or a typed failure."""
-    try:
-        snapshot = await asyncio.to_thread(_read_harness_snapshot)
-    except Exception as exc:  # a dead/broken engine is a failure, not a crash
-        log.warning("Claudexor snapshot for onboarding presets failed", exc_info=True)
-        return None, PresetFailure("daemon_unavailable", f"{type(exc).__name__}: {exc}")
-    discoveries, failure = verified_harness_discoveries(snapshot)
-    if failure is not None:
-        return None, failure
+    """Zero daemon reads for API/local-only, exactly one when subscriptions exist."""
+    snapshot: Dict[str, Any] = {}
+    discoveries: Sequence[HarnessDiscovery] = ()
+    capability: Mapping[str, Any] = {}
+    if subscriptions_connected:
+        try:
+            snapshot = await asyncio.to_thread(_read_harness_snapshot)
+        except Exception as exc:  # a dead/broken engine is a failure, not a crash
+            log.warning("Claudexor snapshot for onboarding presets failed", exc_info=True)
+            return None, PresetFailure("daemon_unavailable", f"{type(exc).__name__}: {exc}")
+        required_models = (
+            set(REVIEWER_PRESET_HARNESSES)
+            if owner_draft is not None else None
+        )
+        discoveries, failure = verified_harness_discoveries(
+            snapshot, required_models_for=required_models,
+        )
+        if failure is not None:
+            return None, failure
+        capability = _harness_capability(snapshot, [d.harness_id for d in discoveries])
     preset = compile_install_preset(
         discoveries,
-        capability=_harness_capability(snapshot, [d.harness_id for d in discoveries]),
+        settings=settings or {},
+        configured_subagents=owner_draft,
+        source=SOURCE_CONFIGURED if owner_draft is not None else SOURCE_ONBOARDING_DEFAULT,
+        capability=capability,
     )
     if not preset.ok:
         refusal = preset.refusal.as_dict() if preset.refusal else {}
@@ -507,12 +615,20 @@ def _settings_fingerprint() -> str:
         return f"unreadable:{type(exc).__name__}:{uuid4()}"
 
 
-def _prepared_settings(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+def _prepared_settings(
+    body: Dict[str, Any],
+    *,
+    base_settings: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     """(old_settings, prepared_settings, error) through the SHARED validator."""
     from ouroboros.config import load_settings
     from ouroboros.onboarding_wizard import prepare_onboarding_settings
 
-    old_settings = load_settings()
+    # Completion keeps the ordinary runtime loader (including its established
+    # one-shot compatibility migrations).  The read-only preview passes the
+    # existing pure owner-reader so merely rendering an unsaved draft can never
+    # persist unrelated compatibility state.
+    old_settings = dict(base_settings) if base_settings is not None else load_settings()
     prepared, error = prepare_onboarding_settings(body, old_settings)
     if error:
         return old_settings, {}, str(error)
@@ -528,8 +644,82 @@ def _prepared_settings(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, 
     return old_settings, normalized, ""
 
 
+def _configured_owner_draft(
+    body: Mapping[str, Any],
+) -> Tuple[Optional[ConfiguredSubagents], str]:
+    """Validate an owner-edited canonical object without reading live status."""
+    if SUBAGENTS_SETTING not in body:
+        return None, ""
+    try:
+        config, _canonical = normalize_configured_subagents(body.get(SUBAGENTS_SETTING))
+    except ValueError as exc:
+        return None, str(exc)
+    return config, ""
+
+
+async def _compile_onboarding_preset(
+    current: Dict[str, Any],
+    *,
+    subscriptions_connected: bool,
+    owner_draft: Optional[ConfiguredSubagents],
+) -> Tuple[Optional[SubscriptionInstallPreset], Optional[PresetFailure]]:
+    preset, failure = await resolve_install_preset(
+        current,
+        subscriptions_connected=subscriptions_connected,
+        owner_draft=owner_draft,
+    )
+    return preset, failure
+
+
+async def api_onboarding_subagents_preview(request: Request) -> JSONResponse:
+    """Read-only canonical preview for the wizard; never persists or projects env."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return unsaved_error("JSON body must be an object.", 400)
+
+    owner_draft, draft_error = _configured_owner_draft(body)
+    if draft_error:
+        return unsaved_error(
+            draft_error, 400, code="invalid_available_subagents",
+            diagnostics=[{"code": "invalid_available_subagents", "message": draft_error}],
+        )
+    _old_settings, current, error = _prepared_settings(
+        body,
+        base_settings=_owner_read_settings_raw(),
+    )
+    if error:
+        return unsaved_error(
+            error, 400, code="invalid_onboarding_settings",
+            diagnostics=[{"code": "invalid_onboarding_settings", "message": error}],
+        )
+    subscriptions_connected, skip_presets = parse_subscription_intent(body)
+    preset, failure = await _compile_onboarding_preset(
+        current,
+        subscriptions_connected=subscriptions_connected and not skip_presets,
+        owner_draft=owner_draft,
+    )
+    if failure is not None:
+        return unsaved_error(
+            PRESET_UNVERIFIED_MESSAGE, 503, code=failure.code, detail=failure.detail,
+            can_skip=True,
+            diagnostics=[{"code": failure.code, "message": failure.detail}],
+        )
+    assert preset is not None
+    return JSONResponse({
+        "ok": True,
+        "available_subagents": configured_subagents_dict(
+            normalize_configured_subagents(preset.available_subagents)[0]
+        ),
+        "source": preset.source,
+        "diagnostics": list(preset.diagnostics),
+    })
+
+
 def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, Any],
-             pending_mode: str, safety_light: bool, preset_applied: bool,
+             pending_mode: str, safety_light: bool, install_preset_applied: bool,
              boundary: CommitBoundary, read_fingerprint: str) -> None:
     """The ONE write, plus the established post-save seams.
 
@@ -546,27 +736,42 @@ def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, 
     to_save = dict(current)
     to_save["OUROBOROS_RUNTIME_MODE"] = pending_mode
     authored = ("OUROBOROS_SAFETY_MODE",) if safety_light else ()
-    _owner_write_settings(
-        to_save,
-        authored_keys=authored,
-        allow_safety_lowering=safety_light,
-        precondition=_write_precondition(preset_applied, safety_light, read_fingerprint),
-        boundary=boundary,
-    )
-    # The RUNNING process keeps its boot runtime mode; the owner's next-boot
-    # choice lives on disk only (identical to the endpoint this replaces).
-    boundary.at("environment projection")
-    env_view = dict(current)
-    env_view["OUROBOROS_RUNTIME_MODE"] = get_runtime_mode()
-    apply_settings_to_env(env_view)
-    boundary.at("supervisor start")
-    _start_supervisor_if_needed_for_request(request, current)
-    boundary.at("hot-reload")
-    changed = [
-        key for key in current
-        if str(current.get(key, "") or "") != str(old_settings.get(key, "") or "")
-    ]
-    _apply_settings_save_side_effects(request, current, old_settings, changed)
+    # Under the seam-wide document lock: the fingerprint precondition protects
+    # THIS write from a stale merge, but not a generic save whose (locked)
+    # read happened before this write — without the lock that save would land
+    # after us and silently erase the whole onboarding transaction. Holding it
+    # orders the two: either the save finishes first and the precondition
+    # refuses honestly, or this write finishes first and the save's read sees
+    # the onboarded document.
+    with settings_document_mutation():
+        _owner_write_settings(
+            to_save,
+            authored_keys=authored,
+            allow_safety_lowering=safety_light,
+            precondition=_write_precondition(
+                install_preset_applied, safety_light, read_fingerprint,
+            ),
+            boundary=boundary,
+        )
+        # STILL under the lock, symmetric with the generic save's locked body:
+        # released after the write alone, a concurrent writer could persist AND
+        # project a newer document before this transaction projects its
+        # pre-prepared snapshot — stamping stale values back over the
+        # environment the newer write just projected.
+        # The RUNNING process keeps its boot runtime mode; the owner's next-boot
+        # choice lives on disk only (identical to the endpoint this replaces).
+        boundary.at("environment projection")
+        env_view = dict(current)
+        env_view["OUROBOROS_RUNTIME_MODE"] = get_runtime_mode()
+        apply_settings_to_env(env_view)
+        boundary.at("supervisor start")
+        _start_supervisor_if_needed_for_request(request, current)
+        boundary.at("hot-reload")
+        changed = [
+            key for key in current
+            if str(current.get(key, "") or "") != str(old_settings.get(key, "") or "")
+        ]
+        _apply_settings_save_side_effects(request, current, old_settings, changed)
 
 
 async def api_onboarding_complete(request: Request) -> JSONResponse:
@@ -580,6 +785,12 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
         body = None
     if not isinstance(body, dict):
         return unsaved_error("JSON body must be an object.", 400)
+
+    owner_draft, draft_error = _configured_owner_draft(body)
+    if draft_error:
+        return unsaved_error(
+            draft_error, 400, code="invalid_available_subagents",
+        )
 
     # BEFORE the read, not after: if a write lands between the two, the document
     # this request goes on to derive is NEWER than the fingerprint, the locked
@@ -603,15 +814,45 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
         current["OUROBOROS_SAFETY_MODE"] = "light"
     preset: Optional[SubscriptionInstallPreset] = None
     preset_reason = "not_requested"
+    install_preset_applied = False
     if not eligible:
         preset_reason = "not_install_time"
+        # Install-time generation is closed, but an explicit canonical owner
+        # draft is still ordinary settings intent.  A recovery/retry completion
+        # must not answer 200 while silently discarding the editor value.  This
+        # path is pure: no daemon read, reviewer rewrite, or preset marker.
+        if owner_draft is not None:
+            preset, failure = await _compile_onboarding_preset(
+                current, subscriptions_connected=False, owner_draft=owner_draft,
+            )
+            if failure is not None:
+                return failure.as_response()
+            preset_reason = "configured_by_owner"
+            current.update(preset.settings_keys(
+                include_reviewer=False, include_marker=False,
+            ))
     elif skip_presets:
         preset_reason = "skipped_by_owner"
-    elif subscriptions_connected:
-        preset, failure = await resolve_install_preset()
+        if owner_draft is not None:
+            preset, failure = await _compile_onboarding_preset(
+                current, subscriptions_connected=False, owner_draft=owner_draft,
+            )
+            if failure is not None:
+                return failure.as_response()
+            preset_reason = "configured_by_owner"
+            current.update(preset.settings_keys(
+                include_reviewer=False, include_marker=False,
+            ))
+    else:
+        preset, failure = await _compile_onboarding_preset(
+            current,
+            subscriptions_connected=subscriptions_connected,
+            owner_draft=owner_draft,
+        )
         if failure is not None:
             return failure.as_response()
         preset_reason = "applied"
+        install_preset_applied = True
         # R8 ordering: provider normalization has ALREADY run over `current`;
         # the structured preset keys land on top of it, never through it.
         current.update(preset.settings_keys())
@@ -625,7 +866,7 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
     try:
         await asyncio.to_thread(
             _persist, request, old_settings, current, pending_mode, safety_light,
-            preset is not None, boundary, read_fingerprint,
+            install_preset_applied, boundary, read_fingerprint,
         )
     except Exception as exc:
         if boundary.committed:
@@ -673,6 +914,7 @@ __all__ = [
     "PRESET_UNVERIFIED_MESSAGE",
     "PresetFailure",
     "api_onboarding_complete",
+    "api_onboarding_subagents_preview",
     "install_is_unconfigured",
     "preset_eligible",
     "resolve_install_preset",

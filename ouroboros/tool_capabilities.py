@@ -10,6 +10,11 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "start_service", "service_status", "service_logs", "stop_service",
     "vcs_status", "vcs_diff", "vcs_commit_reviewed", "commit_reviewed",
     "vcs_restore", "vcs_revert", "vcs_pull_ff", "vcs_rollback",
+    # One-shot deferred follow-up (W=A): core so a root task facing a typed wait
+    # instant (e.g. a structurally unreachable review quorum with a known reset)
+    # can register it without an enable_tools detour. Deliberately absent from
+    # the subagent profiles below — a child may not mint future root tasks.
+    "schedule_followup",
     "schedule_subagent", "integrate_subagent_patch", "compare_subagent_patches",
     "integrate_delegated_patch",
     # Asking the owner WHERE a big task runs is a main-lane act, so it is core and
@@ -65,6 +70,7 @@ LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_files", "search_code", "query_code",
     "vcs_status", "vcs_diff",
     "chat_history", "recent_tasks", "get_task_result", "wait_task", "wait_tasks",
+    "forward_to_worker",
     "schedule_subagent",
     # Task-tree coordination: a child reads the shared frame and raises beacons. tree_note
     # is a bounded tree-scoped write; its tagged child-result disposition branch also
@@ -104,6 +110,7 @@ ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "start_service", "service_status", "service_logs", "stop_service",
     "integrate_subagent_patch", "compare_subagent_patches",
     "schedule_subagent", "wait_task", "wait_tasks", "get_task_result",
+    "forward_to_worker",
     "verify_and_record",
     "knowledge_read", "knowledge_list",
     "tree_note", "tree_read", "override_delegation_constraint",
@@ -209,6 +216,8 @@ REVIEWED_MUTATIVE_TOOLS: frozenset[str] = frozenset({
 
 # Foreground mutative tools may keep editing files after Python future timeout;
 # the loop must wait for terminal completion instead of returning while they run.
-# Empty since D10 retired the SDK edit gateway (the one foreground tool that
-# kept editing after a Python-future timeout); the seam stays for successors.
-FOREGROUND_MUTATIVE_TOOLS: frozenset[str] = frozenset()
+# D10 retired the SDK edit gateway; publication is now the foreground mutator
+# whose remote branch/commit/PR effects must settle before control returns.
+FOREGROUND_MUTATIVE_TOOLS: frozenset[str] = frozenset({
+    "submit_skill_to_hub",
+})

@@ -10,17 +10,21 @@
 //    Add-account button — the button used to hang off the native row, which is
 //    why adding a Codex account meant hunting for a control under an unrelated
 //    line.
-//  * ROWS ARE EQUIVALENT. The default CLI login is a row like any other; being
-//    native is a CAPTION on its metadata line, never a different layout, never
-//    extra chrome. Rotation treats every connected account of a family the
-//    same, and the UI now says so by looking the same.
+//  * ROWS ARE ONE TYPE, on both engine generations. A UNIFIED engine (the
+//    server-stamped `unified_accounts` fact) serves every account — migrated
+//    default logins included — as a named registry row, so every row carries
+//    the same name, Enabled toggle and Remove. A LEGACY engine still emits a
+//    native pseudo-row per harness; it renders through the same two-line
+//    layout, named by the identity the daemon observed, and only its ACTIONS
+//    differ — no Remove and no toggle, because the legacy engine has no route
+//    for either on that row.
 //  * TWO LINES PER ROW. Line 1 is the one primary thing (the account) plus its
 //    status; line 2 is muted metadata in human words — "38% used · resets in
 //    2h", never a raw ISO instant.
-//  * REMOVAL goes through the ENGINE's own contract (DELETE
-//    /api/claudexor/credential-profiles/…). A native CLI login has no removal
-//    button: that account belongs to the vendor's CLI, and a simulated
-//    sign-out would claim an effect this app cannot have.
+//  * REMOVAL and the ENABLED toggle go through the ENGINE's own contract
+//    (DELETE/PATCH /api/claudexor/credential-profiles/…). A legacy native CLI
+//    login has neither button: that account belongs to the vendor's CLI, and
+//    simulating an effect this app cannot have would be a lie.
 //
 // The status payload comes from the SHARED store (`claudexor_status_store.js`)
 // — this section owns no poll — and the login card is the SHARED controller
@@ -51,10 +55,12 @@ import {
     claudexorStatus,
     facetReadState,
     familyLabel,
+    nextUpAccount,
     readsFor,
+    unifiedAccounts,
 } from './claudexor_status_store.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { createLoginCardController } from './harness_login_cards.js';
+import { createLoginCardController, normalizeProfileName } from './harness_login_cards.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -75,6 +81,7 @@ export function verificationBadge(profile, { known = true } = {}) {
     const status = profile?.status || profile || {};
     const source = String(status.verification_source || '');
     const verification = String(status.verification || '');
+    const availability = String(status.availability || '');
     const badge = () => {
         if (source === 'vendor' && verification === 'passed') {
             return { tone: 'ok', label: 'Verified live' };
@@ -83,6 +90,18 @@ export function verificationBadge(profile, { known = true } = {}) {
             // The claim is NARROWER than "signed in" and must stay narrower in
             // WORDS: local-store material has read `passed` a minute before a 401.
             return { tone: 'muted', label: 'Signed in — not verified live' };
+        }
+        if (verification === 'not_run') {
+            // No probe ran, so this is unknown rather than a failed login.
+            // A typed `availability=unknown` is stronger evidence: the engine
+            // tried the auth-status probe but could not get a verdict (timeout,
+            // malformed output, etc.). Keep that distinct from a clean
+            // not-yet-verified profile so the owner is not nudged into a
+            // needless re-login.
+            return {
+                tone: 'muted',
+                label: availability === 'unknown' ? 'Login status unknown' : 'Not verified',
+            };
         }
         if (verification) {
             return { tone: 'error', label: `Verification ${verification}` };
@@ -113,7 +132,8 @@ export function humanizeResetAt(resetsAt, nowMs = Date.now()) {
 }
 
 export function quotaSummary(snapshots, harnessId, subjectId = '',
-                             { quotaRead = READ_OK, nowMs = Date.now() } = {}) {
+                             { quotaRead = READ_OK, nowMs = Date.now(),
+                               fallbackSubjectIds = [] } = {}) {
     // The exhausted window is SHOWN with its reset time, never hidden (Q2-б):
     // hiding it would make the D28 fallback to API money unexplainable. What
     // CHANGED is only the wording — the owner asked for the limit text to be
@@ -126,20 +146,35 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
     if (quotaRead !== READ_OK) {
         return { label: 'Limits not checked', exhausted: false, resetsAt: '', tone: 'muted' };
     }
-    const rows = (snapshots || []).filter((snap) => {
+    const freshRowsFor = (wantedSubject) => (snapshots || []).filter((snap) => {
         const subject = snap?.subject || {};
         if (String(subject.harness || '') !== String(harnessId)) return false;
         // EXACT subject, including the default account's empty id. The old
         // `!subjectId ||` wildcard made the native row match EVERY subject on the
         // harness, so the default account reported a named profile's exhausted
         // window — red styling and all — as its own.
-        if (String(subject.subject_id || '') !== String(subjectId)) return false;
+        if (String(subject.subject_id || '') !== String(wantedSubject)) return false;
         // The RUNTIME ignores a stale reading ("an old reading must not block a lane",
-        // subagents.py `harness_window_wait_hint`), so a card that paints one red is
+        // subagents.py `_exhausted_window`), so a card that paints one red is
         // reporting a block that will not happen: the lane still dispatches. Same bar,
         // same answer, on both sides of the glass.
         return String(snap?.freshness || '') === 'fresh';
     });
+    let rows = freshRowsFor(subjectId);
+    // DUAL-KEYED SUBJECT (unified migration window, plan §K.3): the quota
+    // journal is never rewritten, so right after the engine migrates a default
+    // login onto its named registry row the row's fresh window can still be
+    // keyed by the LEGACY empty/null subject until the next refresh re-keys
+    // it. The caller names the legacy aliases this exact row may inherit
+    // (`fallbackSubjectIds`); they are consulted ONLY when the exact subject
+    // has no fresh window, so a re-keyed reading always wins and no other
+    // account's window can be borrowed (the aliases still match the same
+    // harness, exactly).
+    for (const alias of fallbackSubjectIds) {
+        if (rows.length) break;
+        if (String(alias) === String(subjectId)) continue;
+        rows = freshRowsFor(alias);
+    }
     let worst = null;
     // The runtime's own bar, per snapshot: spent when a constraint is cooling down OR
     // its window is fully used — ANY constraint, not just the one with the highest
@@ -194,19 +229,20 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
     };
 }
 
-export function normalizeProfileName(raw) {
-    // The profile-id alphabet the login request accepts: lowercased, and every
-    // character outside it becomes '-'.
-    return String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
-}
+// The profile-id alphabet lives with the login card now (its own "name the
+// account" face applies the same validation the Add-account dialog does);
+// re-exported so this module keeps its established import path.
+export { normalizeProfileName };
 
 export async function promptProfileName({ dialogImpl = openConfirmDialog, family = '' } = {}) {
     // pywebview's WKWebView implements no window.prompt — it answers null
     // silently, so the old prompt()-based Add-account flow was a dead button on
     // the desktop app. The in-house input dialog asks instead, and it loops
     // until the typed name already IS its normalized form: a name that
-    // normalization would change ("Работа" → "------", "Work" → "work") is
-    // shown back, editable, BEFORE any login starts — never rewritten silently.
+    // normalization would change ("Work" → "work") is shown back, editable,
+    // BEFORE any login starts — never rewritten silently — and a name nothing
+    // slug-legal survives of ("Работа") re-asks with the engine's contract
+    // spelled out instead of offering an illegal all-separator id.
     let initialValue = '';
     let body = `Name for the additional ${family || 'agent'} account (e.g. work, backup).`
         + ' Lowercase letters, digits, "-" and "_" — anything else becomes "-".';
@@ -215,7 +251,18 @@ export async function promptProfileName({ dialogImpl = openConfirmDialog, family
         if (!answer?.confirmed) return '';
         const raw = String(answer.value || '').trim();
         const normalized = normalizeProfileName(raw);
-        if (!normalized) return '';
+        if (!raw) return '';  // a confirmed BLANK keeps meaning "never mind"
+        if (!normalized) {
+            // A typed name nothing slug-legal survives of (engine contract
+            // ^[a-z0-9][a-z0-9_-]{0,63}$ — e.g. no ASCII alphanumerics at
+            // all): re-ask with the contract spelled out instead of
+            // abandoning the add or submitting a name the engine refuses.
+            initialValue = '';
+            body = `"${raw}" cannot become an account name. `
+                + 'Enter a name that starts with a lowercase letter or digit — '
+                + 'letters, digits, "-" and "_", at most 64 characters.';
+            continue;
+        }
         if (normalized === raw) return normalized;
         initialValue = normalized;
         body = `"${raw}" will be saved as "${normalized}" — edit the name or continue.`;
@@ -397,7 +444,10 @@ export function daemonStatusLine(payload, { checking = false, reads = null } = {
 // Discovery needs a running daemon, and on first run there is none — so with
 // nothing discovered the UI still offers a Connect affordance, and the first
 // Connect is exactly what provisions the owned daemon (D30). Presentation
-// only; the login flow itself stays harness-agnostic.
+// only; the login flow itself stays harness-agnostic. agy (Antigravity) is
+// deliberately NOT bootstrapped: it has no engine-default credential store,
+// so a pre-discovery card could only refuse — its card appears from live
+// discovery the moment the engine answers.
 export const BOOTSTRAP_HARNESSES = ['codex', 'claude', 'cursor'];
 
 // The display name comes from the store, which owns the payload it reads and is
@@ -434,9 +484,11 @@ export function bareRowStatusText(accountsRead) {
 }
 
 export function familyStatus(rows, { accountsRead = READ_OK } = {}) {
-    // The aggregate lozenge in a card header. Every connected account of a
-    // family is equivalent, so the header counts them and says they rotate —
-    // it never singles one out as the real one.
+    // The aggregate lozenge in a card header: how many accounts ROTATION can
+    // actually use. That claim may only count accounts that are BOTH signed in
+    // and enabled — a disabled row is the owner's own exclusion, and a header
+    // that counted it would over-promise the pool exactly the way counting a
+    // cold row used to.
     if (!rows.length) return { tone: 'muted', label: bareRowStatusText(accountsRead) };
     // …and the SAME provenance rule the rows obey. These rows are the retained
     // snapshot's memory when the accounts facet did not land, so a green
@@ -447,38 +499,109 @@ export function familyStatus(rows, { accountsRead = READ_OK } = {}) {
     const verdict = (tone, label) => (known
         ? { tone, label }
         : { tone: tone === 'error' ? 'error' : 'muted', label: `${label} — last known` });
-    const bad = rows.filter((row) => verificationBadge(row).tone === 'error').length;
+    // "Need attention" obeys the same exclusion: a DISABLED account is the
+    // owner's own removal from rotation, so its failed verification is not a
+    // family-level alarm — rotation never takes it, and the row's own badge
+    // still shows the error in place. Counting it here turned the header red
+    // over an account the owner had already dealt with.
+    const bad = rows.filter((row) => row.enabled !== false
+        && verificationBadge(row).tone === 'error').length;
     if (bad) {
         return verdict('error', `${bad} of ${rows.length} need attention`);
     }
-    const live = rows.filter((row) => String(row?.status?.verification || '') === 'passed').length;
-    if (!live) return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · not signed in`);
-    // "N accounts · rotating" is a claim about what ROTATION will use, so it may
-    // only count the accounts that are actually signed in. A family with one
-    // live account and one cold row says exactly that instead of promising two.
+    // Enabled state is the structural owner choice. In particular, an engine
+    // deliberately does not probe disabled rows and reports `not_run`; that
+    // unknown verification must not hide the stronger fact that every account
+    // has been excluded from rotation.
+    if (rows.every((row) => row.enabled === false)) {
+        return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · all disabled`);
+    }
+    const live = rows.filter((row) => String(row?.status?.verification || '') === 'passed'
+        && row.enabled !== false).length;
+    if (!live) {
+        const notRun = rows.some((row) => String(row?.status?.verification || '') === 'not_run');
+        if (notRun) return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · not verified`);
+        return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · not signed in`);
+    }
     if (live < rows.length) return verdict('ok', `${live} of ${rows.length} connected`);
     if (live === 1) return verdict('ok', 'Connected');
     return verdict('ok', `${live} accounts · rotating`);
 }
 
+export function nextUpBadge(payload, harness, { accountsRead = READ_OK } = {}) {
+    // The family header's "Next up" badge: who an unpinned run would take,
+    // read through the store's ONE dual-wire reader (accountPools first,
+    // legacy harnessAccounts[].next_up second). '' = nothing to show — no
+    // verdict in the payload, or an accounts read that did not land (a stale
+    // routing claim dressed as current is the exact lie the facets exist to
+    // stop). Every kind renders FAIL-SAFE: an unknown future kind becomes a
+    // generic "unknown" state, never a crash and never a guess.
+    if (accountsRead !== READ_OK) return '';
+    const verdict = nextUpAccount(payload, harness);
+    if (!verdict) return '';
+    const kind = String(verdict.kind || '');
+    if (kind === 'profile') {
+        const id = String(verdict.profileId || '');
+        return id ? `Next up: ${id}` : 'Next up: unknown';
+    }
+    if (kind === 'api_key_route') return 'Next up: API key (no subscription capacity)';
+    if (kind === 'none') return '';
+    if (kind === 'native') {
+        // The legacy union's default-subject verdict. Its optional route says
+        // whether the session or a configured key would actually serve it.
+        return String(verdict.route || '') === 'api_key'
+            ? 'Next up: API key' : 'Next up: default account';
+    }
+    return 'Next up: unknown';
+}
+
 export function accountName(row) {
-    if (row.kind === 'native') return 'Default CLI login';
-    return String(row.display_name || '') || String(row.profile_id || '') || 'Account';
+    // The account's OWN name, in this order: the registry row's display name,
+    // the identity the daemon observed (email), the machine id. The old
+    // "Default CLI login" label claimed a TYPE — under the unified model every
+    // account is a named row of one type, and even on a legacy engine the
+    // honest name for the unnamed default is who it is signed in as. The
+    // legacy pseudo-row keeps a neutral fallback when the daemon observed no
+    // identity for it.
+    const identity = row.identity || {};
+    const named = String(row.display_name || '') || String(identity.email || '');
+    if (named) return named;
+    if (row.kind === 'native') return 'Default account';
+    return String(row.profile_id || '') || 'Account';
+}
+
+// The quota-subject LEGACY ALIASES one row may inherit (see quotaSummary's
+// dual-keyed fallback): only the unified engine's migrated default row — the
+// reserved `<harness>-default` registry id, frozen contract §L.3 — may inherit
+// the legacy empty/null subject its account was keyed by before migration.
+// Every other row gets no alias: exact-subject matching stays the rule.
+export function quotaSubjectAliases(row, payload) {
+    if (!unifiedAccounts(payload)) return [];
+    return row.profile_id === `${row.harness}-default` ? [''] : [];
 }
 
 export function accountMetaLine(row, payload, { quotaRead = READ_OK, nowMs = Date.now() } = {}) {
     // Line 2: everything that is NOT the account itself, in human words and at
     // muted ink. Order is the owner's — how much of the window is left, which
-    // plan, who it is, when we last checked.
+    // plan, who it is, when we last checked. (The former "Managed by the X
+    // CLI" caption is gone: it described a separate account TYPE the unified
+    // model retired, and on a legacy engine the row's actions already say
+    // everything the caption did.)
     const parts = [];
-    if (row.kind === 'native') {
-        parts.push(`Managed by the ${familyLabel(row.harness, payload)} CLI`);
+    if (row.enabled === false) {
+        // The one user-settable routing fact, stated where the rotation claim
+        // lives: a disabled account is excluded from rotation however healthy
+        // its login is.
+        parts.push('disabled — excluded from rotation');
     }
     parts.push(quotaSummary(payload?.quota || [], row.harness, row.profile_id,
-        { quotaRead, nowMs }).label);
+        { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload) }).label);
     const identity = row.identity || {};
     if (identity.plan) parts.push(String(identity.plan));
-    if (identity.email) parts.push(String(identity.email));
+    // The email is metadata only while it is not already the row's name.
+    if (identity.email && String(identity.email) !== accountName(row)) {
+        parts.push(String(identity.email));
+    }
     const at = Date.parse(String(row?.status?.last_verified_at || ''));
     if (Number.isFinite(at)) {
         const age = formatRelativeAge(at, 'just now');
@@ -559,9 +682,37 @@ export function rowActionLabel(row, payload) {
     // what it is really offering: an account that HAS a session signs in again,
     // one that does not simply signs in. ("Connect" belongs to a family with no
     // account yet, where it is the first step rather than a repeat.)
+    return rowLoginAction(row, payload).label;
+}
+
+/**
+ * The engine's explicit auth-probe-unknown state is not permission to start a
+ * new login. `availability=unknown` + `verification=not_run` means that the
+ * probe could not decide; only an explicit `unavailable`/`failed` verdict may
+ * offer the sign-in action. Older engines omit `availability`, so they retain
+ * the legacy behavior. The top-level Refresh action re-runs the status probe.
+ */
+export function loginStatusUnknown(row) {
+    const status = row?.status || {};
+    return String(status.availability || '') === 'unknown'
+        && String(status.verification || '') === 'not_run';
+}
+
+export function rowLoginAction(row, payload) {
     const runtime = runtimeActionLabel(payload);
-    if (runtime !== 'Connect') return runtime;
-    return String(row?.status?.verification || '') === 'passed' ? 'Sign in again' : 'Sign in';
+    if (runtime !== 'Connect') return { label: runtime, refresh: false };
+    if (loginStatusUnknown(row)) {
+        // Keep recovery available for every harness.  An unknown probe is not
+        // proof of logout, but it also must not strand a profile whose next
+        // status read may become a clean login verdict.  The click handler
+        // below runs the shared Refresh path instead of starting OAuth.
+        return { label: 'Check status', refresh: true };
+    }
+    return {
+        label: String(row?.status?.verification || '') === 'passed'
+            ? 'Sign in again' : 'Sign in',
+        refresh: false,
+    };
 }
 
 // "agents", "agents and limits", "agents, accounts and limits".
@@ -605,7 +756,10 @@ function faultOutranksReassurance(service, note) {
     return { tone: note.tone, text: note.text };
 }
 
-export function serviceBannerLine(store, { wakeError = '' } = {}) {
+export function serviceBannerLine(store, { wakeError = '', wakeBusy = false } = {}) {
+    if (wakeBusy) {
+        return { tone: 'muted', text: 'Starting the agent daemon…' };
+    }
     // THE service banner: one place on the tab that explains a daemon/runtime
     // problem, replacing the scattering of "(not in discovery)" the owner
     // reported. Provenance is PER FACET, so this line never collapses three
@@ -713,11 +867,37 @@ export async function removeAccount(harness, profileId, { fetchImpl = apiFetch }
     return data;
 }
 
+export async function setAccountEnabled(harness, profileId, enabled, { fetchImpl = apiFetch } = {}) {
+    // The Enabled toggle is the engine's own PATCH contract (the one
+    // user-settable routing control a registry row carries); a refusal is the
+    // answer, and nothing here pretends the pool changed.
+    const url = `/api/claudexor/credential-profiles/${encodeURIComponent(harness)}`
+        + `/${encodeURIComponent(profileId)}`;
+    const resp = await fetchImpl(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: Boolean(enabled) }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(String(data?.error || `HTTP ${resp.status}`));
+    return data;
+}
+
 export function removeAccountConfirmBody(name, family) {
-    return `${family} will forget the account "${name}". Ouroboros deletes nothing on `
-        + `the ${family} side — sign in again any time to bring it back. Reviewer rows `
-        + 'pinned to this account stay visible and are shown as unavailable until you '
-        + 'repoint them.';
+    return `The Claudexor binding for ${family} account "${name}" will be removed. `
+        + 'Vendor or OS credential storage may remain signed in and is not changed by '
+        + `Ouroboros; the deletion receipt says when it was retained. Reviewer rows `
+        + 'and a Delegation pin pointing at this account stay visible and are shown as '
+        + 'unavailable until you repoint them.';
+}
+
+export function vendorCredentialRetainedNotice(receipt, name, family) {
+    const disposition = receipt?.vendorCredentialDisposition;
+    if (!disposition || disposition.owner !== 'vendor'
+        || disposition.state !== 'left_unchanged'
+        || disposition.scope !== 'os_user') return '';
+    return `Removed "${name}" from ${family}. Claudexor left vendor credential storage `
+        + 'for this OS user unchanged; the vendor account may still be signed in outside Ouroboros.';
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +909,7 @@ const state = {
     loginCard: null,
     disposers: [],
     removeError: '',
+    removeNotice: '',
     initialized: false,
     // The owner asked to start the daemon and the wake refused. Rendered by the
     // service banner and expired ONLY when the daemon provably answers
@@ -750,16 +931,16 @@ export function renderAgentAccountsSection() {
         <div class="form-section" id="harness-accounts-section">
             <h3>Accounts</h3>
             <div class="settings-section-copy">
-                Agent subscriptions used by delegated subagents and
-                review lanes. Every account of a family is equivalent — work rotates across all of
-                them. Accounts live in Ouroboros's own agent home; your personal logins are never
-                read or imported.
+                Agent subscriptions used by delegated subagents and review lanes. Unpinned work
+                rotates across a family's enabled, signed-in accounts; a disabled account keeps its
+                login and stays out of rotation. Accounts live in Ouroboros's own agent home; your
+                personal logins are never read or imported.
             </div>
             <div id="harness-accounts-error" class="settings-inline-status" data-tone="error" hidden></div>
             <div id="harness-accounts-groups" class="agent-family-list"></div>
             <div id="harness-login-card"></div>
             <div class="settings-toolbar">
-                <button type="button" class="settings-ghost-btn" id="btn-harness-refresh">Refresh</button>
+                <button type="button" class="btn btn-default" id="btn-harness-refresh">Refresh</button>
             </div>
         </div>
     `;
@@ -782,7 +963,8 @@ export function accountRowFacts(row, payload,
     // reset it promises may already have happened.
     return {
         badge: verificationBadge(row, { known: accountsRead === READ_OK }),
-        quota: quotaSummary(payload?.quota || [], row.harness, row.profile_id, { quotaRead, nowMs }),
+        quota: quotaSummary(payload?.quota || [], row.harness, row.profile_id,
+            { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload) }),
         name: accountName(row),
         meta: accountMetaLine(row, payload, { quotaRead, nowMs }),
     };
@@ -790,6 +972,15 @@ export function accountRowFacts(row, payload,
 
 function rowHtml(row, payload, facets = {}) {
     const { badge, quota, name, meta } = accountRowFacts(row, payload, facets);
+    const loginAction = rowLoginAction(row, payload);
+    // Row ACTIONS follow the engine's own routes, never the row's looks: a
+    // named registry row (every row on a unified engine, the named profiles on
+    // a legacy one) has the PATCH Enabled toggle and DELETE Remove; the legacy
+    // native pseudo-row has neither, because that engine has no route for
+    // either and a dead button would claim an effect this app cannot have.
+    const rowActions = row.kind === 'native' ? '' : `
+                <button type="button" class="btn btn-default" data-harness-toggle data-enabled="${row.enabled === false ? '0' : '1'}" title="${row.enabled === false ? 'Let rotation use this account again' : 'Keep the login, take this account out of rotation'}">${row.enabled === false ? 'Enable' : 'Disable'}</button>
+                <button type="button" class="btn btn-default" data-harness-remove title="Ask the agent service to forget this account">Remove</button>`;
     return `
         <div class="harness-account-row${quota.exhausted ? ' harness-exhausted' : ''}" data-harness="${escapeHtml(row.harness)}" data-profile="${escapeHtml(row.profile_id)}" data-kind="${escapeHtml(row.kind)}">
             <div class="harness-account-main">
@@ -798,8 +989,7 @@ function rowHtml(row, payload, facets = {}) {
             </div>
             <div class="harness-account-meta muted">${escapeHtml(meta)}</div>
             <div class="harness-account-actions">
-                <button type="button" class="settings-ghost-btn" data-harness-login>${escapeHtml(rowActionLabel(row, payload))}</button>
-                ${row.kind === 'native' ? '' : '<button type="button" class="settings-ghost-btn" data-harness-remove title="Ask the agent service to forget this account">Remove</button>'}
+                <button type="button" class="btn btn-default" data-harness-login>${escapeHtml(loginAction.label)}</button>${rowActions}
             </div>
         </div>
     `;
@@ -810,14 +1000,17 @@ function groupHtml(group, payload, facets) {
     // (familyStatus falls through to it), and printing the same sentence again
     // in the body just made the card twice as tall to say nothing new.
     const body = group.rows.map((row) => rowHtml(row, payload, facets)).join('');
+    const nextUp = nextUpBadge(payload, group.harness,
+        { accountsRead: facets?.accountsRead ?? READ_OK });
     return `
         <section class="agent-family-card" data-family="${escapeHtml(group.harness)}">
             <div class="agent-family-head">
                 <div class="agent-family-id">
                     <h4>${escapeHtml(group.label)}</h4>
                     <span class="ui-status" data-tone="${group.status.tone}">${escapeHtml(group.status.label)}</span>
+                    ${nextUp ? `<span class="ui-status" data-tone="muted" data-next-up>${escapeHtml(nextUp)}</span>` : ''}
                 </div>
-                <button type="button" class="settings-ghost-btn" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>
+                <button type="button" class="btn btn-default" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>
             </div>
             <div class="agent-family-rows">${body}</div>
         </section>
@@ -836,7 +1029,10 @@ function renderRows() {
     const host = document.getElementById('harness-accounts-groups');
     const banner = document.getElementById('agents-service-banner');
     if (banner) {
-        const line = serviceBannerLine(state.store, { wakeError: state.wakeError });
+        const line = serviceBannerLine(state.store, {
+            wakeError: state.wakeError,
+            wakeBusy: state.wakeBusy,
+        });
         banner.textContent = line.text;
         banner.dataset.tone = line.tone;
     }
@@ -853,8 +1049,10 @@ function renderRows() {
     if (!host) return;
     const errorBox = document.getElementById('harness-accounts-error');
     if (errorBox) {
-        errorBox.hidden = !state.removeError;
-        errorBox.textContent = state.removeError;
+        const text = state.removeError || state.removeNotice;
+        errorBox.hidden = !text;
+        errorBox.textContent = text;
+        errorBox.dataset.tone = state.removeError ? 'error' : 'warn';
     }
     const payload = state.store.snapshot || {};
     const accountsRead = state.store.facet(FACET_ACCOUNTS);
@@ -865,13 +1063,33 @@ function renderRows() {
         button.addEventListener('click', () => {
             if (!state.initialized) return;
             const row = button.closest('[data-harness]');
-            startLogin(row?.dataset.harness, row?.dataset.profile);
+            const rowData = row?.dataset || {};
+            const rowModel = accountRows(payload).find((candidate) =>
+                String(candidate?.harness || '') === String(rowData.harness || '')
+                && String(candidate?.profile_id || '') === String(rowData.profile || '')
+            );
+            const action = rowLoginAction(rowModel, payload);
+            if (action.refresh) {
+                state.store.refresh();
+                return;
+            }
+            startLogin(rowData.harness, rowData.profile);
         });
     });
     host.querySelectorAll('[data-harness-remove]').forEach((button) => {
         button.addEventListener('click', () => {
             const row = button.closest('[data-harness]');
             confirmRemoveAccount(row?.dataset.harness, row?.dataset.profile);
+        });
+    });
+    host.querySelectorAll('[data-harness-toggle]').forEach((button) => {
+        button.addEventListener('click', () => {
+            const row = button.closest('[data-harness]');
+            // The button carries the state it RENDERED for, so a click flips
+            // exactly what the owner saw — never a re-read of a row the poll
+            // may have replaced mid-click.
+            toggleAccountEnabled(row?.dataset.harness, row?.dataset.profile,
+                button.dataset.enabled === '0');
         });
     });
     host.querySelectorAll('[data-family-add]').forEach((button) => {
@@ -894,25 +1112,55 @@ function renderRows() {
     state.loginCard?.render();
 }
 
-async function confirmRemoveAccount(harness, profileId) {
+async function toggleAccountEnabled(harness, profileId, enabled) {
+    // No confirm dialog: the toggle is reversible in one click and destroys
+    // nothing (the login material stays). Failures ride the same inline error
+    // box as removal, and the fresh read repaints the row from engine truth.
     if (!harness || !profileId) return;
-    const family = familyLabel(harness, state.store.snapshot || {});
-    const answer = await openConfirmDialog({
+    state.removeError = '';
+    state.removeNotice = '';
+    try {
+        await setAccountEnabled(harness, profileId, enabled);
+    } catch (error) {
+        state.removeError = `Could not ${enabled ? 'enable' : 'disable'} "${profileId}": `
+            + `${error.message || error}. The account is unchanged.`;
+    }
+    await state.store.refresh();
+    renderRows();
+}
+
+/**
+ * Complete destructive flow behind a row's Remove button. Injectable deps let
+ * the node suite drive the production handler; confirm mode authorizes only on
+ * its documented strict boolean `true`, never the input mode's object shape.
+ */
+export async function confirmRemoveAccount(harness, profileId, {
+    dialogImpl = openConfirmDialog,
+    removeImpl = removeAccount,
+    store = state.store,
+    renderImpl = renderRows,
+} = {}) {
+    if (!harness || !profileId) return;
+    const family = familyLabel(harness, store.snapshot || {});
+    const answer = await dialogImpl({
         title: 'Remove account',
         body: removeAccountConfirmBody(profileId, family),
         confirmLabel: 'Remove',
         danger: true,
     });
-    if (!answer?.confirmed) return;
+    if (answer !== true) return;
     state.removeError = '';
+    state.removeNotice = '';
     try {
-        await removeAccount(harness, profileId);
+        const receipt = await removeImpl(harness, profileId);
+        state.removeNotice = vendorCredentialRetainedNotice(
+            receipt, profileId, family);
     } catch (error) {
         state.removeError = `Could not remove "${profileId}": ${error.message || error}. `
             + 'The account is unchanged.';
     }
-    await state.store.refresh();
-    renderRows();
+    await store.refresh();
+    renderImpl();
 }
 
 /**
@@ -975,6 +1223,28 @@ export function refreshHarnessStatus() {
 }
 
 /**
+ * Opening Agents is an explicit owner action. Refresh first so an old live
+ * snapshot cannot hide a daemon reaped by a server restart; only the exact
+ * already-provisioned idle state is then restarted. First-time installation,
+ * foreign ownership and repair remain behind Connect.
+ */
+async function refreshHarnessStatusOnActivation() {
+    const snapshot = await state.store.refresh();
+    // The store deliberately retains the last answer after a failed GET so
+    // the panel can keep useful context.  That retained snapshot is not fresh
+    // evidence for an owner-triggered write: a transient outage must never
+    // turn yesterday's `stale + ready` into a wake request.
+    if (state.store.error) return null;
+    const daemon = snapshot?.daemon || state.store.snapshot?.daemon || {};
+    if (String(daemon.state || '') === 'stale'
+        && String(daemon.runtime?.state || '') === 'ready'
+        && !daemon.ownership_problem) {
+        return wakeDaemon();
+    }
+    return null;
+}
+
+/**
  * Mount the section. The exported destroy seam is an honest local detach, so
  * remount never waits on or invents daemon release proof.
  */
@@ -986,6 +1256,7 @@ async function _init(store) {
     _destroy();
     state.store = store;
     state.removeError = '';
+    state.removeNotice = '';
     state.wakeError = '';
     state.wakeBusy = false;
     ensureLoginCard();
@@ -1010,6 +1281,7 @@ async function _init(store) {
     state.disposers.push(bindStatusSurface(state.store, {
         listener: () => renderRows(),
         elementId: 'harness-accounts-groups',
+        onActivate: refreshHarnessStatusOnActivation,
     }));
     state.initialized = true;
     // The first read must not wait for the poll interval: init runs while the

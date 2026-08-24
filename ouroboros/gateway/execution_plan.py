@@ -27,19 +27,17 @@ log = logging.getLogger(__name__)
 
 
 async def api_execution_targets(request: Request) -> JSONResponse:
-    """GET /api/execution-targets[?include=models] — what work can run on.
+    """GET /api/execution-targets — the Available subagents the owner configured.
 
-    Read-only and daemon-lazy in the same way the accounts status is: it asks
-    the engine, and an unreachable one comes back as a typed gap
-    (``session_read``) rather than an empty catalogue that would read as "you
-    have no harnesses".
+    One list, from the owner's own catalog: the same rows `schedule_subagent`
+    takes by id. An empty answer means the catalog is empty or disabled, which
+    is a real state the card must render rather than guess around.
     """
-    include_models = "models" in str(request.query_params.get("include") or "")
-
     def _read() -> Dict[str, Any]:
-        from ouroboros.execution_targets import execution_targets
+        from ouroboros.tools.execution_plan import available_subagents
 
-        return execution_targets(include_models=include_models).as_dict()
+        rows = available_subagents()
+        return {"subagents": list(rows.values()), "enabled": bool(rows)}
 
     try:
         return JSONResponse(await asyncio.to_thread(_read))
@@ -49,16 +47,19 @@ async def api_execution_targets(request: Request) -> JSONResponse:
 
 
 def _unreachable_rows(plan: Any) -> list:
-    """Rows whose destination cannot be reached, phrased per row. [] when fine."""
-    from ouroboros.execution_targets import execution_targets, validate_pin
+    """Rows naming a subagent the catalog does not carry. [] when fine.
 
-    catalog = execution_targets()
-    problems = []
-    for item in plan.items:
-        reason = validate_pin(item.route, catalog=catalog)
-        if reason:
-            problems.append(f"{item.item_id} -> {item.route.target_id}: {reason}")
-    return problems
+    The dropdown only offered configured rows, but the door is not the dropdown:
+    a hand-made POST can name anything, and an approval is the last moment a bad
+    id is still cheap to refuse.
+    """
+    from ouroboros.tools.execution_plan import available_subagents
+
+    catalog = available_subagents()
+    return [
+        f"{item.item_id} -> {item.subagent_id}: not in the Available subagents catalog"
+        for item in plan.items if item.subagent_id not in catalog
+    ]
 
 
 def _deliver(task_id: str, plan_text: str) -> Dict[str, Any]:

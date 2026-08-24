@@ -12,7 +12,7 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import (
     apply_settings_to_env,
@@ -45,11 +45,9 @@ from ouroboros.task_results import (
 from ouroboros.task_status import load_effective_task_result, wait_for_effective_tasks
 from ouroboros.subagents import (
     LEGACY_SUBAGENT_FIELDS,
-    SUBAGENT_EXECUTORS,
     build_subagent_envelope,
-    normalize_subagent_executor,
-    normalize_subagent_model_lane,
 )
+from ouroboros.subagent_runtime import select_child_actor
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.tool_policy import swarm_router_turn
 from ouroboros.tools.registry import ToolContext, ToolEntry
@@ -218,6 +216,13 @@ def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> s
     emitted_modes = list(emission.get("emitted_modes") or [])
     write_surface = str(emission.get("write_surface") or "")
     coop_shared_tree = str(emission.get("coop_shared_tree") or "")
+    configured = emission.get("configured_subagent") if isinstance(
+        emission.get("configured_subagent"), dict
+    ) else {}
+    selected_id = str(configured.get("selected_subagent_id") or "")
+    selected_route = configured.get("route") if isinstance(configured.get("route"), dict) else {}
+    route_kind = str(selected_route.get("kind") or "")
+    legacy_selection = bool(emission.get("legacy_selection"))
     worker_note = " (live queue emission requested)" if any(m == "live" for m in emitted_modes) else ""
     try:
         _record_scheduled_subagent(ctx, {
@@ -270,10 +275,20 @@ def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> s
             )
         except Exception:
             coop_note = f"\nshared coop tree: {coop_shared_tree}"
+    commitment = (
+        "ordinary recursive API actor"
+        if route_kind == "api_model"
+        else "recursive nanny; exact external start is committed before its first model call"
+    )
+    legacy_note = (
+        "\nDEPRECATED_LEGACY_SELECTOR: deterministically mapped to this exact configured row; "
+        "future calls must pass subagent_id."
+        if legacy_selection else ""
+    )
     return (
         f"Subagent request queued {task_ids[0]}: {objective} "
-        f"(requested_lane={requested_model_lane})"
-        f"{worker_note}{slot_note}{profile_note}{coop_note}"
+        f"(subagent_id={selected_id}, route={route_kind}, {commitment})"
+        f"{worker_note}{slot_note}{profile_note}{coop_note}{legacy_note}"
     )
 
 
@@ -716,6 +731,59 @@ def _attach_origin_from_metadata(ctx: ToolContext, evt: Dict[str, Any]) -> None:
         evt["origin_suppressed"] = True
 
 
+def _attach_predecessor_authority_from_metadata(
+    ctx: ToolContext, evt: Dict[str, Any], predecessor_task_id: str = "",
+) -> str:
+    metadata = getattr(ctx, "task_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    selected_id = str(predecessor_task_id or "").strip()
+    if not selected_id:
+        return ""
+    previous = metadata.get("project_last_task_result")
+    manifest = metadata.get("main_routing_manifest")
+    candidates = (
+        manifest.get("final_results")
+        if isinstance(manifest, dict) and isinstance(manifest.get("final_results"), list)
+        else [previous] if isinstance(previous, dict) else []
+    )
+    previous = next((
+        row for row in candidates
+        if isinstance(row, dict) and str(row.get("task_id") or "") == selected_id
+    ), None)
+    if not isinstance(previous, dict):
+        return (
+            "predecessor_task_id is not an addressable result in the host "
+            "routing manifest"
+        )
+    status_root = Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(ctx, "budget_drive_root", "")
+        or ctx.drive_root
+    ))
+    if not load_effective_task_result(status_root, selected_id, materialize_artifacts=False):
+        return "the selected predecessor task result is missing or unreadable"
+    source = previous.get("authority_source") if isinstance(previous, dict) else None
+    from ouroboros.agent_startup_checks import valid_task_result_authority_source
+
+    if valid_task_result_authority_source(source, selected_id):
+        evt["predecessor_authority_source"] = dict(source)
+    else:
+        return "the selected predecessor has no readable authority source"
+    return ""
+
+
+def _attach_client_surface(ctx: ToolContext, evt: Dict[str, Any]) -> None:
+    """Copy the routing turn's per-message client-surface fact onto a
+    promote/route/steer event BY VALUE (the origin_message_ref rail's sibling:
+    the fact was captured at ingress; producers never re-derive it)."""
+    metadata = getattr(ctx, "task_metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    fact = metadata.get("client_surface")
+    if isinstance(fact, dict) and fact:
+        evt["client_surface"] = dict(fact)
+
+
 def _attach_swarm_intent(ctx: ToolContext, evt: Dict[str, Any]) -> None:
     """Carry host-attested Swarm intent into the admitted managed root."""
 
@@ -743,7 +811,11 @@ def _finish_swarm_handoff(
 ) -> str:
     """Latch one immutable admission attempt; repeated calls emit nothing."""
 
-    if swarm_router_turn(ctx) and not isinstance(getattr(ctx, "_swarm_handoff_attempt", None), dict):
+    metadata = getattr(ctx, "task_metadata", {})
+    presence_turn = isinstance(metadata, dict) and bool(metadata.get("presence"))
+    if (swarm_router_turn(ctx) or presence_turn) and not isinstance(
+        getattr(ctx, "_swarm_handoff_attempt", None), dict
+    ):
         ctx._swarm_handoff_attempt = {
             "task_id": str(evt.get("task_id") or ""),
             "routing_token": str(evt.get("routing_token") or ""),
@@ -764,6 +836,7 @@ def _promote_chat_to_task(
     project_name: str = "",
     workspace: str = "",
     source: str = "",
+    predecessor_task_id: str = "",
 ) -> str:
     """Route real work out of the conversation lane into a supervised pooled task.
 
@@ -886,8 +959,32 @@ def _promote_chat_to_task(
         ),
         "ts": utc_now_iso(),
     }
+    metadata = getattr(ctx, "task_metadata", {})
+    presence = metadata.get("presence") if isinstance(metadata, dict) else None
+    if isinstance(presence, dict) and presence:
+        # A public conversation may promote long work, but it cannot choose a
+        # new Project/workspace/source authority. The immutable positive ceiling
+        # and exact return destination follow the promoted root by value.
+        evt.update({
+            "project_id": "",
+            "project_name": "",
+            "workspace_root": "",
+            "workspace": "",
+            "source": "",
+            "presence": dict(presence),
+            "task_contract": dict(getattr(ctx, "task_contract", {}) or {}),
+        })
     _attach_origin_from_metadata(ctx, evt)
+    predecessor_error = _attach_predecessor_authority_from_metadata(
+        ctx, evt, predecessor_task_id,
+    )
+    if predecessor_error:
+        return (
+            "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (promote_chat_to_task): "
+            + predecessor_error
+        )
     _attach_swarm_intent(ctx, evt)
+    _attach_client_surface(ctx, evt)
     mode, confirmation = _emit_and_wait_for_routing(ctx, evt)
     if display_name:
         scope_note = f" in new project '{display_name}'"
@@ -974,6 +1071,7 @@ def _list_projects(ctx: ToolContext, limit: int = 50) -> str:
 
 def _route_to_project(
     ctx: ToolContext, project_id: str = "", message: str = "", reason: str = "",
+    predecessor_task_id: str = "",
 ) -> str:
     """Route a main-chat message to an EXISTING project so the work continues in
     that project's context (its memory/journal/thread), keeping the main chat free.
@@ -986,8 +1084,8 @@ def _route_to_project(
     from ouroboros.project_facts import explicit_project_id_ok, sanitize_project_id
     from ouroboros.projects_registry import get_project
 
-    msg = str(message or "").strip()
-    if not msg:
+    msg = str(message or "")
+    if not msg.strip():
         return "⚠️ TOOL_ARG_ERROR (route_to_project): message is required"
     cached = _cached_swarm_handoff(ctx)
     if cached:
@@ -1068,7 +1166,13 @@ def _route_to_project(
         "ts": utc_now_iso(),
     }
     _attach_origin_from_metadata(ctx, evt)
+    predecessor_error = _attach_predecessor_authority_from_metadata(
+        ctx, evt, predecessor_task_id,
+    )
+    if predecessor_error:
+        return "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project): " + predecessor_error
     _attach_swarm_intent(ctx, evt)
+    _attach_client_surface(ctx, evt)
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     name = str(proj.get("name") or pid)
     status = str(receipt.get("status") or "unconfirmed")
@@ -1124,13 +1228,21 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
             "⚠️ TOOL_ARG_ERROR (steer_task): task_id is required — pick one from "
             "current_chat.running_tasks (or promote_chat_to_task to start new work)."
         )
-    if not msg:
+    if not msg.strip():
         return "⚠️ TOOL_ARG_ERROR (steer_task): message is required."
     try:
         current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
         current_chat_id = 0
     _md = getattr(ctx, "task_metadata", None)
+    # The model chooses the target, but the host transports the exact owner
+    # bytes captured at ingress.  A model-authored paraphrase must not replace
+    # the owner's steering text.  Non-owner/internal calls have no origin text
+    # and retain the explicit tool argument.
+    if isinstance(_md, dict) and isinstance(_md.get("origin_message_text"), str):
+        exact_owner_text = str(_md.get("origin_message_text") or "")
+        if exact_owner_text.strip():
+            msg = exact_owner_text
     client_message_id = str((_md.get("client_message_id") if isinstance(_md, dict) else "") or "").strip()
     routing_contract = (
         _md.get("routing_contract")
@@ -1152,13 +1264,18 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
         if isinstance(_md, dict) else [],
         "ts": utc_now_iso(),
     }
+    _attach_client_surface(ctx, evt)
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     status = str(receipt.get("status") or "unconfirmed")
     if status == "delivered":
-        return (
+        confirmation = (
             f"✉️ Steering task {target}: mailbox delivery is durably confirmed ({mode}). "
             "The task receives it at its next checkpoint."
         )
+        detail = str(receipt.get("detail") or "")
+        if detail:
+            confirmation += f"\n\n[ATTACHMENTS]\n{detail}\n[END_ATTACHMENTS]"
+        return confirmation
     if status in {"rejected", "needs_manual_target"}:
         return (
             f"⚠️ STEER_REJECTED: task {target} was not steered "
@@ -1356,6 +1473,7 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 # requested child deadline whenever the parent carried one of its own.
                 "deadline_at": narrowed_deadline_at,
                 "delegation_budget": delegation_budget,
+                "attachment_manifest": spec.get("attachment_manifest") or [],
                 # Same lesson for the criteria carriers, re-stated even when EMPTY:
                 # without these, the parent's claims/criteria leak into every child and
                 # child verify receipts would "support" claims the child never owned.
@@ -1364,6 +1482,7 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
             } if isinstance(parent_contract, dict) else {
                 "delegation_budget": delegation_budget,
                 "acceptance_claims": child_claims,
+                "attachment_manifest": spec.get("attachment_manifest") or [],
             },
         },
     })
@@ -1398,39 +1517,67 @@ def _inherited_workspace_from_active_repo(
     return workspace_root, workspace_mode
 
 
+def _materialize_child_attachment_manifest(
+    parent_contract: Dict[str, Any], target_root: Path, task_id: str,
+    *, owner_drive: Optional[Path] = None, owner_task_id: str = "",
+) -> tuple[list[dict], str]:
+    """Copy inherited task inputs into the child's own artifact store."""
+
+    initial = parent_contract.get("attachment_manifest") if parent_contract else []
+    inherited = list(initial) if isinstance(initial, list) else []
+    if owner_drive is not None and owner_task_id:
+        from ouroboros.owner_mailbox import owner_attachment_manifest
+
+        inherited.extend(owner_attachment_manifest(owner_drive, owner_task_id))
+    if not inherited:
+        return [], ""
+    from ouroboros.artifacts import materialize_inherited_attachment_manifest
+
+    return materialize_inherited_attachment_manifest(inherited, target_root, task_id)
+
+
 def schedule_subagent_properties() -> Dict[str, Any]:
     """SSOT for the schedule_subagent parameter surface: ONE object, TWO derived consumers.
 
-    The PUBLIC schema is the contract (`ToolEntry("schedule_subagent", …)` in `get_tools`, with
-    `additionalProperties: False`), and the handler must refuse exactly what the schema does not
-    expose. Those were previously two hand-maintained copies — this mapping and a frozenset of
-    names sitting beside it, its own comment admitting it "mirrors" the schema. A mirror is only
-    correct until someone adds a parameter to one side, at which point handler validation drifts
-    from what the model can see: a newly published parameter gets refused as "unsupported", or a
-    withdrawn one keeps being accepted. Now `get_tools` builds `properties` from this and
-    `_schedule_task` builds its allowed-key set from `schedule_subagent_param_names()`, so the two
-    cannot disagree (BIBLE P7).
+    The PUBLIC schema is the model contract (`ToolEntry("schedule_subagent", …)` in `get_tools`,
+    with `additionalProperties: False`). Ordinary arguments are derived from this one mapping;
+    the only non-public exception is the bounded D23 legacy selector set carried through the
+    registry for deterministic migration. This avoids the former pair of hand-maintained public
+    parameter lists drifting apart (BIBLE P7).
 
     Returns a FRESH mapping per call, exactly as the inline literal did, so a caller that mutates
     a returned schema cannot corrupt every later `get_tools()`."""
     from ouroboros.tool_access import SUBAGENT_CAPABILITIES
 
     return {
-        "objective": {"type": "string", "description": "Focused child objective. Be specific about scope."},
+        "subagent_id": {
+            "type": "string",
+            "description": (
+                "Exact actor id from the Available subagents catalog. The selected row is "
+                "snapshotted into the child, so later Settings edits do not retarget it."
+            ),
+        },
+        "plan_item_id": {
+            "type": "string",
+            "description": (
+                "Optional: the id of the work item in the OWNER-APPROVED execution plan "
+                "(propose_execution_plan) that THIS child is. It selects the subagent the "
+                "owner allocated to that piece of work, exactly as naming its subagent_id "
+                "would — use it after the owner approves a plan, so each child lands on the "
+                "agent they chose for it. An explicit subagent_id always wins, and an item "
+                "no approved plan carries falls back to the ordinary selection with the "
+                "fallback disclosed in capability_delta."
+            ),
+        },
+        "objective": {"type": "string", "description": "Focused child objective. Be specific about scope. State the OUTCOME you need, not a step-by-step script: on a delegated (harness) dispatch the child forwards the work to its own delegated run, and a script-shaped objective reads as orders to execute natively."},
         "expected_output": {"type": "string", "description": "Concrete handoff expected from the child."},
         "role": {"type": "string", "description": "Optional freeform role label for lineage/UI, e.g. architecture-reviewer."},
-        "context": {"type": "string", "description": "Optional parent reference material. It is injected as context, not instructions."},
+        "context": {"type": "string", "description": "Optional parent reference material. It is injected as context, not instructions; for a harness-dispatched child it becomes the WORK ORDER for its delegated run's prompt, so put the recipe/details here rather than in the objective."},
         "constraints": {"type": "string", "description": "Optional constraints/non-goals for the child."},
         "memory_mode": {
             "type": "string",
             "enum": sorted(VALID_SUBTASK_MEMORY_MODES),
             "description": "Child memory mode. Default forked copies stable memory only; empty starts blank. shared is disabled for live local subagents.",
-        },
-        "model_lane": {
-            "type": "string",
-            "enum": ["auto", "main", "heavy", "light"],
-            "default": "auto",
-            "description": "How STRONG this child should be. It says nothing about what the child may DO — authority comes from write_surface. CHOOSE CONSCIOUSLY: light for a read-only micro-check, a mini-audit, a formatting or lookup task; heavy for the strong acting/coding slot; main for the ordinary strong model. Omitting it (auto) INHERITS YOUR OWN lane — the right answer when the child's answer gets committed, or when you will act on it without re-checking. Cheap work must be NAMED light, not left unsaid. An empty Heavy/Light slot falls back to Main and the child reports the reduction in capability_delta. Depth does not change the lane; a child that finds the work harder raises itself with switch_model.",
         },
         "write_surface": {
             "type": "string",
@@ -1444,7 +1591,7 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "enum": ["read_only", "self_worktree", "external_workspace", "genesis"],
             "description": "read_only (or omit) = read-only child auditing THIS repo. Otherwise the isolated write surface for a MUTATIVE child (see tool description). Acting surfaces require mutative subagents enabled (default ON in advanced/pro).",
         },
-        "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory — a REAL external Git working tree, never runtime data. An installed non-Git skill payload is NOT an external workspace: delegate it directly with delegate_start(root='skill_payload', bucket=..., skill_name=...). OMIT write_root to build COOPERATIVELY from scratch — the host mints ONE shared git tree the whole subagent tree writes into together (deeper descendants inherit it), and you integrate the result as the sole committer. Ignored for self_worktree and genesis (both auto-provisioned)."},
+        "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory — a REAL external Git working tree, never runtime data. An installed non-Git skill payload is NOT an external workspace: delegate it directly with delegate_start(subagent_id=..., prompt=..., root='skill_payload', bucket=..., skill_name=...). OMIT write_root to build COOPERATIVELY from scratch — the host mints ONE shared git tree the whole subagent tree writes into together (deeper descendants inherit it), and you integrate the result as the sole committer. Ignored for self_worktree and genesis (both auto-provisioned)."},
         "protected_paths_grant": {"type": "boolean", "default": False, "description": "Allow the child to modify protected paths in its self_worktree. Honored only in pro runtime mode; you still re-check at integration."},
         "external_tool_grants": {"type": "array", "items": {"type": "string"}, "description": "Optional extension/MCP tool names to grant this mutative child. Denied by default."},
         "delegation_intent": {"type": "string", "description": "Optional: tell THIS child whether/how to delegate further (e.g. 'build the whole game; spawn your own children per subsystem and let them spawn too'). Propagated structurally into the child's delegation budget and surfaced in its prompt, so a 'use maximum subagents / grandchildren' intent is not lost. Defaults to inheriting the parent's intent."},
@@ -1456,23 +1603,9 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "items": {"type": "string", "enum": list(SUBAGENT_CAPABILITIES)},
             "description": "Closed-enum capabilities this child must have (e.g. shell/vcs/write/service). The scheduler reconciles this with the selected profile before spawning; do not encode these needs in prose.",
         },
-        "executor": {
-            "type": "string",
-            "enum": list(SUBAGENT_EXECUTORS),
-            "default": "auto",
-            "description": "WHO runs this child, a third axis alongside power (model_lane) and authority (write_surface). auto follows the owner's configured policy and is the right answer almost always — with no delegation route configured it simply runs native. native pins the child to Ouroboros' own metered loop. harness pins it to the configured delegation harness and is a REFUSAL to spend metered API money: when no harness route is available the child does NOT run, it ends with a typed executor-unavailable outcome (reported in capability_delta), because re-routing the pin to native would spend exactly what the pin prevents. Ask for auto if metered spend is acceptable.",
-        },
-        # `effort` was published here until v6.87.28 and is gone. A parent declares
-        # the WORK, not the machinery: `model_lane` already answers "how good must
-        # this answer be", so `model_lane: light` with `effort: max` was a request
-        # nobody could resolve, and a harness route carries its own effort, so a
-        # parent asking `low` against a route pinned to `xhigh` had no rule for who
-        # wins. Effort is derived at dispatch from `config.resolve_effort(task_type)`
-        # — the owner's control over it is exactly what it was before the knob.
-        "plan_item_id": {
-            "type": "string",
-            "description": "Optional: the id of the work item in the OWNER-APPROVED execution plan (propose_execution_plan) that THIS child is. Not a fourth axis and not a way to pick a machine — you still declare the work, and the destination comes from the owner's approved allocation exactly as the configured harness supplies it today. Use it after the owner approves a plan, so each child lands where they said that piece of work should run. An id no approved plan carries falls back to the owner's standing policy and the fallback is disclosed in capability_delta.",
-        },
+        # Per-call effort is retired. The selected Available-subagent row owns its
+        # effort; a second request knob could contradict that immutable row or the
+        # compound session route it pins.
         "deadline_at": {
             "type": "string",
             "description": "Optional ISO-8601 UTC instant after which this child's work is worthless to you (e.g. a scout whose handoff you can only consume inside a narrow window). NARROWING ONLY: the earlier of this and the parent's deadline wins, so it can tighten your own deadline but never extend it. Omit it to simply inherit the parent's.",
@@ -1524,11 +1657,6 @@ def _validated_schedule_fields(params: Dict[str, Any]) -> tuple[Dict[str, Any], 
     """
     deadline_at = str(params.get("deadline_at") or "").strip()
     memory_mode = str(params.get("memory_mode") or "forked").strip().lower()
-    try:
-        model_lane = normalize_subagent_model_lane(params.get("model_lane", "auto"))
-        executor = normalize_subagent_executor(params.get("executor", "auto"))
-    except ValueError as exc:
-        return {}, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}."
     if deadline_at:
         # `deadline_at` became MODEL-AUTHORED in v6.87.7; it used to be computed by
         # plan_review, where neither check could fail. Both failures below are SILENT
@@ -1581,7 +1709,6 @@ def _validated_schedule_fields(params: Dict[str, Any]) -> tuple[Dict[str, Any], 
         "context": str(params.get("context") or "").strip(),
         "constraints": str(params.get("constraints") or "").strip(),
         "memory_mode": memory_mode, "may_mutate": params.get("may_mutate", False),
-        "model_lane": model_lane, "executor": executor,
         "acceptance_claims": acceptance_claims,
         "plan_item_id": str(params.get("plan_item_id") or "").strip(),
     }, ""
@@ -1596,9 +1723,14 @@ def _validated_schedule_fields(params: Dict[str, Any]) -> tuple[Dict[str, Any], 
 # disclosure cannot come to disagree about why the field went away.
 RETIRED_SCHEDULE_PARAMS: Dict[str, str] = {"effort": "reasoning_effort"}
 
+# D23: accepted only by the real registry invocation path and intentionally absent
+# from ``schedule_subagent_properties``.  The handler attribute is consumed by the
+# generic registry seam; no tool-name special case or public schema alias exists.
+HIDDEN_LEGACY_SCHEDULE_PARAMS: frozenset[str] = frozenset({"model_lane", "executor"})
+
 
 def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, **params: Any) -> str:
-    allowed_params = schedule_subagent_param_names()
+    allowed_params = schedule_subagent_param_names() | HIDDEN_LEGACY_SCHEDULE_PARAMS
     retired = sorted(str(key) for key in params if key in RETIRED_SCHEDULE_PARAMS)
     if retired:
         return "⚠️ TOOL_ARG_ERROR (schedule_subagent): " + " ".join(
@@ -1610,8 +1742,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         bad = ", ".join(unsupported)
         return (
             "⚠️ TOOL_ARG_ERROR (schedule_subagent): unsupported argument(s): "
-            f"{bad}. Use the v6 strict schema: objective, expected_output, "
-            "optional role/context/constraints/memory_mode/model_lane and (for "
+            f"{bad}. Use the strict schema: subagent_id, objective, expected_output, "
+            "optional role/context/constraints/memory_mode and (for "
             "mutative children) write_surface/write_root/protected_paths_grant/"
             "external_tool_grants."
         )
@@ -1630,8 +1762,15 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     constraints = fields["constraints"]
     memory_mode = fields["memory_mode"]
     may_mutate = fields["may_mutate"]
-    requested_model_lane = fields["model_lane"]
-    requested_executor = fields["executor"]
+    plan_meta = getattr(ctx, "task_metadata", None)
+    plan_meta = plan_meta if isinstance(plan_meta, dict) else {}
+    actor = select_child_actor(params, fields, root_task_id=str(
+        plan_meta.get("root_task_id") or getattr(ctx, "task_id", "") or "").strip())
+    if actor.refusal:
+        return actor.refusal
+    configured_subagent, legacy_selection = actor.configured, actor.legacy
+    requested_model_lane, requested_executor = actor.model_lane, actor.executor
+    plan_item_id, plan_item_unresolved = actor.plan_item, actor.plan_unresolved
 
     try:
         current_depth = int(getattr(ctx, 'task_depth', 0) or 0)
@@ -1682,6 +1821,14 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     # constraint selection, mutating detection, and the event all treat it as read-only (P5).
     if requested_surface == "read_only":
         requested_surface = ""
+    if requested_surface:
+        from ouroboros.presence_authority import presence_ceiling_allows_delegated_surface
+
+        if not presence_ceiling_allows_delegated_surface(ctx, requested_surface):
+            return (
+                "⚠️ PRESENCE_DELEGATION_BLOCKED: mutative delegation requires an exact "
+                "selected write root for this surface in the inherited capability ceiling."
+            )
     # FR2: a flat parent requesting external_workspace with no write_root builds
     # cooperatively in ONE host-minted shared tree (helper extracted to keep this
     # method under the size gate).
@@ -1719,10 +1866,24 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     task_ids: List[str] = [tid]
     root_task_id = root_task_id_seed or tid
     parent_model_lane = str(metadata.get("effective_model_lane") or "")
+    parent_cognitive_route = {
+        "model": str(getattr(ctx, "active_model", "") or metadata.get("model") or ""),
+        "effort": str(getattr(ctx, "active_effort", "") or metadata.get("reasoning_effort") or ""),
+        "use_local_model": bool(
+            getattr(ctx, "active_use_local", metadata.get("use_local_model", False))
+        ),
+    }
     child_drive, _drive_err = _prepare_child_drive(
         tid, status_drive_root, memory_mode, parent_project_id)
     if _drive_err:
         return _drive_err
+    child_attachment_manifest, attachment_error = _materialize_child_attachment_manifest(
+        parent_contract, child_drive or status_drive_root, tid,
+        owner_drive=Path(ctx.drive_root), owner_task_id=parent_task_id,
+    )
+    if attachment_error:
+        shutil.rmtree(task_state_dir(status_drive_root, tid), ignore_errors=True)
+        return f"⚠️ SUBTASK_ATTACHMENT_ERROR: {attachment_error}"
 
     # C3.1: propagate and narrow the parent's typed delegation intent.
     child_delegation_budget = child_budget_for_schedule(
@@ -1740,6 +1901,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
         "child_delegation_budget": child_delegation_budget, "deadline_at": str(deadline_at or ""),
         "acceptance_claims": fields["acceptance_claims"],
+        "attachment_manifest": child_attachment_manifest,
     })
     # The requested-status envelope carries the REQUEST. Its derived half stays
     # empty until dispatch fills it, so a queued child's public description never
@@ -1758,35 +1920,15 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     # Not at dispatch, unlike route health: health is a live fact that can change
     # while a child waits, but an approved decision is not — re-reading the plan
     # later would let an edit silently re-route children the owner had already
-    # signed off on. A plan that will not parse REFUSES the schedule rather than
-    # falling back: falling back would spend on a destination nobody approved,
-    # which is the whole failure this record exists to prevent.
-    plan_item_id = fields["plan_item_id"]
-    routing_pin: Dict[str, Any] = {}
-    if plan_item_id:
-        from ouroboros.routing_plan import plan_pin_for_item
-
-        try:
-            pin = plan_pin_for_item(root_task_id, plan_item_id)
-        except ValueError as exc:
-            return (
-                "⚠️ TOOL_ARG_ERROR (schedule_subagent): the approved execution plan "
-                f"for this task tree cannot be read ({exc}). Nothing was scheduled — "
-                "re-approve the allocation with propose_execution_plan, or drop "
-                "plan_item_id to use the owner's standing policy."
-            )
-        if pin is not None:
-            routing_pin = pin.as_dict()
     intent_fields = {
         "model_lane": requested_model_lane,
         "requested_model_lane": requested_model_lane,
         "parent_model_lane": parent_model_lane,
         "requested_executor": requested_executor,
-        # Both halves ride: the id the parent NAMED (kept even when no plan
-        # carries it, so the disclosed fallback can say which item was meant)
-        # and the destination it RESOLVED TO ({} = none applied).
+        "configured_subagent": configured_subagent,
         "routing_plan_item": plan_item_id,
-        "routing_pin": routing_pin,
+        "routing_plan_item_unresolved": plan_item_unresolved,
+        "parent_cognitive_route": parent_cognitive_route,
     }
     evt = {
         "type": "schedule_subagent",
@@ -1872,6 +2014,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "root_task_id": root_task_id_seed or current_task_id,
         "emitted_modes": emitted_modes,
         "write_surface": requested_surface,
+        "configured_subagent": configured_subagent,
+        "legacy_selection": legacy_selection,
         # Host-minted shared coop tree only (a caller-supplied write_root is the
         # parent's own knowledge already).
         "coop_shared_tree": (
@@ -1880,6 +2024,9 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
             else ""
         ),
     })
+
+
+setattr(_schedule_task, "_hidden_legacy_params", HIDDEN_LEGACY_SCHEDULE_PARAMS)
 
 
 def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
@@ -1894,13 +2041,26 @@ def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
     return f"Deep self-review requested (model: {model}). It will be queued and executed asynchronously."
 
 
-def _chat_history(ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "") -> str:
+def _chat_history(
+    ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "",
+    snapshot: str = "", **filters: str,
+) -> str:
     from ouroboros.memory import Memory
-    mem = Memory(drive_root=ctx.drive_root)
+    metadata = getattr(ctx, "task_metadata", {}) if isinstance(
+        getattr(ctx, "task_metadata", {}), dict
+    ) else {}
+    canonical_root = Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(ctx, "budget_drive_root", "")
+        or ctx.drive_root
+    ))
+    mem = Memory(drive_root=canonical_root)
     # Full project awareness (v6.32.0): the one mind's active recall spans every
     # thread (main + projects). The project-task working FOCUS is applied to the
     # passive default context only, never to this deliberate recall tool.
-    return mem.chat_history(count=count, offset=offset, search=search)
+    return mem.chat_history(
+        count=count, offset=offset, search=search, snapshot=snapshot, **filters,
+    )
 
 
 def _update_scratchpad(ctx: ToolContext, content: str) -> str:
@@ -2072,8 +2232,6 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
         use_local = False
         if model == os.environ.get("OUROBOROS_MODEL") and os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1"):
             use_local = True
-        elif model == os.environ.get("OUROBOROS_MODEL_HEAVY") and os.environ.get("USE_LOCAL_HEAVY", "").lower() in ("true", "1"):
-            use_local = True
         elif model == os.environ.get("OUROBOROS_MODEL_LIGHT") and os.environ.get("USE_LOCAL_LIGHT", "").lower() in ("true", "1"):
             use_local = True
         else:
@@ -2096,13 +2254,54 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
     return f"OK: switching to {', '.join(changes)} on next round."
 
 
-def _get_task_result(ctx: ToolContext, task_id: str) -> str:
-    """Read the effective result of a registered subtask."""
+def _get_task_result(
+    ctx: ToolContext, task_id: str, include_authority: bool = False,
+    include_work_order_source: bool = False, source_start_char: Any = None,
+    source_end_char: Any = None,
+) -> str:
+    """Read a task result, or one bounded canonical work-order source range."""
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     data = load_effective_task_result(status_drive_root, task_id)
     if not data:
         return f"Task {task_id}: unknown or not yet registered"
+    if bool(include_authority) or bool(include_work_order_source):
+        from ouroboros.agent_startup_checks import task_result_authority_projection
+
+        authority = task_result_authority_projection(data, drive_root=status_drive_root)
+        payload: Dict[str, Any] = {
+            "status": "available", "authority": authority,
+            "source": {"tool": "get_task_result", "task_id": str(task_id)},
+        }
+        if bool(include_work_order_source):
+            from ouroboros.subagent_work_order import (
+                _source_task_from_context,
+                work_order_source_projection,
+            )
+
+            projection, reason = work_order_source_projection(
+                _source_task_from_context(ctx, str(task_id)),
+                source_start_char,
+                source_end_char,
+            )
+            source = {
+                "kind": "task_result",
+                "task_id": str(task_id),
+                "tool": "get_task_result",
+                "arguments": {
+                    "task_id": str(task_id),
+                    "include_authority": True,
+                    "include_work_order_source": True,
+                },
+                "projection": "canonical_work_order",
+            }
+            payload["source"] = source
+            payload["work_order_source"] = projection or {
+                "schema": 1, "kind": "canonical_work_order", "status": "unavailable",
+            }
+            if reason:
+                payload["work_order_source"]["reason"] = reason
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
     status = data.get("status", "unknown")
     result = data.get("result", "")
     trace = data.get("trace_summary", "")
@@ -2584,6 +2783,9 @@ def _wait_for_tasks(
                         _ee["delegated_runs_settled"] = int(_evidence.get("delegated_runs_settled") or 0)
                         _ee["delegated_runs_succeeded"] = int(_evidence.get("delegated_runs_succeeded") or 0)
                         _ee["delegated_runs_failed"] = int(_evidence.get("delegated_runs_failed") or 0)
+                        _ee["delegated_runs_source_unresolved"] = int(
+                            _evidence.get("delegated_runs_source_unresolved") or 0
+                        )
                     # The substrate claim rides only when the envelope made one.
                     _substrate = str(data.get("actual_substrate") or _envelope.get("actual_substrate") or "")
                     if _substrate:
@@ -2628,7 +2830,9 @@ _PROMOTE_CHAT_DESCRIPTION = (
     "and this task runs inside it (my own judgment: the owner's phrasing is intent, "
     "not a keyword trigger — I name the project from what they actually want it "
     "called, and do not just answer or spawn a project-less task). `project_id` "
-    "scopes to an existing project; "
+    "scopes to an existing project. When this new task continues one specific "
+    "completed result shown by the host (the Main manifest or Project last-result "
+    "preview), pass its internal id as `predecessor_task_id`; omit it for fresh work. "
     "`workspace_root` points at a working folder. A project-scoped task inherits "
     "the project's working folder as its ACTIVE WORKSPACE by default (its file/"
     "shell/git tools operate there, not on the Ouroboros repo); pass "
@@ -2672,6 +2876,7 @@ def get_tools() -> List[ToolEntry]:
                     "workspace_root": {"type": "string", "description": "Optional absolute working-folder path (validated at admission: must be a git worktree root outside the Ouroboros repo/data). When omitted for a project-scoped task, the project's registered working_dir is used by default.", "default": ""},
                     "workspace": {"type": "string", "description": "Pass 'none' to opt OUT of the project room's default working folder (a folder-less task in a folder-ful project). Leave empty otherwise.", "default": ""},
                     "source": {"type": "string", "description": "Attach or clone the project's working folder in ONE move: a git URL (https://... or git@host:path — cloned server-side into the projects root; private repos fail typed auth_required) or an existing folder path (validated attach). The folder is registered on the project (provenance + trusted_at) and becomes this task's active workspace. Use for 'help me debug this GitHub repo / this folder' asks.", "default": ""},
+                    "predecessor_task_id": {"type": "string", "description": "Internal selector for one completed result already listed by the host routing manifest. Use only when the new task continues that result; omit for fresh work.", "default": ""},
                 },
                 "required": ["objective"],
             },
@@ -2718,12 +2923,15 @@ def get_tools() -> List[ToolEntry]:
                 "CALL THIS TOOL with project_id='' and the owner's message: it emits the typed "
                 "needs_manual_target acknowledgement with host-validated task options and New task "
                 "in Project; prose alone cannot emit that typed choice. For brand-new work that is not yet a project, "
-                "use promote_chat_to_task instead. Returns a visible routing receipt."
+                "use promote_chat_to_task instead. When continuing one completed result from the "
+                "Main host manifest, pass its internal `predecessor_task_id`; omit it for fresh work. "
+                "Returns a visible routing receipt."
             ),
             "parameters": {"type": "object", "properties": {
                 "project_id": {"type": "string", "default": "", "description": "Target project id (filesystem-clean; see list_projects), or empty to emit typed needs_manual_target."},
                 "message": {"type": "string", "description": "The owner message / work to route into the project."},
                 "reason": {"type": "string", "default": "", "description": "Optional short why-this-project note (provenance)."},
+                "predecessor_task_id": {"type": "string", "default": "", "description": "Internal selector for one completed result listed by the Main host manifest. Omit for fresh work."},
             }, "required": ["message"]},
         }, _route_to_project),
         ToolEntry("steer_task", {
@@ -2755,6 +2963,10 @@ def get_tools() -> List[ToolEntry]:
                 "genesis (a from-scratch new project — game/site/app/new Ouroboros — auto-provisioned as a fresh "
                 "empty git repo under the durable projects root; the project directory IS the deliverable, not "
                 "integrated into this repo). "
+                "An installed skill payload under data/ is NOT a write_surface (runtime data is never one, by "
+                "design): mutate it YOURSELF via delegate_start(subagent_id=..., prompt=..., root='skill_payload', bucket=..., skill_name=...) "
+                "— a child cannot open a payload delegation — and schedule children only as read-only "
+                "designers/reviewers for that work. "
                 "COOPERATIVE MULTI-BUILDER vs GENESIS: when SEVERAL builder children must contribute to ONE new "
                 "deliverable together, give each write_surface=external_workspace and OMIT write_root — the host "
                 "mints ONE shared git tree the whole subagent tree writes into cooperatively (deeper descendants "
@@ -2780,7 +2992,7 @@ def get_tools() -> List[ToolEntry]:
                 # DERIVED, not restated: schedule_subagent_properties() is the single source
                 # this schema and the handler's allowed-key set both read from.
                 "properties": schedule_subagent_properties(),
-                "required": ["objective", "expected_output"],
+                "required": ["subagent_id", "objective", "expected_output"],
                 "additionalProperties": False,
             },
         }, _schedule_task),
@@ -2794,12 +3006,20 @@ def get_tools() -> List[ToolEntry]:
         }, _request_deep_self_review),
         ToolEntry("chat_history", {
             "name": "chat_history",
-            "description": "Retrieve messages from chat history. Supports search.",
+            "description": "Retrieve live and recent archived chat messages. Supports exact provenance/date filters, substring search, and pagination.",
             "parameters": {"type": "object", "properties": {
                 "count": {"type": "integer", "default": 100, "description": "Number of messages (from latest)"},
                 "offset": {"type": "integer", "default": 0, "description": "Skip N from end (pagination)"},
                 "search": {"type": "string", "default": "", "description": "Text filter"},
-            }, "required": []},
+                "provider": {"type": "string", "default": "", "description": "Exact transport provider"},
+                "account_id": {"type": "string", "default": "", "description": "Exact transport account ID"},
+                "conversation_id": {"type": "string", "default": "", "description": "Exact transport conversation ID"},
+                "thread_id": {"type": "string", "default": "", "description": "Exact transport thread ID"},
+                "actor_id": {"type": "string", "default": "", "description": "Exact platform actor ID"},
+                "date_from": {"type": "string", "default": "", "description": "Inclusive ISO-8601 lower timestamp bound"},
+                "date_to": {"type": "string", "default": "", "description": "Inclusive ISO-8601 upper timestamp bound"},
+                "snapshot": {"type": "string", "default": "", "description": "Opaque snapshot returned by the first page; reuse it with offset to refuse shifted/mixed pages"},
+            }, "required": [], "additionalProperties": False},
         }, _chat_history),
         ToolEntry("update_scratchpad", {
             "name": "update_scratchpad",
@@ -2864,9 +3084,15 @@ def get_tools() -> List[ToolEntry]:
         }, _switch_model),
         ToolEntry("get_task_result", {
             "name": "get_task_result",
-            "description": "Read the effective result of a subtask, including child-drive output when available.",
+            "description": "Read the effective result or exact authority of a task, including one bounded canonical work-order source range when requested.",
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
-                "task_id": {"type": "string", "description": "Task ID returned by schedule_subagent"},
+                "task_id": {"type": "string", "description": "Task ID returned by scheduling or exposed by the host routing manifest."},
+                "include_authority": {"type": "boolean", "default": False,
+                                      "description": "Return the exact selected result, task contract, origin, artifact references, and current plan-review authority."},
+                "include_work_order_source": {"type": "boolean", "default": False,
+                                               "description": "Return the canonical work-order source projection; provide both source_start_char and source_end_char for the exact bounded range."},
+                "source_start_char": {"type": "integer", "description": "Inclusive character offset for the requested canonical work-order source range."},
+                "source_end_char": {"type": "integer", "description": "Exclusive character offset for the requested canonical work-order source range."},
             }},
         }, _get_task_result),
         ToolEntry("wait_task", {

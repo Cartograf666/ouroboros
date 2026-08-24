@@ -41,6 +41,7 @@ VALID_SKILL_PERMISSIONS = frozenset(
         "supervised_task",
         "subscribe_event",
         "inject_chat",
+        "presence",
     }
 )
 _EVENT_TOPIC_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")

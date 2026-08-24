@@ -264,7 +264,17 @@ export function resolveCostPair(payload, newName, oldName) {
     const raw = has(oldName) ? source[oldName] : (has(newName) ? source[newName] : null);
     if (raw === null || raw === undefined || raw === '') return null;
     const num = Number(raw);
-    return Number.isFinite(num) ? num : null;
+    if (!Number.isFinite(num)) return null;
+    const unknown = Number(source.unknown_unmetered);
+    const reserved = Number(source.reserved_usd);
+    const unresolved = Number(source.unresolved_upper_bound_usd);
+    // Historical terminal envelopes may carry the old `0 + unknown` shape.
+    // Keep the browser aligned with the Python SSOT: a zero with no known
+    // reservation/bound is pending unknown, never a free receipt.
+    if (num === 0 && Number.isFinite(unknown) && unknown > 0
+        && (!Number.isFinite(reserved) || reserved === 0)
+        && (!Number.isFinite(unresolved) || unresolved === 0)) return null;
+    return num;
 }
 
 /** This task's own accounted upper bound (null when unknown). */

@@ -51,6 +51,7 @@ def compute_touched_context_status(
 
 def ladder_terminal_cause(
     context_status: TouchedContextStatus, input_limit: int, budget_phrase: str = "",
+    managed: bool = False,
 ) -> tuple[str, str]:
     """``(cause, remedy)`` for a terminal ladder status — ONE derivation, both terminals.
 
@@ -78,12 +79,27 @@ def ladder_terminal_cause(
             f"(~{context_status.token_count} estimated tokens)",
             ATLAS_MIXED_ASSEMBLY_REMEDY,
         )
+    if managed:
+        # A managed resolution stages the whole two-parent merge tree by
+        # contract: "split the commit" is structurally impossible for it, so
+        # the remedy is REPLACED (never appended below a false imperative).
+        from ouroboros.tools.review_admission import (
+            MANAGED_OVERSIZE_GUIDANCE,
+            MANAGED_SPLIT_IMPOSSIBLE,
+        )
+
+        overflow_remedy = f"{MANAGED_SPLIT_IMPOSSIBLE} {MANAGED_OVERSIZE_GUIDANCE}"
+    else:
+        overflow_remedy = (
+            "Split the commit into smaller staged diffs, or configure a "
+            "larger-window reviewer."
+        )
     return (
         "the irreducible scope prompt (checklist + canonical docs + staged diff) is "
         f"~{context_status.token_count} estimated tokens and exceeds the scope reviewer "
         f"{budget}, with every touched file "
         "already degraded to diff-only and the atlas to its manifest",
-        "Split the commit into smaller staged diffs, or configure a larger-window reviewer.",
+        overflow_remedy,
     )
 
 

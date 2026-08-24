@@ -79,6 +79,8 @@ def test_executor_panic_cleanup_wait_false_uses_bounded_docker_stop(tmp_path, mo
 
     def fake_docker_wait(cmd, **kwargs):
         docker_run_calls.append([str(part) for part in cmd])
+        if "kill -0" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="exited\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     class FakePopen:
@@ -91,7 +93,9 @@ def test_executor_panic_cleanup_wait_false_uses_bounded_docker_stop(tmp_path, mo
     killed_foreground = workspace_executor.kill_all_foreground(data, wait=False)
     killed_services = workspace_executor.kill_all_services(data, wait=False)
 
-    assert len(docker_run_calls) == 3
+    # Both in-memory and durable services perform an explicit kill-0
+    # confirmation after the stop shell, in addition to the dispatches.
+    assert len(docker_run_calls) == 5
     assert all(call[:2] == ["docker", "exec"] for call in docker_run_calls)
     assert any(item.get("executor_type") == "docker_exec" for item in killed_foreground)
     assert any(item.get("state") == "stopped" for item in killed_services)

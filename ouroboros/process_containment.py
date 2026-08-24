@@ -68,6 +68,51 @@ def pid_marker_state(pid: int, marker: str) -> str:
     return MARKER_UNREADABLE
 
 
+# Tri-state env ASSIGNMENT, a different question from `pid_marker_state`'s membership: the caller
+# KILLS on the answer, so PRESENT is the only affirmative and both ABSENT and UNREADABLE deny it.
+ENV_ASSIGNMENT_PRESENT = "present"
+ENV_ASSIGNMENT_ABSENT = "absent"
+ENV_ASSIGNMENT_UNREADABLE = "unreadable"
+
+
+def pid_environment_assignment_state(pid: int, key: str, value: str) -> str:
+    """Whether ``pid``'s LIVE environment carries exactly ``key=value``.
+
+    ABSENT means answered-not-carried; UNREADABLE means unanswerable. Windows is always UNREADABLE:
+    no caller may claim a Windows proof from this."""
+    if _pl.IS_WINDOWS or not key or int(pid) <= 0:
+        return ENV_ASSIGNMENT_UNREADABLE
+    assignment = f"{key}={value}"
+    if os.path.isdir("/proc"):
+        try:
+            with open(f"/proc/{int(pid)}/environ", "rb") as handle:
+                data = handle.read()
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH, errno.ENOTDIR):
+                return ENV_ASSIGNMENT_ABSENT  # the pid is gone
+            return ENV_ASSIGNMENT_UNREADABLE  # nondumpable, or another user's process
+        # Split on the NUL delimiter and compare WHOLE entries: a substring test would let
+        # `OTHER_KEY=<ours>` or `KEY=<ours>/sub` answer for `KEY=<ours>`.
+        entries = data.split(b"\0")
+        return (ENV_ASSIGNMENT_PRESENT
+                if assignment.encode("utf-8", "replace") in entries
+                else ENV_ASSIGNMENT_ABSENT)
+    try:
+        out = subprocess.run(["ps", "-E", "-ww", "-p", str(int(pid)), "-o", "command="],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ENV_ASSIGNMENT_UNREADABLE
+    if out.returncode != 0:
+        # `ps -p` fails only when there is no such process.
+        return ENV_ASSIGNMENT_ABSENT
+    if assignment in (out.stdout or "").split():
+        return ENV_ASSIGNMENT_PRESENT
+    # ALIVE, and `ps -E` showed no such assignment. Unlike /proc's EACCES, `ps -E` reports a process
+    # whose environment it may not read by OMITTING it — indistinguishable from one that never
+    # carried the assignment (as is a value containing whitespace). Unanswered, not answered "no".
+    return ENV_ASSIGNMENT_UNREADABLE
+
+
 def pid_is_zombie(pid: int) -> bool:
     """Whether ``pid`` is an already-exited process still holding a table slot. A SIGKILLed child of
     THIS process keeps its pid, pgid and ``ps`` row until someone ``wait()``s it, and the preflight

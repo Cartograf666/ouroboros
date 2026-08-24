@@ -30,9 +30,11 @@ from ouroboros.task_results import (
     load_task_result,
     write_task_result,
 )
-from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
+from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection, with_cost_aliases
 from ouroboros.outcomes import infra_failed_axes, normalize_outcome_axes
+from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.subagents import intended_lane as intended_subagent_lane
+from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 
 log = logging.getLogger(__name__)
@@ -54,19 +56,29 @@ _GIT_UNBORN_HEAD = "(unborn)"
 HOST_NARRATION = "host_narration"
 
 
+def _routing_attachments(value: Any) -> Optional[list]:
+    return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else None
+
+
 def _emit_routing_receipt(
     ctx: Any,
     evt: Dict[str, Any],
     *,
     action: str,
     target: str = "",
+    target_label: str = "",
     status: str,
     reason: str = "",
     detail: str = "",
     options: Optional[list] = None,
+    attachment_manifest: Optional[list] = None,
     publish: bool = True,
 ) -> Dict[str, Any]:
     """Persist and publish one token-bound routing annotation receipt."""
+    if target and not str(target_label or "").strip():
+        from ouroboros.project_dialogue import routing_target_label
+
+        target_label = routing_target_label(ctx.DRIVE_ROOT, action, target, task=evt, project_id=str(evt.get("project_id") or ""))
     client_message_id = str(evt.get("client_message_id") or "").strip()
     routing_token = str(evt.get("routing_token") or "").strip()
     annotation_status = "not_applicable"
@@ -81,11 +93,13 @@ def _emit_routing_receipt(
                     client_message_id,
                     action=action,
                     target=target,
+                    target_label=target_label,
                     status=status,
                     routing_token=routing_token,
                     reason=reason,
                     detail=detail,
                     options=options,
+                    attachment_manifest=attachment_manifest,
                 )
                 else "failed"
             )
@@ -106,7 +120,10 @@ def _emit_routing_receipt(
         "detail": str(detail or ""),
         "annotation_status": annotation_status,
         "routing_token": routing_token,
+        "target_label": str(target_label or ""),
     }
+    if attachment_manifest is not None:
+        receipt["attachment_manifest"] = _routing_attachments(attachment_manifest) or []
     if not receipt["persisted"]:
         return receipt
     if publish:
@@ -115,8 +132,10 @@ def _emit_routing_receipt(
             evt,
             action=action,
             target=target,
+            target_label=target_label,
             status=effective_status,
             options=options,
+            attachment_manifest=attachment_manifest,
         )
     return receipt
 
@@ -127,11 +146,17 @@ def _publish_routing_ack(
     *,
     action: str,
     target: str,
+    target_label: str = "",
     status: str,
     options: Optional[list] = None,
+    attachment_manifest: Optional[list] = None,
 ) -> None:
     """Publish a live non-bubble acknowledgement after durable authority exists."""
     try:
+        if target and not str(target_label or "").strip():
+            from ouroboros.project_dialogue import routing_target_label
+
+            target_label = routing_target_label(ctx.DRIVE_ROOT, action, target, task=evt, project_id=str(evt.get("project_id") or ""))
         client_message_id = str(evt.get("client_message_id") or "").strip()
         try:
             chat_id = int(evt.get("chat_id") or 0)
@@ -144,10 +169,13 @@ def _publish_routing_ack(
                 "client_message_id": client_message_id,
                 "action": action,
                 "target": target,
+                "target_label": target_label,
                 "status": status,
             }
             if options is not None:
                 ack_kwargs["options"] = options
+            if attachment_manifest is not None:
+                ack_kwargs["attachment_manifest"] = attachment_manifest
             ack(
                 chat_id,
                 **ack_kwargs,
@@ -404,7 +432,11 @@ def _compose_subagent_text(
             "[WRITE SURFACE]",
             f"You are a MUTATIVE (acting) child. write_surface={surface}."
             + (f" write_root={write_root}." if write_root else ""),
-            "Make all changes inside the write root only. Do NOT commit, run review / "
+            # Boundary-only wording (decision 2A): this text is frozen at
+            # schedule time, when the executor is unknown — it states WHERE
+            # changes land, never that the child executes them natively itself
+            # (the dispatch-time executor note owns execution framing).
+            "All changes land inside the write root only. Do NOT commit, run review / "
             "runtime / skills lifecycle, enable tools, or write cognitive memory. Your "
             "changes are captured as a workspace.patch and returned to the parent, who "
             "integrates and is the sole committer of the live body. Nested delegation is "
@@ -493,6 +525,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     task_group_id = str(fields.get("task_group_id") or "")
     task_group = fields.get("task_group") if isinstance(fields.get("task_group"), dict) else {}
     subagent_envelope = fields.get("subagent_envelope") if isinstance(fields.get("subagent_envelope"), dict) else {}
+    configured_subagent = fields.get("configured_subagent") if isinstance(fields.get("configured_subagent"), dict) else {}
+    parent_cognitive_route = fields.get("parent_cognitive_route") if isinstance(fields.get("parent_cognitive_route"), dict) else {}
     task: Dict[str, Any] = {
         "id": tid,
         "type": "task",
@@ -528,6 +562,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "task_group_id": task_group_id,
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
+        "configured_subagent": configured_subagent,
+        "parent_cognitive_route": parent_cognitive_route,
         "metadata": {
             "parent_task_id": parent_id,
             "root_task_id": root_task_id,
@@ -550,6 +586,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": subagent_envelope,
+            "configured_subagent": configured_subagent,
+            "parent_cognitive_route": parent_cognitive_route,
         },
     }
     if not drive_root:
@@ -883,6 +921,7 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
             _hb_chat_id = _bound_project_chat_id(ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")) or int(task.get("chat_id") or 0)
         except (TypeError, ValueError):
             _hb_chat_id = 0
+        cost_fields = live_root_cost_projection(task_id, task, evt, ctx.DRIVE_ROOT)
         try:
             ctx.bridge.push_log({
                 "ts": evt.get("ts", utc_now_iso()),
@@ -898,6 +937,7 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
                 "parent_task_id": evt.get("parent_task_id", ""),
                 "delegation_role": evt.get("delegation_role", ""),
                 "subagent_role": evt.get("subagent_role", ""),
+                **cost_fields,
             })
         except Exception:
             log.debug("Failed to forward task heartbeat to live logs", exc_info=True)
@@ -938,32 +978,67 @@ def _handle_task_dispatch_resolved(evt: Dict[str, Any], ctx: Any) -> None:
 def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
     try:
         chat_id = int(evt.get("chat_id") or 0)
+        task_id = str(evt.get("task_id") or "")
+        phase = str(evt.get("phase") or "thinking")
+        client_msg_id = ""
+        kind = ""
+        if task_id:
+            try:
+                from supervisor.active_activity import get_direct_activity_registry
+                # A registry hit identifies a direct/ephemeral turn; queued
+                # managed tasks also emit typing_start but are not tracked here,
+                # so their frames go out without a kind stamp.
+                entry = get_direct_activity_registry().get(task_id)
+                if entry:
+                    client_msg_id = entry.client_message_id
+                    kind = entry.kind
+            except Exception:
+                pass
+        if not kind and task_id:
+            # A RUNNING queue ROOT is stamped "managed_task" so the client can
+            # reconcile its entry against the /api/state activity snapshot
+            # (which lists queue roots). Subagent typing keeps the legacy
+            # no-kind exemption: no snapshot source enumerates children.
+            try:
+                running = getattr(ctx, "RUNNING", None)
+                meta = running.get(task_id) if isinstance(running, dict) else None
+                task_row = meta.get("task") if isinstance(meta, dict) else None
+                if isinstance(task_row, dict):
+                    from ouroboros.task_results import resolve_task_lineage
+
+                    lineage = resolve_task_lineage(
+                        task_id,
+                        metadata=task_row.get("metadata"),
+                        root_task_id=task_row.get("root_task_id"),
+                        parent_task_id=task_row.get("parent_task_id"),
+                        delegation_role=task_row.get("delegation_role"),
+                        original_task_id=task_row.get("original_task_id"),
+                        timeout_retry_from=task_row.get("timeout_retry_from"),
+                    )
+                    if lineage["is_root_task"]:
+                        kind = "managed_task"
+            except Exception:
+                log.debug("managed typing kind resolution failed for %s", task_id, exc_info=True)
         if chat_id:
-            ctx.bridge.send_chat_action(chat_id, "typing")
+            ctx.bridge.send_chat_action(
+                chat_id,
+                "typing",
+                activity_id=task_id,
+                client_message_id=client_msg_id,
+                phase=phase,
+                kind=kind,
+            )
     except Exception:
         log.debug("Failed to send typing action to chat", exc_info=True)
         pass
 
 
-# Delivered final-answer dedupe (mirror of the already_done terminal dedupe, for
-# this one event kind): the worker sends the final send_message BOTH over the
-# live queue (before blocking post-task) AND in the buffered return — queue.put
-# is not a delivery receipt, so neither copy is dropped worker-side; instead
-# both carry the same delivery_id and the second one is suppressed here. The
-# in-memory deque is a fast-path cache; the durable registry
-# (``supervisor.terminal_delivery``, phase A2) is the LOGICAL dedupe shared by
-# the natural, cancel, and reap delivery paths and survives a restart.
+# Durable terminal registry dedupes successful sends across restarts.
 _DELIVERED_MESSAGE_IDS: "deque[str]" = deque(maxlen=256)
 
 
 def _register_delivered(ctx: Any, delivery_id: str) -> None:
-    """Durably mark one delivery id as delivered — and clear what it owed.
-
-    Both halves of the same fact: the id joins the restart-surviving registry AND
-    leaves the pending outbox in one write, so a replay can never re-send an
-    answer that landed (phase A2/F7). Fail-soft: a registry write must never cost
-    a delivery that already happened.
-    """
+    """Atomically mark one id delivered and clear its pending-outbox row."""
     try:
         from supervisor.terminal_delivery import register_delivery
 
@@ -1008,27 +1083,22 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         # are narration ABOUT the task, never work BY it.
         progress_meta = evt.get("progress_meta") if isinstance(evt.get("progress_meta"), dict) else None
         _running = getattr(ctx, "RUNNING", None)
-        if is_progress and task_id and isinstance(_running, dict):
+        task_row: Dict[str, Any] = {}
+        if task_id and isinstance(_running, dict):
             _m = _running.get(task_id)
             # Mutate in place (see _handle_llm_usage): no write-back, so a cross-thread
             # cancel that popped this task is never resurrected.
             if isinstance(_m, dict):
-                if not evt.get(HOST_NARRATION):
+                if is_progress and not evt.get(HOST_NARRATION):
                     _m["last_progress_at"] = time.time()
-                # v6.82 (P5): host-attested cancelable marker. RUNNING membership is
-                # the supervisor's own truth that this frame belongs to a queue task
-                # that /api/tasks/{id}/cancel can force-cancel. An in-process
-                # direct-chat turn is never in RUNNING, so its card never shows a
-                # dead "Cancel run" button. Covers pooled roots that skip the
-                # scheduled notice (e.g. promote_chat_to_task). The marker is
-                # LINEAGE-GATED here and carries the RUNNING row's authoritative
-                # lineage: only a resolved ROOT is stamped (a timeout-retry root
-                # counts — its root_task_id names the original, which is exactly
-                # why the frontend must trust this attestation rather than
-                # re-deriving rootness from frame shape), and a subagent's
-                # narration never mints a root-shaped card with a live Cancel.
-                # Copy-on-write: the worker's own event dict is never mutated.
                 task_row = _m.get("task") if isinstance(_m.get("task"), dict) else {}
+                child_meta = subagent_message_meta(task_row, task_id=task_id)
+                if child_meta:
+                    event_meta = dict(progress_meta or {})
+                    progress_meta = dict(child_meta)
+                    progress_meta.update(event_meta)
+            if is_progress and isinstance(_m, dict):
+                # Host-attested RUNNING lineage is the cancel authority.
                 progress_meta = dict(progress_meta or {})
                 for lineage_key in ("root_task_id", "parent_task_id", "delegation_role"):
                     value = str(task_row.get(lineage_key) or "").strip()
@@ -1050,8 +1120,27 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
                         progress_meta["cancelable"] = True
                 except Exception:
                     log.debug("cancelable lineage resolution failed for %s", task_id, exc_info=True)
-        bound_chat = _bound_project_chat_id(ctx, task_id, evt.get("parent_task_id"), evt.get("root_task_id"))
-        chat_id = bound_chat or int(evt["chat_id"])
+        if task_id and not is_progress and not task_row and not subagent_message_meta(progress_meta, task_id=task_id):
+            try:
+                from ouroboros.task_status import load_effective_task_result
+
+                result = load_effective_task_result(ctx.DRIVE_ROOT, task_id, materialize_artifacts=False)
+                child_meta = subagent_message_meta(result, task_id=task_id)
+                if child_meta:
+                    event_meta = dict(progress_meta or {})
+                    progress_meta = dict(child_meta)
+                    progress_meta.update(event_meta)
+            except Exception:
+                log.debug("final lineage recovery failed for %s", task_id, exc_info=True)
+        meta = progress_meta or {}
+        bound_chat = _bound_project_chat_id(
+            ctx, task_id,
+            meta.get("parent_task_id") or evt.get("parent_task_id"),
+            meta.get("root_task_id") or evt.get("root_task_id"),
+        )
+        system_type = str(evt.get("system_type") or "")
+        # Project completion summaries target cognitive Main; other messages keep lineage routing.
+        chat_id = int(evt["chat_id"]) if system_type == "project_completion_summary" else bound_chat or int(evt["chat_id"])
         ctx.send_with_budget(
             chat_id,
             str(evt.get("text") or ""),
@@ -1063,12 +1152,9 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             ts=(str(raw_ts) if raw_ts else None),
             # S3 (Q4): a typed system receipt keeps its role/type end to end.
             role=str(evt.get("role") or ""),
-            system_type=str(evt.get("system_type") or ""),
+            system_type=system_type,
         )
-        # Registered only AFTER a successful send: if the live copy's send
-        # raises, the buffered copy must NOT be suppressed later — "never
-        # lost" outranks "never doubled". The durable registration is the
-        # restart-surviving half of the same rule.
+        # Register only after send; a failed first copy must not suppress retry.
         if delivery_id:
             _DELIVERED_MESSAGE_IDS.append(delivery_id)
             _register_delivered(ctx, delivery_id)
@@ -1245,6 +1331,7 @@ def _authoritative_terminal_cost(
     task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
 ) -> Dict[str, Any]:
     """Project one terminal task/root from the physical-attempt authority."""
+    from ouroboros.cost_projection import honest_accounted_amount
     from supervisor.state import reconstruct_task_cost
 
     authority_root = pathlib.Path(task.get("budget_drive_root") or drive_root)
@@ -1285,8 +1372,11 @@ def _authoritative_terminal_cost(
                 root_task_id=str(lineage["root_task_id"] or task_id),
             )
             subtree_final = bool(subtree.get("cost_final"))
+            subtree_amount = honest_accounted_amount(subtree)
             projection.update({
-                "cost_usd_with_children": round(float(subtree.get("accounted_usd") or 0.0), 6),
+                "cost_usd_with_children": (
+                    round(subtree_amount, 6) if subtree_amount is not None else None
+                ),
                 "cost_with_children_partial": not subtree_final,
                 "cost_final": bool(projection.get("cost_final") and subtree_final),
                 # THIRD site of the same class: `non_final_rows` is `cost_final`'s
@@ -1313,7 +1403,7 @@ def _authoritative_terminal_cost(
         )
     checkpoint = result.get("root_phase_checkpoint")
     post_status = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
-    if is_root and post_status in {"pending_once", "running"}:
+    if is_root and post_task_synthesis_is_open(post_status):
         projection["cost_final"] = False
         projection["cost_with_children_partial"] = True
     # SSOT cost naming (C2): re-converge the additive/deprecated alias pairs at
@@ -1591,6 +1681,19 @@ def _finish_task_done_dispatch(
 ) -> None:
     """Notify lineage, release queue state, and preserve terminal compatibility."""
 
+    from ouroboros.project_dialogue import (
+        append_terminal_task_projection,
+        enqueue_project_completion_summary,
+    )
+
+    append_terminal_task_projection(
+        ctx.DRIVE_ROOT, str(task_id or ""), task, final_task_result, task_done_event,
+    )
+
+    enqueue_project_completion_summary(
+        ctx.DRIVE_ROOT, evt, str(task_id or ""), task, final_task_result, task_done_event,
+    )
+
     if task_id and str(task.get("delegation_role") or "") == "subagent":
         try:
             raw_chat = int(task.get("chat_id") or 0)
@@ -1769,6 +1872,13 @@ def _finish_task_done_dispatch(
             )
     except Exception as exc:
         log.warning("Failed to store task result in events: %s", exc)
+    if task_id:
+        try:
+            from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
+
+            cleanup_settled_owner_mailbox(ctx.DRIVE_ROOT, str(task_id), task)
+        except Exception:
+            log.warning("Failed to cleanup terminal owner mailbox for %s", task_id, exc_info=True)
 
 
 def _resolve_lifecycle_fault(
@@ -3079,6 +3189,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                 target=str(outcome.get("task_id") or task_id),
                 status="scheduled",
                 detail=str(outcome.get("source_note") or ""),
+                attachment_manifest=_routing_attachments(outcome.get("attachment_manifest")),
                 publish=False,
             )
             admission_status = (
@@ -3109,6 +3220,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                     if admission_status == "scheduled"
                     else "Task is scheduled, but its owner-facing routing receipt was not confirmed."
                 ),
+                attachment_manifest=list(outcome.get("attachment_manifest") or []),
             )
             admission = stored.get("promotion_admission") if isinstance(stored, dict) else {}
             if (
@@ -3129,7 +3241,9 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                 evt,
                 action=receipt_action,
                 target=str(outcome.get("task_id") or task_id),
+                target_label=str(receipt.get("target_label") or ""),
                 status="scheduled",
+                attachment_manifest=_routing_attachments(outcome.get("attachment_manifest")),
             )
             if title:
                 _broadcast_task_named(
@@ -3156,7 +3270,8 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
             reason="promote_chat_to_task_rejected",
         )
         supervisor_queue.release_task_admission(task_id, routing_token)
-        _persist_promote_rejection(ctx, evt, outcome)
+        if str(outcome.get("reason") or "") != "attachment_admission_rejected":
+            _persist_promote_rejection(ctx, evt, outcome)
         _emit_routing_receipt(
             ctx,
             evt,
@@ -3165,6 +3280,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
             status="needs_manual_target",
             reason=str(outcome.get("reason") or "admission_rejected"),
             detail=str(outcome.get("detail") or ""),
+            attachment_manifest=_routing_attachments(outcome.get("attachment_manifest")),
         )
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -3235,10 +3351,9 @@ def _handle_ensure_project_scope(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_routing_manual_target(evt: Dict[str, Any], ctx: Any) -> None:
     """Publish the decision actor's typed abstention without routing work."""
-    options = [
-        dict(row) for row in list(evt.get("options") or [])[:100]
-        if isinstance(row, dict)
-    ]
+    from ouroboros.project_dialogue import routing_options_with_labels
+
+    options = routing_options_with_labels(ctx.DRIVE_ROOT, evt.get("options"))
     _emit_routing_receipt(
         ctx,
         evt,
@@ -3319,6 +3434,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     task_group_id = str(evt.get("task_group_id") or "").strip()
     task_group = evt.get("task_group") if isinstance(evt.get("task_group"), dict) else {}
     subagent_envelope = evt.get("subagent_envelope") if isinstance(evt.get("subagent_envelope"), dict) else {}
+    configured_subagent = evt.get("configured_subagent") if isinstance(evt.get("configured_subagent"), dict) else {}
+    parent_cognitive_route = evt.get("parent_cognitive_route") if isinstance(evt.get("parent_cognitive_route"), dict) else {}
     task_constraint = evt.get("task_constraint") if isinstance(evt.get("task_constraint"), dict) else None
     required_capabilities = [
         str(item or "").strip().lower()
@@ -3379,6 +3496,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "task_group_id": task_group_id,
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
+        "configured_subagent": configured_subagent,
+        "parent_cognitive_route": parent_cognitive_route,
     }
     if delegation_role == "subagent" and (not str(evt.get("objective") or "").strip() or not expected_output):
         detail = "Subagent rejected: schedule_subagent requires objective and expected_output."
@@ -3609,6 +3728,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": subagent_envelope,
+            "configured_subagent": configured_subagent,
+            "parent_cognitive_route": parent_cognitive_route,
             "parent_id": parent_id,
         })
         admitted = ctx.enqueue_task(task)
@@ -3930,7 +4051,10 @@ def _handle_send_photo(evt: Dict[str, Any], ctx: Any) -> None:
         if not chat_id or not image_b64:
             return
         photo_bytes = b64mod.b64decode(image_b64)
-        ok, err = ctx.bridge.send_photo(chat_id, photo_bytes, caption=caption, mime=mime)
+        ok, err = ctx.bridge.send_photo(
+            chat_id, photo_bytes, caption=caption, mime=mime,
+            task_id=str(evt.get("task_id") or ""),
+        )
         if not ok:
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -3969,7 +4093,10 @@ def _handle_send_video(evt: Dict[str, Any], ctx: Any) -> None:
         if not video_b64:
             return
         video_bytes = b64mod.b64decode(video_b64)
-        ok, err = ctx.bridge.send_video(chat_id, video_bytes, caption=caption, mime=mime)
+        ok, err = ctx.bridge.send_video(
+            chat_id, video_bytes, caption=caption, mime=mime,
+            task_id=str(evt.get("task_id") or ""),
+        )
         if not ok:
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -4080,9 +4207,8 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.bridge.push_log(payload)
     except Exception:
         log.debug("Failed to forward live log event", exc_info=True)
-    # An execution-plan proposal is persisted for the same reason a checkpoint is:
-    # it is a QUESTION still awaiting an answer, so a page reload that lost it
-    # would leave the task parked on a card the owner can no longer see.
+    # A proposal persists for the same reason a checkpoint does: it is a QUESTION
+    # awaiting an answer, and a reload that lost it parks the task on a card nobody sees.
     if data.get("type") in ("task_checkpoint", "execution_plan_proposal"):
         try:
             ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)

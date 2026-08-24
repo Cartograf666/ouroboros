@@ -1,27 +1,22 @@
 """The owner-approved execution allocation for ONE task tree.
 
 A big task is not one piece of work on one substrate: the owner may want the
-frontend built on a subscription harness, the tests run on a local model and the
-research done on a cheap metered one. That decision is the OWNER'S, and this
-module is the durable record of it — one file per root task, written once the
-owner approves (or edits) the allocation the agent proposed.
+frontend built by the strong implementation agent, the tests run by the fast
+scout, and the research done by an independent second opinion. WHICH agents
+exist is the owner's standing configuration (``configured_subagents`` — the
+Available-subagents catalog in Settings). WHICH ONE each piece of a particular
+task gets is the decision this record holds, taken once, in the moment, with the
+cost and time evidence in front of the owner.
 
-WHY THIS IS NOT A FOURTH SUBAGENT AXIS. A parent declares the WORK
-(``write_surface``, ``model_lane``, ``executor``) and never the machinery — the
-route, model and effort are consequences of the OWNER'S settings plus what is
-live (see ``ouroboros/subagents.py``). An approved plan is exactly such an owner
-setting, only scoped to one task tree instead of the whole install: the parent
-names WHICH approved item a child is, and the route it lands on comes from the
-owner, the same way ``OUROBOROS_SUBAGENT_HARNESS`` supplies it today. Nothing
-here lets the model widen its own reach.
+So a row here is deliberately NOT a route: it is a reference to a catalog row by
+``subagent_id``. The route, model, effort and credential pin all come from that
+row and are snapshotted onto the child by the scheduler, exactly as a directly
+chosen ``subagent_id`` would be — this record only says which row applies to
+which piece of work. One vocabulary for "where work can run", not two.
 
 MALFORMED RAISES, item-precise — the same posture and the same reason as
-``reviewer_slot_config``: coercing a typo either spends metered money the owner
-deliberately moved off, or delegates a piece of work they never delegated.
-
-The route vocabulary is NOT redefined here. ``{kind: api_chat | agent_session,
-target_id}`` already exists as the reviewer-slot spelling and is imported from
-its owner, so an install cannot end up with two dialects of the same fact.
+``configured_subagents`` and ``reviewer_slot_config``: coercing a typo would run
+a piece of work on an agent the owner never picked for it.
 """
 
 from __future__ import annotations
@@ -32,19 +27,13 @@ import pathlib
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-from ouroboros.reviewer_slot_config import (
-    ROUTE_KIND_API,
-    ROUTE_KIND_SESSION,
-)
 from ouroboros.task_results import validate_task_id
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
 
 ROUTING_PLAN_FILENAME = "routing_plan.json"
-ROUTING_PLAN_VERSION = 1
-
-_ROUTE_KINDS = (ROUTE_KIND_API, ROUTE_KIND_SESSION)
+ROUTING_PLAN_VERSION = 2
 
 # Where an approved row came from, so a receipt can tell "the owner took my
 # recommendation" from "the owner overruled me" — the difference the routing
@@ -58,63 +47,24 @@ _SOURCES = (SOURCE_RECOMMENDED, SOURCE_EDITED)
 MAX_ITEMS = 32
 _ITEM_ID_MAX_CHARS = 64
 _TITLE_MAX_CHARS = 200
-_TARGET_MAX_CHARS = 200
-
-
-@dataclass(frozen=True)
-class RoutePin:
-    """One approved destination: the reviewer-slot route plus its optional pins.
-
-    ``model`` is meaningful on BOTH kinds and means the same thing on each — the
-    model the owner pinned for this piece of work: the API model id on
-    ``api_chat``, the harness's own model on ``agent_session`` (where it also
-    rides the ``harness=model`` spelling). ``profile_id`` is the manual
-    credential pin and is session-only, exactly as on a reviewer row.
-    """
-
-    kind: str
-    target_id: str
-    model: str = ""
-    profile_id: str = ""
-
-    @property
-    def is_session(self) -> bool:
-        return self.kind == ROUTE_KIND_SESSION
-
-    def route_spec(self) -> str:
-        """The opaque Claudexor route spec (``harness[=model]``), '' for api rows.
-
-        The spelling is Claudexor's own — the same one ``parse_subagent_harness``
-        reads — so a pinned session row reaches dispatch through the existing
-        route parser instead of a second grammar.
-        """
-        if not self.is_session:
-            return ""
-        return f"{self.target_id}={self.model}" if self.model else self.target_id
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "kind": self.kind,
-            "target_id": self.target_id,
-            "model": self.model,
-            "profile_id": self.profile_id,
-        }
+# The catalog's own id grammar (`configured_subagents._ID_RE`), bounded the same.
+_SUBAGENT_ID_MAX_CHARS = 64
 
 
 @dataclass(frozen=True)
 class RoutingPlanItem:
-    """One approved piece of work and where the owner said it runs."""
+    """One approved piece of work and which configured subagent runs it."""
 
     item_id: str
     title: str
-    route: RoutePin
+    subagent_id: str
     source: str = SOURCE_RECOMMENDED
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "item_id": self.item_id,
             "title": self.title,
-            "route": self.route.as_dict(),
+            "subagent_id": self.subagent_id,
             "source": self.source,
         }
 
@@ -132,9 +82,9 @@ class RoutingPlan:
         """The approved item by id, or None — an unknown id is never an error.
 
         A child naming an id this plan does not carry is a STALE or mistaken
-        reference, not a malformed plan: it falls back to the install-wide
-        policy and the fallback is disclosed on the child's capability delta.
-        Raising here would kill a task tree over a typo in one child.
+        reference, not a malformed plan: it falls back to the ordinary
+        subagent selection and the fallback is disclosed. Raising here would
+        kill a task tree over a typo in one child.
         """
         wanted = str(item_id or "").strip()
         if not wanted:
@@ -176,44 +126,6 @@ def _bounded(value: Any, limit: int, field: str, where: str) -> str:
     return text
 
 
-def parse_route_pin(raw: Any, where: str) -> RoutePin:
-    """Strict parse of ONE ``{kind, target_id, model?, profile_id?}``."""
-    if not isinstance(raw, dict):
-        raise ValueError(f"routing plan: {where} route must be an object "
-                         "{kind, target_id}")
-    kind = str(raw.get("kind") or "").strip().lower()
-    if kind not in _ROUTE_KINDS:
-        raise ValueError(
-            f"routing plan: {where} names an unknown route kind {kind!r}; "
-            f"valid: {', '.join(_ROUTE_KINDS)}"
-        )
-    target = _bounded(raw.get("target_id"), _TARGET_MAX_CHARS, "target_id", where)
-    if not target:
-        raise ValueError(f"routing plan: {where} route.target_id is empty")
-    if kind == ROUTE_KIND_SESSION and "::" in target:
-        # The harness IS the provider on a delegated row, so the `provider::model`
-        # spelling has no meaning there — the same refusal a reviewer row gives.
-        raise ValueError(
-            f"routing plan: {where} session target {target!r} uses '::' — a "
-            "delegated row is spelled harness[=model]"
-        )
-    if kind == ROUTE_KIND_SESSION and "=" in target:
-        # The model has its own field. Accepting it inside `target_id` too would
-        # give one fact two carriers that can disagree.
-        raise ValueError(
-            f"routing plan: {where} session target {target!r} carries '=' — put "
-            "the harness model in the route's own `model` field"
-        )
-    model = _bounded(raw.get("model"), _TARGET_MAX_CHARS, "model", where)
-    profile = _bounded(raw.get("profile_id"), _TARGET_MAX_CHARS, "profile_id", where)
-    if profile and kind != ROUTE_KIND_SESSION:
-        raise ValueError(
-            f"routing plan: {where} pins a credential profile on an {kind} route; "
-            "profiles exist only on delegated (agent_session) routes"
-        )
-    return RoutePin(kind=kind, target_id=target, model=model, profile_id=profile)
-
-
 def _parse_item(raw: Any, where: str, seen_ids: set) -> RoutingPlanItem:
     if not isinstance(raw, dict):
         raise ValueError(f"routing plan: {where} is not an object")
@@ -227,9 +139,15 @@ def _parse_item(raw: Any, where: str, seen_ids: set) -> RoutingPlanItem:
     if item_id in seen_ids:
         raise ValueError(
             f"routing plan: item_id {item_id!r} appears twice; a child naming it "
-            "could not tell which destination the owner meant"
+            "could not tell which agent the owner meant"
         )
     seen_ids.add(item_id)
+    subagent_id = _bounded(raw.get("subagent_id"), _SUBAGENT_ID_MAX_CHARS, "subagent_id", where)
+    if not subagent_id:
+        raise ValueError(
+            f"routing plan: {where} needs a subagent_id from the Available-subagents "
+            "catalog — this record references a configured row, it does not define a route"
+        )
     source = str(raw.get("source") or SOURCE_RECOMMENDED).strip().lower()
     if source not in _SOURCES:
         raise ValueError(
@@ -239,7 +157,7 @@ def _parse_item(raw: Any, where: str, seen_ids: set) -> RoutingPlanItem:
     return RoutingPlanItem(
         item_id=item_id,
         title=_bounded(raw.get("title"), _TITLE_MAX_CHARS, "title", where),
-        route=parse_route_pin(raw.get("route"), where),
+        subagent_id=subagent_id,
         source=source,
     )
 
@@ -255,8 +173,9 @@ def parse_routing_plan(payload: Any, *, root_task_id: str = "") -> RoutingPlan:
         raise ValueError("routing plan must be a JSON object")
     version = payload.get("version")
     if int(version or 0) != ROUTING_PLAN_VERSION:
-        # A future version is refused rather than read optimistically: an
-        # unknown shape that happens to parse would route real money by guess.
+        # A version this build does not read is refused rather than read
+        # optimistically: v1 rows carried their own route, and reading one as a
+        # catalog reference would dispatch work to whatever id that text matched.
         raise ValueError(
             f"routing plan version {version!r} is not supported "
             f"(this build reads version {ROUTING_PLAN_VERSION})"
@@ -304,9 +223,9 @@ def load_routing_plan(
     """The approved plan for a tree, or None when there is none.
 
     ABSENCE is None; MALFORMED raises. Those are different facts and the caller
-    treats them differently: no plan means "use the install-wide policy", while
-    an unreadable one means the owner's decision cannot be honoured and no money
-    may be spent guessing at it.
+    treats them differently: no plan means "select the subagent the ordinary
+    way", while an unreadable one means the owner's decision cannot be honoured
+    and no work may be dispatched guessing at it.
     """
     try:
         path = routing_plan_path(str(root_id or ""), data_root=data_root)
@@ -321,16 +240,16 @@ def load_routing_plan(
     return parse_routing_plan(raw, root_task_id=str(root_id or ""))
 
 
-def plan_pin_for_item(
+def planned_subagent_id(
     root_id: Any, item_id: Any, *, data_root: pathlib.Path | None = None,
-) -> Optional[RoutePin]:
-    """The approved destination for one item, or None when nothing applies.
+) -> str:
+    """The configured subagent the owner approved for one item ('' when none).
 
-    The ONE reader the schedule path uses, so "which route did the owner approve
+    The ONE reader the schedule path uses, so "which agent did the owner pick
     for this child" has a single answer no caller re-derives.
     """
     plan = load_routing_plan(root_id, data_root=data_root)
     if plan is None:
-        return None
+        return ""
     entry = plan.item(item_id)
-    return entry.route if entry is not None else None
+    return entry.subagent_id if entry is not None else ""

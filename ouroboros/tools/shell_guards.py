@@ -1027,6 +1027,149 @@ def writer_target_tokens(argv: List[str]) -> List[str]:
     return list(dict.fromkeys(target for target in targets if str(target or "").strip()))
 
 
+_DIRECTORY_DESTINATION_COMMANDS = frozenset({"cp", "ln", "mv"})
+_DIRECTORY_DESTINATION_OPTIONS_WITH_ARGS = frozenset({
+    "-S",
+    "-t",
+    "--suffix",
+    "--target-directory",
+})
+_DIRECTORY_DESTINATION_LONG_FLAGS = frozenset({
+    "--attributes-only",
+    "--backup",
+    "--context",
+    "--dereference",
+    "--force",
+    "--interactive",
+    "--no-clobber",
+    "--no-dereference",
+    "--no-target-directory",
+    "--parents",
+    "--preserve",
+    "--recursive",
+    "--reflink",
+    "--relative",
+    "--sparse",
+    "--symbolic",
+    "--symbolic-link",
+    "--target-directory",
+    "--verbose",
+})
+
+
+def directory_destination_pairs(argv: List[str]) -> List[tuple[str, str, str]]:
+    """Return ``(command, destination-directory, source)`` for simple dir copies.
+
+    ``writer_target_tokens`` intentionally sees only the destination operand.  For
+    a command such as ``cp source Deliverables/``, however, the file created is
+    ``Deliverables/source``.  This narrow companion covers the ordinary
+    ``cp``/``mv``/``ln`` directory form without pretending to parse arbitrary
+    shell or archive syntax.  Unknown long options are left to the existing
+    best-effort parser rather than guessed as operands.
+    """
+    if not argv:
+        return []
+    command = pathlib.PurePath(str(argv[0])).name.lower().removesuffix(".exe")
+    if command not in _DIRECTORY_DESTINATION_COMMANDS:
+        return []
+    operands: list[str] = []
+    target_directory = ""
+    i = 1
+    while i < len(argv):
+        token = str(argv[i] or "")
+        if not token:
+            i += 1
+            continue
+        if token == "--":
+            operands.extend(str(item) for item in argv[i + 1:] if str(item or ""))
+            break
+        if token.startswith("-") and token != "-":
+            # GNU cp/mv/ln accept attached short option arguments (``-tDIR``
+            # and ``-Ssuffix``). Keep the target parser active for those
+            # forms instead of failing open to the generic root check.
+            if not token.startswith("--"):
+                short = token[1:]
+                positions = [(short.find(flag), flag) for flag in ("t", "S") if flag in short]
+                if positions:
+                    position, flag = min(positions)
+                    attached = short[position + 1:]
+                    if flag == "t":
+                        if attached:
+                            target_directory = attached
+                            i += 1
+                        elif i + 1 < len(argv):
+                            target_directory = str(argv[i + 1] or "")
+                            i += 2
+                        else:
+                            return []
+                    elif attached:
+                        i += 1
+                    elif i + 1 < len(argv):
+                        i += 2
+                    else:
+                        return []
+                    continue
+            option = token.split("=", 1)[0]
+            if option in _DIRECTORY_DESTINATION_OPTIONS_WITH_ARGS:
+                if "=" in token:
+                    if option in {"-t", "--target-directory"}:
+                        target_directory = token.split("=", 1)[1]
+                    i += 1
+                    continue
+                if i + 1 >= len(argv):
+                    return []
+                if option in {"-t", "--target-directory"}:
+                    target_directory = str(argv[i + 1] or "")
+                i += 2
+                continue
+            if token.startswith("--"):
+                if option not in _DIRECTORY_DESTINATION_LONG_FLAGS:
+                    return []
+                i += 1
+                continue
+            # Short clusters are flags for these commands.  ``-t`` and ``-S``
+            # were handled above because they consume a following operand.
+            i += 1
+            continue
+        operands.append(token)
+        i += 1
+    if target_directory:
+        sources = operands
+        destination = target_directory
+    else:
+        if len(operands) < 2:
+            return []
+        sources = operands[:-1]
+        destination = operands[-1]
+    if not destination or not sources:
+        return []
+    result: list[tuple[str, str, str]] = []
+    for source in sources:
+        source = str(source or "")
+        if source:
+            result.append((command, destination, source))
+    return result
+
+
+def directory_destination_child_name(
+    command: str,
+    argv: List[str],
+    source: str,
+) -> str:
+    """Return the child path a directory destination receives from ``source``."""
+    source_text = str(source or "").replace("\\", "/").rstrip("/")
+    if command == "cp" and "--parents" in {str(item) for item in argv[1:]}:
+        parts = [
+            part
+            for part in pathlib.PurePosixPath(source_text).parts
+            if part not in {"", ".", "/"}
+        ]
+        if not parts or ".." in parts:
+            return ""
+        return "/".join(parts)
+    return pathlib.PurePath(source_text).name
+
+
 def _writer_target_tokens_single(argv: List[str]) -> List[str]:
     if not argv:
         return []

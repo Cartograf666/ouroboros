@@ -12,7 +12,7 @@ import hashlib
 import logging
 import pathlib
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from ouroboros.contracts.skill_manifest import SkillManifest, SkillManifestError, canonical_skill_name, parse_skill_manifest_text
 from ouroboros.contracts.plugin_api import FORBIDDEN_SKILL_SETTINGS
@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 _MANIFEST_NAMES = ("SKILL.md", "skill.json")
 # Only metadata/cache names are skipped. Non-metadata dotfiles remain hashed
 # and reviewed because a skill subprocess can import/source/read them.
-_SKILL_DIR_CACHE_NAMES = frozenset({"__pycache__", "node_modules", ".git", ".hg", ".svn", ".idea", ".vscode", ".tox", ".ouroboros_env", ".DS_Store"})
+_SKILL_DIR_CACHE_NAMES = frozenset({"__pycache__", "node_modules", ".git", ".hg", ".svn", ".idea", ".vscode", ".tox", ".pytest_cache", ".ouroboros_env", ".DS_Store"})
 # Launcher/lifecycle control files are NOT runtime payload: they mark seed
 # provenance and must not invalidate (or be covered by) the review hash —
 # otherwise writing .seed-origin after hashing flips the verdict stale.
@@ -157,7 +157,7 @@ class LoadedSkill:
 
 @dataclass(frozen=True)
 class _SkillLocationCandidate:
-    """Manifest-bearing package location without payload or state reads."""
+    """Package location without payload or state reads."""
 
     name: str
     location: str
@@ -429,6 +429,16 @@ class SkillPayloadUnreadable(RuntimeError):
         self.err = err
 
 
+def reduce_skill_content_hash(file_digests: Iterable[tuple[str, bytes]]) -> str:
+    """Reduce canonically ordered relative paths and file digests."""
+    digest = hashlib.sha256()
+    for rel, file_digest in file_digests:
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_digest)
+    return digest.hexdigest()
+
+
 def compute_content_hash(
     skill_dir: pathlib.Path,
     *,
@@ -443,8 +453,8 @@ def compute_content_hash(
     ``include_control_files=True`` reproduces the legacy pre-v6.31 hash for
     one-shot state migration only.
     """
-    digest = hashlib.sha256()
     skill_dir = skill_dir.resolve()
+    file_digests: List[tuple[str, bytes]] = []
     for file_path in _iter_payload_files(
         skill_dir,
         manifest_entry=manifest_entry,
@@ -464,10 +474,8 @@ def compute_content_hash(
         except OSError as exc:
             log.warning("Failed to read skill payload file %s", file_path, exc_info=True)
             raise SkillPayloadUnreadable(rel, exc) from exc
-        digest.update(rel.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(file_digest.digest())
-    return digest.hexdigest()
+        file_digests.append((rel, file_digest.digest()))
+    return reduce_skill_content_hash(file_digests)
 
 
 # State persistence
@@ -625,6 +633,7 @@ def requested_core_setting_keys(env_keys: List[str]) -> List[str]:
 
 _GRANTABLE_SKILL_PERMISSIONS = frozenset({
     "inject_chat",
+    "presence",
     "subscribe_event:chat.outbound",
     "subscribe_event:chat.typing",
     "subscribe_event:chat.photo",
@@ -641,6 +650,8 @@ def requested_skill_permissions(
     permission_set = {str(item or "").strip() for item in (permissions or [])}
     if "inject_chat" in permission_set:
         requested.append("inject_chat")
+    if "presence" in permission_set:
+        requested.append("presence")
     if "subscribe_event" in permission_set:
         for raw_topic in subscribe_events or []:
             topic = str(raw_topic or "").strip()
@@ -954,8 +965,12 @@ def _is_orphan_marker_name(name: str) -> bool:
 
 def _walk_skill_packages(
     root: pathlib.Path,
+    *,
+    selected_manifestless_name: str = "",
+    include_manifestless_root: bool = False,
+    excluded_manifestless_children: frozenset[str] = frozenset(),
 ) -> List[pathlib.Path]:
-    """Yield skill packages at root or one level deep, skipping install orphans."""
+    """Yield ordinary packages plus one exact selected manifestless target."""
     out: List[pathlib.Path] = []
     if not root.is_dir():
         return out
@@ -963,18 +978,46 @@ def _walk_skill_packages(
         # Back-compat: OUROBOROS_SKILLS_REPO_PATH may point at one skill.
         out.append(root)
         return out
+    root_is_selected_manifestless = (
+        include_manifestless_root
+        and selected_manifestless_name
+        and not _is_orphan_marker_name(root.name)
+        and _sanitize_skill_name(root.name) == selected_manifestless_name
+    )
+    found_manifest_package = False
     for child in _safe_listdir(root):
         if _is_orphan_marker_name(child.name):
             continue
         if _looks_like_skill_dir(child):
             out.append(child)
+            found_manifest_package = True
             continue
+        child_has_manifest_package = False
         # One level deeper for grouping containers such as native/clawhub.
         for grandchild in _safe_listdir(child):
             if _is_orphan_marker_name(grandchild.name):
                 continue
             if _looks_like_skill_dir(grandchild):
                 out.append(grandchild)
+                child_has_manifest_package = True
+                found_manifest_package = True
+            elif (
+                selected_manifestless_name
+                and _sanitize_skill_name(grandchild.name)
+                == selected_manifestless_name
+            ):
+                out.append(grandchild)
+        if (
+            selected_manifestless_name
+            and not child_has_manifest_package
+            and child.name not in excluded_manifestless_children
+            and _sanitize_skill_name(child.name) == selected_manifestless_name
+        ):
+            out.append(child)
+    if root_is_selected_manifestless and not found_manifest_package:
+        # Preserve the direct-checkout interpretation only for a leaf package;
+        # a checkout root containing real child packages remains a container.
+        return [root]
     return out
 
 
@@ -1012,8 +1055,12 @@ def _classify_skill_location(
 def _skill_location_inventory(
     drive_root: pathlib.Path,
     repo_path: str | None = None,
+    *,
+    selected_manifestless_name: str = "",
 ) -> tuple[_SkillLocationCandidate, ...]:
     """Return deduplicated manifest locations without payload/state reads."""
+    from ouroboros.config import SKILL_SOURCE_SUBDIRS
+
     if repo_path is None:
         from ouroboros.config import get_skills_repo_path
 
@@ -1030,16 +1077,26 @@ def _skill_location_inventory(
         if candidate is not None and candidate.is_dir():
             user_repo_root = candidate
 
-    roots: List[pathlib.Path] = []
+    roots: List[tuple[pathlib.Path, bool]] = []
     if data_skills_root is not None:
-        roots.append(data_skills_root)
+        roots.append((data_skills_root, False))
     if user_repo_root is not None:
-        roots.append(user_repo_root)
+        roots.append((user_repo_root, True))
 
     inventory: List[_SkillLocationCandidate] = []
     seen_dirs: set[pathlib.Path] = set()
-    for root in roots:
-        for entry in _walk_skill_packages(root):
+    for root, include_manifestless_root in roots:
+        excluded_children = (
+            frozenset(SKILL_SOURCE_SUBDIRS)
+            if not include_manifestless_root
+            else frozenset()
+        )
+        for entry in _walk_skill_packages(
+            root,
+            selected_manifestless_name=selected_manifestless_name,
+            include_manifestless_root=include_manifestless_root,
+            excluded_manifestless_children=excluded_children,
+        ):
             try:
                 resolved = entry.resolve()
             except OSError:
@@ -1175,18 +1232,13 @@ def _classify_skill_source(
     return SKILL_SOURCE_EXTERNAL
 
 
-def discover_skills(
+def _load_skill_location_candidates(
+    candidates: tuple[_SkillLocationCandidate, ...],
+    *,
     drive_root: pathlib.Path,
-    repo_path: str | None = None,
+    include_manifestless: bool = False,
 ) -> List[LoadedSkill]:
-    """Scan data-plane skills plus the optional user checkout."""
-    if repo_path is None:
-        from ouroboros.config import get_skills_repo_path
-        repo_path = get_skills_repo_path()
-    repo_path = str(repo_path or "").strip()
-
-    candidates = _skill_location_inventory(drive_root, repo_path=repo_path)
-
+    """Load one inventory with the ordinary collision/source semantics."""
     skills: List[LoadedSkill] = []
     by_name: Dict[str, List[_SkillLocationCandidate]] = {}
     for candidate in candidates:
@@ -1215,6 +1267,8 @@ def discover_skills(
 
         candidate = group[0]
         loaded = load_skill(candidate.skill_dir, drive_root)
+        if loaded is None and include_manifestless:
+            loaded = _broken_skill(candidate.skill_dir, "manifest missing")
         if loaded is None:
             continue
         loaded.source = _classify_skill_source(
@@ -1224,8 +1278,57 @@ def discover_skills(
         )
         skills.append(loaded)
 
-    skills.sort(key=lambda s: (s.name, str(s.skill_dir)))
+    skills.sort(key=lambda skill: (skill.name, str(skill.skill_dir)))
     return skills
+
+
+def discover_skills(
+    drive_root: pathlib.Path,
+    repo_path: str | None = None,
+) -> List[LoadedSkill]:
+    """Scan data-plane skills plus the optional user checkout."""
+    if repo_path is None:
+        from ouroboros.config import get_skills_repo_path
+        repo_path = get_skills_repo_path()
+    repo_path = str(repo_path or "").strip()
+
+    candidates = _skill_location_inventory(drive_root, repo_path=repo_path)
+
+    return _load_skill_location_candidates(candidates, drive_root=drive_root)
+
+
+def discover_selected_skill_candidates(
+    drive_root: pathlib.Path,
+    name: str,
+    *,
+    repo_path: str | None = None,
+) -> List[LoadedSkill]:
+    """Resolve one selected identity, including a just-deleted manifest.
+
+    The manifestless opt-in is intentionally unavailable to ordinary passive
+    discovery. It exists only so a card opened before deletion can still start
+    an agent repair task and so hidden physical collisions remain ambiguous.
+    """
+    if repo_path is None:
+        from ouroboros.config import get_skills_repo_path
+
+        repo_path = get_skills_repo_path()
+    configured_repo = str(repo_path or "").strip()
+    canonical_name = _sanitize_skill_name(name)
+    candidates = tuple(
+        candidate
+        for candidate in _skill_location_inventory(
+            drive_root,
+            repo_path=configured_repo,
+            selected_manifestless_name=canonical_name,
+        )
+        if candidate.name == canonical_name
+    )
+    return _load_skill_location_candidates(
+        candidates,
+        drive_root=drive_root,
+        include_manifestless=True,
+    )
 
 
 def find_skill(
@@ -1387,7 +1490,8 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
 __all__ = [
     "AutoGrantOutcome", "LoadedSkill", "HASH_EXEMPT_CONTROL_FILENAMES",
     "SkillReviewState", "auto_grant_if_enabled",
-    "VALID_REVIEW_STATUSES", "compute_content_hash", "discover_skills", "find_skill",
+    "VALID_REVIEW_STATUSES", "compute_content_hash", "reduce_skill_content_hash", "discover_skills",
+    "discover_selected_skill_candidates", "find_skill",
     "enabled_skill_conflicts", "skill_conflict_status",
     "grant_status_for_skill", "is_self_authored_skill_dir", "list_available_for_execution",
     "load_enabled", "load_review_state", "load_skill_grants", "load_skill",

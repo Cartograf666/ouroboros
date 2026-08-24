@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 log = logging.getLogger(__name__)
@@ -36,6 +36,8 @@ from ouroboros import task_activity
 from ouroboros.config import EFFORT_SCALE, resolve_effort
 from ouroboros.agent_startup_checks import (
     inject_crash_report,
+    persist_early_origin_stub as _persist_early_origin_stub_impl,
+    validate_task_authority_sources,
     verify_restart,
     verify_system_state,
 )
@@ -46,142 +48,29 @@ from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.outcomes import infra_failed_axes
+from ouroboros import subagent_bootstrap, subagent_runtime
 from ouroboros.subagents import (
     CapabilityDelta,
     SubagentExecutorResolution,
-    SubagentLaneResolution,
     SUBAGENT_RESOLUTION_FIELDS,
     SubagentDispatch,
     capability_delta_disclosures,
     envelope_from_task,
     resolve_subagent_dispatch,
 )
+from ouroboros.subagent_messages import subagent_message_meta
 
 
 _worker_boot_logged = False
 _worker_boot_lock = threading.Lock()
 
-
-def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
-                           lane: Optional["SubagentLaneResolution"] = None) -> str:
-    """The child's VISIBLE marker for a substrate decision it did not make ('' = silent).
-
-    The rule table's `auto` rows are only honest if the child can see which way they
-    went: a nanny must know to delegate, and a child that fell back to metered tokens
-    must know its route was unavailable rather than discovering it by spending.
-
-    ``lane`` is the same dispatch's lane resolution: a nanny that landed on the
-    LIGHT lane by policy is told so, with the sanctioned escalation
-    (``switch_model`` for real acceptance judgment) named beside it — a policy the
-    child cannot see is a policy it will fight by accident.
-    """
-    if decision is None or decision.blocked:
-        return ""
-    if decision.executor == "harness":
-        route = decision.route.route_id if decision.route else ""
-        note = (
-            f"EXECUTOR: your parent scheduled you on the delegated substrate ({route}). "
-            "You are a NANNY. Decide your delegation plan FIRST — right after reading "
-            "your objective and constraints, before any substantive work. Cost classes: "
-            "a subscription-lane run has known-zero marginal cost when the route reports "
-            "its settled spend as $0 (an estimated or undisclosed spend is estimated/unknown, "
-            "not zero); every token YOU think on is metered API money. "
-            "While the lane is healthy, delegate everything you can — even small tasks — "
-            "with delegate_start / delegate_wait, and verify what comes back rather than "
-            "believing it. After a delegated run SUCCEEDS, your job is to VERIFY and "
-            "INTEGRATE its output — never to rebuild the same work yourself on metered "
-            "tokens. Follow-up work (fixes, the next increment, a retry with a corrected "
-            "prompt) is delegated too, with a new delegate_start; your own metered rounds "
-            "are for judgment — acceptance, integration, honest settlement — not for "
-            "co-building around a $0 run. If your run asks a question (delegate_wait "
-            "returns waiting_on_user), answer it from the task context with "
-            "delegate_answer; a question above your authority — money, scope, external "
-            "actions — goes to your human via progress while you keep waiting (a timeout_at "
-            "question benign-declines at the engine timeout; timeout_at=null waits until answered)."
-        )
-        if lane is not None and lane.provenance == "policy" and lane.effective_lane == "light":
-            note += (
-                " You run on the LIGHT model lane by dispatch policy: custody chores "
-                "(starting runs, waiting, reading results, relaying) belong on this "
-                "cheap lane. For a genuine acceptance or integration judgment you may "
-                "raise your own power with switch_model and drop back after — that is "
-                "the sanctioned escalation, not a workaround."
-            )
-        if decision.reset_at:
-            note += (
-                f" The route's plan window is currently spent and resets at "
-                f"{decision.reset_at}. Decide explicitly: wait for the reset, deliver "
-                "partial work, or say you fell back — do not drift into spending."
-            )
-        return note
-    if decision.reason in {"requested_native", "harness_not_configured"}:
-        return ""  # the ordinary case has nothing to announce
-    if decision.reset_at:
-        # D28's fallback, stated as the CAPABILITY DELTA it is: the parent asked for the
-        # already-paid substrate to be used when available, every profile of it is spent,
-        # and the work is proceeding on metered money instead. Destination 2 of 3 (the
-        # child's own prompt); the durable event and the parent's envelope carry the same
-        # two facts. The reset instant is named so the child can weigh waiting against
-        # spending instead of guessing.
-        return (
-            "EXECUTOR CAPABILITY DELTA: every plan window of the configured delegated "
-            f"substrate is spent (resets at {decision.reset_at}), so you FELL BACK to "
-            "METERED API tokens. Your parent asked for 'auto', which permits this "
-            "fallback rather than a wait — but it is real money that the subscription "
-            "would have covered: keep the work proportionate, and say in your result "
-            "that you ran below the substrate you were scheduled for and why."
-        )
-    return (
-        f"EXECUTOR: the configured delegated substrate is unavailable "
-        f"({decision.reason}), so you are running on METERED API tokens. Your parent "
-        "asked for 'auto', which permits this — but say so in your result."
-    )
-
-
-def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str, Dict[str, Any]]:
-    """The terminal ``(text, usage)`` of a child that was pinned and could not run.
-
-    Deliberately NOT a fallback: the task ends unrun and typed, having spent nothing.
-    """
-    if decision.reason in ("delegate_tools_invisible", "delegate_visibility_unverified"):
-        # Q1A preflight (2026-08-10 amendments): the route is healthy but the
-        # child's MATERIALIZED toolset does not carry the delegate verbs — or
-        # the toolset introspection itself failed, so visibility is UNKNOWN,
-        # not disproven (distinct reason: the terminal states exactly what is
-        # known). Either way the pin cannot be honored, and the fix is tool
-        # policy/contract, not waiting for the route to recover.
-        detail = (
-            "the delegate tools (delegate_start/delegate_wait/delegate_cancel) "
-            "are not visible in its materialized toolset"
-            if decision.reason == "delegate_tools_invisible"
-            else "the toolset introspection failed, so the delegate tools' "
-            "(delegate_start/delegate_wait/delegate_cancel) visibility could "
-            "not be verified"
-        )
-        text = (
-            "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated "
-            f"substrate (executor='harness'), but {detail}, so the pin cannot be "
-            "honored. The task was NOT run on metered API tokens. Fix the tool "
-            "policy / task contract that hides the delegate verbs, or schedule "
-            "again with executor='auto' to accept metered spend."
-        )
-        # Literal codes (not `decision.reason`) so the provenance drift guard
-        # keeps seeing every code the runtime can emit.
-        if decision.reason == "delegate_visibility_unverified":
-            return text, {"execution_status": "infra_failed", "reason_code": "delegate_visibility_unverified"}
-        return text, {"execution_status": "infra_failed", "reason_code": "delegate_tools_invisible"}
-    text = (
-        "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated substrate "
-        f"(executor='harness') and the route cannot run: {decision.reason}."
-        + (f" It resets at {decision.reset_at}." if decision.reset_at else "")
-        + " The task was NOT run on metered API tokens, because that spend is exactly "
-        "what the pin exists to prevent. Reschedule once the route recovers, or "
-        "schedule it again with executor='auto' to accept metered spend."
-    )
-    return text, {
-        "execution_status": "infra_failed",
-        "reason_code": "subagent_executor_unavailable",
-    }
+# Re-exports under the historical names (B1/F7): the pair moved WHOLE to
+# `subagent_dispatch_notes` at this module's size ceiling; the byte-pinned
+# transport suite (and every other caller) keeps importing them from here.
+from ouroboros.subagent_dispatch_notes import (  # noqa: E402
+    dispatch_executor_note,
+    executor_blocked_outcome,
+)
 
 
 def _record_executor_resolution(
@@ -236,7 +125,7 @@ def _record_executor_resolution(
                 log.debug("Failed to append subscription-window beacon", exc_info=True)
 
 
-def _blocked_executor_terminal(cap_info: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+def _blocked_executor_terminal(cap_info: Dict[str, Any], task: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """p34's typed terminal for a blocked executor pin, rebuilt from the facts
     cap_info carried across the (ctx, messages, cap_info) seam. The placeholder
     method p2 kept for exactly this synthesis is deleted; this is the one body."""
@@ -245,51 +134,31 @@ def _blocked_executor_terminal(cap_info: Dict[str, Any]) -> Tuple[str, Dict[str,
         executor="blocked",
         reason=str(cap_info.get("executor_blocked_reason") or ""),
         reset_at=str(cap_info.get("executor_blocked_reset_at") or ""),
-    ))
+    ), availability=(task or {}).get("subagent_availability")
+        if isinstance((task or {}).get("subagent_availability"), dict) else {})
     return text, usage, {"reasoning_notes": ["subagent_executor_unavailable"], "tool_calls": []}
 
 
 def _persist_early_origin_stub(drive_root: Any, task: Dict[str, Any]) -> None:
-    """Durably persist the ingress-captured origin BEFORE the convertible card
-    exists (v6.73.0). Merge-write only; the full RUNNING write follows and
-    overlays it. Ephemeral decision turns write no durable record by design
-    (they are never convertible), and tasks without an origin write nothing.
+    _persist_early_origin_stub_impl(drive_root, task, write_result=write_task_result)
 
-    A persistence failure is LOUD (warning + typed events.jsonl anomaly) but
-    deliberately non-fatal: the owner's task is worth more than its start
-    message, and the same storage fault would fail the full RUNNING write
-    moments later anyway — the residual convert-in-window exposure requires a
-    disk fault racing an instant owner click."""
-    if bool(task.get("_ephemeral_turn")):
-        return
-    ref = task.get("origin_message_ref")
-    if not (isinstance(ref, dict) and ref):
-        return
-    for _attempt in range(2):
-        try:
-            write_task_result(
-                drive_root,
-                str(task.get("id") or ""),
-                STATUS_RUNNING,
-                chat_id=task.get("chat_id"),
-                origin_message_ref=dict(ref),
-                origin_message_text=task.get("origin_message_text"),
-                result="Task is starting.",
-            )
-            return
-        except Exception:
-            if _attempt:
-                log.warning("Early origin stub persistence failed", exc_info=True)
-    try:
-        from ouroboros.utils import append_jsonl
 
-        append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl", {
-            "ts": utc_now_iso(),
-            "type": "origin_stub_persist_failed",
-            "task_id": str(task.get("id") or ""),
-        })
-    except Exception:
-        log.debug("origin_stub_persist_failed event write failed", exc_info=True)
+def _authority_source_terminal(refusal: Dict[str, Any]):
+    text = (
+        "AUTHORITY_SOURCE_UNAVAILABLE: cannot begin substantive work for "
+        f"{refusal.get('human_label') or 'this task'}. {refusal.get('detail') or ''}"
+    ).strip()
+    usage = {
+        "execution_status": "infra_failed", "reason_code": "authority_source_unavailable",
+        "authority_source_unavailable": refusal,
+    }
+    return text, usage, {"reasoning_notes": ["authority_source_unavailable"], "tool_calls": []}
+
+
+def _sync_task_project_scope(task: Dict[str, Any], ctx: Any) -> None:
+    project_id = str(getattr(ctx, "project_id", "") or "").strip()
+    if project_id and not str(task.get("project_id") or "").strip():
+        task["project_id"] = project_id
 
 
 def _budget_exhausted_message() -> str:
@@ -420,10 +289,19 @@ def preflight_delegate_visibility(
         return amended, True
 
     def _append_reason(delta: CapabilityDelta, note: str, **changes: Any) -> CapabilityDelta:
-        reasons = [part for part in (delta.reason, note) if part]
-        return dataclasses.replace(delta, reason="; ".join(reasons), **changes)
+        from ouroboros.subagents import derive_capability_reason
 
-    pinned = str(task.get("requested_executor") or "auto").strip().lower() == "harness"
+        # Seed from the legacy string when the typed list is empty but a reason
+        # exists (a stored pre-lists delta): rebuilding purely from the list
+        # would silently DISCARD that disclosure text (P1).
+        base = delta.reduction_reasons or ((delta.reason,) if delta.reason else ())
+        reasons = (*base, note)
+        return dataclasses.replace(
+            delta, reduction_reasons=reasons,
+            reason=derive_capability_reason(reasons, delta.substrate_disclosures),
+            **changes)
+
+    pinned = isinstance(task.get("configured_subagent"), dict) or str(task.get("requested_executor") or "auto").strip().lower() == "harness"
     reason = "delegate_tools_invisible"
     try:
         available = set(tools.available_tools())
@@ -461,7 +339,7 @@ def preflight_delegate_visibility(
     ))
 
 
-def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool) -> None:
+def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool, delegate_activity_seed: bool = False) -> None:
     """Reset EVERY nanny-economics mark for a fresh dispatch (F4).
 
     DEFENSIVE, not load-bearing: ``_prepare_task_context`` builds a FRESH
@@ -471,7 +349,7 @@ def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool) -> None:
     ctx._nanny_route_dispatched = bool(route_dispatched)
     ctx._nanny_finalization_injected = False
     ctx._nanny_metered_progress = None
-    ctx._nanny_delegate_baseline = None
+    ctx._nanny_delegate_baseline = ({"round": 0, "cost": 0.0} if delegate_activity_seed else None)
     ctx._nanny_reminder_mark = None
 
 
@@ -527,11 +405,25 @@ def capability_delta_prompt_block(dispatch: Optional[SubagentDispatch]) -> str:
         # fact reaches the child through `dispatch_executor_note` beside this
         # block, so rendering "BELOW what your parent asked for:" over an empty
         # list here told the child nothing and read as a broken sentence.
+        # The parenthetical carries the typed DISPATCH axes only (B4): substrate
+        # facts are completion-seam and never fuse into this dispatch sentence
+        # (a fresh resolution carries none anyway).
+        reduction = delta.get("reduction_reasons")
+        reason_text = (
+            "; ".join(reduction) if isinstance(reduction, list) and reduction
+            else (delta.get("reason") or "unspecified")
+        )
+        action = (
+            "Do the work anyway — routed through your delegated run "
+            "(delegate_start / delegate_wait), not your own metered rounds — but say "
+            if delta.get("effective_executor") == "harness"
+            else "Do the work anyway, but say "
+        )
         parts.append(
             "You are running BELOW what your parent asked for: "
             + "; ".join(disclosures)
-            + f" ({delta.get('reason') or 'unspecified'}). Do the work anyway, but say "
-            "so in blockers if the gap actually limited your answer — do not quietly "
+            + f" ({reason_text}). " + action
+            + "so in blockers if the gap actually limited your answer — do not quietly "
             "return a weaker result as if it were full strength."
         )
     if delta.get("legacy_note"):
@@ -765,6 +657,8 @@ class OuroborosAgent:
                 drive_root=task.get("drive_root"),
                 child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
                 budget_drive_root=task.get("budget_drive_root"),
+                workspace_root=task.get("workspace_root"),
+                workspace_mode=task.get("workspace_mode"),
                 task_constraint=task.get("task_constraint"),
                 task_contract=task.get("task_contract"),
                 model_lane=task.get("model_lane"),
@@ -781,7 +675,7 @@ class OuroborosAgent:
                 reasoning_effort=task.get("reasoning_effort"),
                 task_group_id=task.get("task_group_id"),
                 task_group=task.get("task_group"),
-                subagent_envelope=task.get("subagent_envelope"),
+                subagent_envelope=task.get("subagent_envelope"), configured_subagent=task.get("configured_subagent"), parent_cognitive_route=task.get("parent_cognitive_route"), subagent_availability=task.get("subagent_availability"),
                 metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
                 # Ingress-captured owner-message identity (v6.73.0): persisted on the
                 # durable record so a post-hoc "Turn into project" binds the start
@@ -840,8 +734,14 @@ class OuroborosAgent:
             except Exception:
                 log.warning("mutation baseline capture failed for %s", task.get("id"), exc_info=True)
 
-    def _prepare_task_context(self, task: Dict[str, Any]) -> Tuple[ToolContext, List[Dict[str, Any]], Dict[str, Any]]:
+    def _prepare_task_context(
+        self, task: Dict[str, Any], authority_refusal: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[ToolContext, List[Dict[str, Any]], Dict[str, Any]]:
         """Set up ToolContext, build messages, return (ctx, messages, cap_info)."""
+        if authority_refusal is None:
+            authority_refusal = validate_task_authority_sources(self.env, task)
+        if authority_refusal:
+            return None, [], {"authority_source_unavailable": authority_refusal}
         drive_logs = self.env.drive_path("logs")
         task = attach_task_contract(task)
         # THE resolution, before anything durable is written about this run: the
@@ -862,8 +762,6 @@ class OuroborosAgent:
             task_type=str(task.get("type") or ""),
         )
         if str(task.get("delegation_role") or "") == "subagent" and self._event_queue is not None and self._current_chat_id is not None:
-            _tc = task.get("task_constraint")
-            _surface = str((_tc.get("surface") if isinstance(_tc, dict) else "") or "")
             try:
                 self._event_queue.put({
                     "type": "send_message",
@@ -872,19 +770,9 @@ class OuroborosAgent:
                     "format": "markdown",
                     "is_progress": True,
                     "task_id": str(task.get("id") or ""),
-                    "progress_meta": {
-                        "subagent_event": "running",
-                        "subagent_task_id": str(task.get("id") or ""),
-                        "root_task_id": str(task.get("root_task_id") or ""),
-                        "parent_task_id": str(task.get("parent_task_id") or ""),
-                        "delegation_role": "subagent",
-                        "subagent_role": str(task.get("role") or ""),
-                        "write_surface": _surface,
-                        "task_group_id": str(task.get("task_group_id") or ""),
-                        "model_lane": str(task.get("requested_model_lane") or task.get("model_lane") or ""),
-                        "effective_model_lane": str(task.get("effective_model_lane") or ""),
-                        "model": str(task.get("model") or ""),
-                    },
+                    "progress_meta": subagent_message_meta(
+                        task, task_id=str(task.get("id") or ""), event="running",
+                    ),
                     "ts": utc_now_iso(),
                 })
             except Exception:
@@ -917,7 +805,7 @@ class OuroborosAgent:
             "reasoning_effort",
             "task_group_id",
             "task_group",
-            "subagent_envelope",
+            "subagent_envelope", "configured_subagent", "parent_cognitive_route", "subagent_availability",
             "executor_ref",
             "original_task_id",
             "timeout_retry_from",
@@ -927,6 +815,10 @@ class OuroborosAgent:
             # passes the start-message identity to the next binding.
             "origin_message_ref",
             "origin_message_text",
+            # The complete work-order source reader needs the original typed
+            # constraint mapping, not the normalized dataclass repr, to rebuild
+            # the exact canonical serializer bytes during a source-range answer.
+            "task_constraint",
         ):
             if task.get(key) not in (None, ""):
                 task_metadata[key] = task.get(key)
@@ -1012,7 +904,10 @@ class OuroborosAgent:
             ctx.inspect_acceptance_fence = self._inspect_acceptance_fence
             ctx.end_acceptance_fence = self._end_acceptance_fence
         apply_project_model_route(ctx, self.env.drive_root, _resolved_project_id, task)
-        if str(task_metadata.get("delegation_role") or "").lower() == "subagent":
+        if (
+            str(task_metadata.get("delegation_role") or "").lower() == "subagent"
+            or bool(task.get("_presence_turn"))
+        ):
             model_override = str(task_metadata.get("model") or "").strip()
             if model_override:
                 ctx.task_model_override = model_override
@@ -1027,6 +922,8 @@ class OuroborosAgent:
             if chat_model:
                 ctx.task_model_override = chat_model
                 ctx.task_use_local_override = bool(task_metadata.get("chat_use_local_model"))
+        if bool(task.get("_presence_turn")):
+            ctx.inline_max_rounds = int(task_metadata.get("inline_max_rounds") or 10)
         # NOTE: the ephemeral decision turn is INTENTIONALLY kept on the SAME route as the
         # main chat (no light-lane override): a busy-chat ephemeral turn can produce the
         # owner-facing answer inline (WS10), so silently lowering its model would be a P1
@@ -1050,15 +947,16 @@ class OuroborosAgent:
                 ctx.task_model_override = str(task_metadata.get("model") or "").strip()
                 if "use_local_model" in task_metadata:
                     ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
+        startup_wake = subagent_bootstrap.bootstrap_before_context(ctx, task, dispatch)
         self._capture_mutation_baseline(task, task_metadata)
-
         self._emit_typing_start()
-
+        canonical_drive = pathlib.Path(task.get("budget_drive_root") or self.env.budget_drive_root or self.env.drive_root)
+        review_env = self.env if canonical_drive.resolve(strict=False) == self.env.drive_root.resolve(strict=False) else replace(self.env, drive_root=canonical_drive)
         messages, cap_info = build_llm_messages(
             env=self.env,
             memory=self.memory,
             task=task,
-            review_context_builder=lambda: build_review_context(self.env),
+            review_context_builder=lambda: build_review_context(review_env),
             ctx=ctx,
         )
         # The second of the three places a reduction must reach (the durable record
@@ -1078,6 +976,7 @@ class OuroborosAgent:
         )
         if _exec_note:
             messages.append({"role": "user", "content": _exec_note})
+        subagent_bootstrap.append_startup_receipt(ctx, messages, startup_wake)
         # The nanny postcondition's input fact for the loop's finalization seam:
         # THIS task was dispatched onto the delegated substrate. ALL economics
         # marks reset together per dispatch (F4) — defensive, since the
@@ -1086,7 +985,7 @@ class OuroborosAgent:
             dispatch is not None
             and dispatch.executor_resolution is not None
             and dispatch.executor_resolution.executor == "harness"
-        ))
+        ), delegate_activity_seed=bool(startup_wake))
 
         budget_remaining = None
         budget_accounting_status = "available"
@@ -1112,7 +1011,7 @@ class OuroborosAgent:
         # rather than a new return value or module-level helper, so synthesis can
         # adopt p34's `SubagentExecutorResolution`/`executor_blocked_outcome` without
         # a same-named twin to dedup here.
-        if dispatch is not None and dispatch.blocked:
+        if dispatch is not None and dispatch.blocked and not startup_wake:
             _res = dispatch.executor_resolution
             cap_info["executor_blocked_reason"] = str(
                 (_res.reason if _res is not None else "")
@@ -1134,8 +1033,7 @@ class OuroborosAgent:
         """Run one task under the root/subtree monetary attribution scope."""
         # Hot-reload settings so UI changes affect the next task without restart.
         try:
-            from ouroboros.config import load_settings, apply_settings_to_env
-            apply_settings_to_env(load_settings())
+            subagent_runtime.apply_task_start_settings()
         except Exception:
             pass
 
@@ -1191,7 +1089,9 @@ class OuroborosAgent:
             self._accepting_owner_messages = bool(
                 task.get("_is_direct_chat") and not task.get("_ephemeral_turn")
             )
-        _persist_early_origin_stub(self.env.drive_root, task)  # origin durable BEFORE the card exists
+        authority_refusal = validate_task_authority_sources(self.env, task)
+        if not authority_refusal:
+            _persist_early_origin_stub(self.env.drive_root, task)
         self._emit_live_log(
             "task_started",
             task_id=self._current_task_id or "",
@@ -1203,20 +1103,16 @@ class OuroborosAgent:
             # card before tool activity can reveal it.
             ephemeral_decision=bool(task.get("_ephemeral_turn")),
         )
-
         drive_logs = self.env.drive_path("logs")
         heartbeat_stop = self._start_task_heartbeat_loop(str(task.get("id") or ""))
-
         try:
-            ctx, messages, cap_info = self._prepare_task_context(task)
+            ctx, messages, cap_info = self._prepare_task_context(task, authority_refusal)
             budget_remaining = cap_info.get("budget_remaining")
 
             usage: Dict[str, Any] = {}
             llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
-
             task_type_str = str(task.get("type") or "").lower()
             initial_effort = _initial_effort_for(task, task_type_str)
-
             # The owner's first phase-6 UI directive: the LEDE must show that THIS
             # bubble / subagent runs on codex (a chip, not a badge). The fact is
             # recorded onto the live task metadata that `_subagent_progress_meta`
@@ -1224,8 +1120,12 @@ class OuroborosAgent:
             # stamped onto the task, never re-derived per surface.
             self._record_executor_facts(task)
 
-            if str(cap_info.get("executor_blocked_reason") or ""):
-                text, usage, llm_trace = _blocked_executor_terminal(cap_info)
+            authority_refusal = cap_info.get("authority_source_unavailable")
+            if isinstance(authority_refusal, dict) and authority_refusal:
+                task["_skip_post_task_synthesis"] = True
+                text, usage, llm_trace = _authority_source_terminal(authority_refusal)
+            elif str(cap_info.get("executor_blocked_reason") or ""):
+                text, usage, llm_trace = _blocked_executor_terminal(cap_info, task)
             elif task_type_str == "deep_self_review":
                 # Deep self-review bypasses the tool loop.
                 try:
@@ -1350,9 +1250,7 @@ class OuroborosAgent:
             # ctx, but persistence/finalization read the task dict — sync it back so the
             # stored result and project-task reflection see the project (C4.1 gap). Fill
             # only, never overwrite, to preserve the "no re-scope" invariant.
-            _scope_pid = str(getattr(ctx, "project_id", "") or "").strip()
-            if _scope_pid and not str(task.get("project_id") or "").strip():
-                task["project_id"] = _scope_pid
+            _sync_task_project_scope(task, ctx)
 
             emit_task_results(
                 self.env, self.memory, self.llm,
@@ -1495,7 +1393,10 @@ class OuroborosAgent:
             return
         try:
             self._event_queue.put({
-                "type": "typing_start", "chat_id": self._current_chat_id,
+                "type": "typing_start",
+                "chat_id": self._current_chat_id,
+                "task_id": str(self._current_task_id or ""),
+                "phase": "thinking",
                 "ts": utc_now_iso(),
             })
         except Exception:
@@ -1537,27 +1438,8 @@ class OuroborosAgent:
 
     def _subagent_progress_meta(self, event: str) -> Dict[str, Any]:
         metadata = self._current_task_metadata if isinstance(self._current_task_metadata, dict) else {}
-        if str(metadata.get("delegation_role") or "").lower() != "subagent":
-            return {}
         task_id = str(self._current_task_id or metadata.get("subagent_task_id") or metadata.get("task_id") or "")
-        return {
-            "subagent_event": str(event or "progress"),
-            "subagent_task_id": task_id,
-            "root_task_id": str(metadata.get("root_task_id") or ""),
-            "parent_task_id": str(metadata.get("parent_task_id") or ""),
-            "delegation_role": "subagent",
-            "subagent_role": str(metadata.get("role") or ""),
-            "write_surface": str(metadata.get("write_surface") or ""),
-            "task_group_id": str(metadata.get("task_group_id") or ""),
-            "model_lane": str(metadata.get("requested_model_lane") or metadata.get("model_lane") or ""),
-            "effective_model_lane": str(metadata.get("effective_model_lane") or ""),
-            "model": str(metadata.get("model") or ""),
-            # Phase 6 (owner directive #1): WHERE this subagent really runs. Only
-            # a delegated route is a fact worth a chip — the native path is the
-            # ordinary case and prints nothing, so the lane never fills with
-            # "api" noise. Empty stays empty; the renderer draws no chip.
-            "executor_route": str(metadata.get("executor_route") or ""),
-        }
+        return subagent_message_meta(metadata, task_id=task_id, event=event or "progress")
 
     def _start_task_heartbeat_loop(self, task_id: str) -> Optional[threading.Event]:
         if not task_id.strip():

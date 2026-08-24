@@ -1057,7 +1057,17 @@ _REVIEW_SCHEMA = {
         "shared reviewer-slot configuration and scored against the "
         "Skill Review Checklist section in docs/CHECKLISTS.md. Persists the "
         "verdict to data/state/skills/<name>/review.json with a content "
-        "hash so a later edit invalidates the review automatically."
+        "hash so a later edit invalidates the review automatically. "
+        "Max Review Cycles semantics: an identical snapshot never buys a new "
+        "panel — a recorded substantive verdict REPLAYS free, keyed by (review "
+        "group, content hash, panel-contract fingerprint), so only changed "
+        "content, a changed panel contract, or a NEW rebuttal dispatches "
+        "reviewers again. The shared OUROBOROS_REVIEW_MAX_CYCLES ceiling "
+        "bounds PAID panel dispatches per ceiling key (root task for "
+        "task-driven reviews; the current content snapshot for the manual "
+        "lane); on exhaustion the review is refused free with a typed "
+        "review_cycles_exhausted event and the skill stays honestly PENDING — "
+        "never executable without a real verdict."
     ),
     "parameters": {
         "type": "object",
@@ -1071,7 +1081,12 @@ _REVIEW_SCHEMA = {
                 "description": (
                     "Optional rebuttal to prior review findings. Use only when "
                     "you have code-grounded evidence that a previous finding was "
-                    "a false positive or already addressed."
+                    "a false positive or already addressed. The rebuttal is "
+                    "identified by CONTENT: its sha256 buys exactly ONE paid "
+                    "panel wave when new to the current snapshot's streak; "
+                    "repeating an already-adjudicated rebuttal replays the "
+                    "recorded verdict free, and no rebuttal buys past the "
+                    "paid-cycle ceiling."
                 ),
             },
         },

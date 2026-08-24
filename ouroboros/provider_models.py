@@ -80,18 +80,24 @@ PROVIDER_CREDENTIAL_GROUPS: dict[str, tuple[str, ...]] = {
     "local": (),
 }
 
-# Settings keys that hold a ROUTED model identity (prefix -> provider via provider_for_model).
+# Active settings keys that hold a ROUTED model identity (prefix -> provider via
+# provider_for_model). Heavy is a bounded migration/history input, not a live
+# route selector; keeping the split here prevents new consumers (including
+# Provider Test) from accidentally resurrecting it.
 # Superset of the live slots; a key absent from settings still declares whatever
 # ``config.SETTINGS_DEFAULTS`` will hand the runtime, which is why declared_model_settings()
 # fills the defaults in rather than treating "unset" as "unused".
-MODEL_SETTING_KEYS: tuple[str, ...] = (
-    "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT",
+ACTIVE_MODEL_SETTING_KEYS: tuple[str, ...] = (
+    "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS",
     "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_FALLBACK",
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "OUROBOROS_WEBSEARCH_MODEL",
     "OUROBOROS_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODEL",
 )
+LEGACY_MODEL_SETTING_KEYS: tuple[str, ...] = ("OUROBOROS_MODEL_HEAVY",)
+# Compatibility import name. Its meaning is now explicitly the active set.
+MODEL_SETTING_KEYS = ACTIVE_MODEL_SETTING_KEYS
 
 # Settings keys whose value is a Claude Agent SDK / Claude Code model NAME (``opus[1m]``),
 # NOT a routed model identity: they carry no provider prefix, so provider_for_model would
@@ -130,6 +136,31 @@ def provider_has_credentials(provider: str) -> bool:
     return bool(str(os.environ.get(env_key, "") or "").strip())
 
 
+def provider_has_credentials_in_settings(provider: str, settings: dict) -> bool:
+    """Mapping-based twin used by pure config/default compilers (no ambient env)."""
+    def get(key: str) -> str:
+        return str((settings or {}).get(key, "") or "").strip()
+
+    if provider == "local":
+        return bool(get("LOCAL_MODEL_SOURCE"))
+    if provider == "openai-compatible":
+        return bool(
+            get("OPENAI_COMPATIBLE_BASE_URL")
+            or (get("OPENAI_API_KEY") and get("OPENAI_BASE_URL"))
+        )
+    if provider == "gigachat":
+        return bool(
+            get("GIGACHAT_CREDENTIALS")
+            or (get("GIGACHAT_USER") and get("GIGACHAT_PASSWORD"))
+        )
+    env_key = PROVIDER_ENV_KEYS.get(provider, "OPENROUTER_API_KEY")
+    return bool(get(env_key))
+
+
+def model_has_credentials_in_settings(model: str, settings: dict) -> bool:
+    return provider_has_credentials_in_settings(provider_for_model(model), settings)
+
+
 def model_has_credentials(model: str) -> bool:
     """Return True when the model's provider has usable credentials configured."""
     return provider_has_credentials(provider_for_model(model))
@@ -157,14 +188,14 @@ def review_model_uses_local(model: str) -> bool:
 def resolve_credentialed_model(default_model: str) -> str:
     """Return ``default_model`` if its provider is credentialed, else the first
     configured model slot whose provider has credentials (light → fallback →
-    main → heavy). Falls back to ``default_model`` when nothing is credentialed
+    main). Falls back to ``default_model`` when nothing is credentialed
     so callers surface the original provider error rather than a silent swap."""
     if model_has_credentials(default_model):
         return default_model
-    # LIGHT/MAIN/HEAVY are single-model slots; FALLBACKS is a comma chain expanded via the
+    # LIGHT/MAIN are single-model slots; FALLBACKS is a comma chain expanded via the
     # shared SSOT parser (which also honors the legacy singular OUROBOROS_MODEL_FALLBACK)
-    # instead of testing the whole comma-string as one broken model id. Empty Heavy/Light
-    # (default -> Main) simply contribute nothing here. Lazy import: config imports this
+    # instead of testing the whole comma-string as one broken model id. Empty Light
+    # (default -> Main) simply contributes nothing here. Lazy import: config imports this
     # module, so importing config at module load would be circular.
     from ouroboros.config import parse_fallback_chain
     candidates: list[str] = []
@@ -172,7 +203,7 @@ def resolve_credentialed_model(default_model: str) -> str:
     if light:
         candidates.append(light)
     candidates.extend(parse_fallback_chain())
-    for env_name in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY"):
+    for env_name in ("OUROBOROS_MODEL",):
         raw = str(os.environ.get(env_name, "") or "").strip()
         if raw:
             candidates.append(raw)
@@ -261,11 +292,37 @@ def provider_credential_plan(settings: dict) -> dict:
     }
 
 
+# Shipped router profile. Keeping the root-loop role policy beside the direct
+# provider profiles gives onboarding, runtime defaults, and tests one vocabulary
+# instead of repeating model ids across those surfaces.
+OPENROUTER_DEFAULTS = {
+    "main": "google/gemini-3.7-flash",
+    "heavy": "",
+    "light": "openai/gpt-5.6-luna",
+    "vision": "",
+    "consciousness": "",
+    "fallback": "openai/gpt-5.6-luna",
+    "deep_self_review": "openai/gpt-5.6-sol-pro",
+}
+
+OPENROUTER_REVIEW_DEFAULTS = {
+    "triad": (
+        "google/gemini-3.7-flash",
+        "openai/gpt-5.6-terra",
+        "anthropic/claude-opus-5",
+    ),
+    "scope": ("openai/gpt-5.6-terra",),
+    # Claude Agent SDK spelling, not an OpenRouter model id. With no direct
+    # Anthropic key the existing advisory gate records an audited bypass.
+    "advisory": "claude-sonnet-5",
+}
+
+
 OPENAI_DIRECT_DEFAULTS = {
     "main": "openai::gpt-5.6-terra",
-    "heavy": "openai::gpt-5.6-sol",
+    "heavy": "",
     "light": "openai::gpt-5.6-luna",
-    "fallback": "openai::gpt-5.6-luna",
+    "fallback": "openai::gpt-5.6-sol",
     # Deep self-review is a real slot with a SHIPPED default; without a
     # per-provider value a direct-only install keeps an unreachable
     # OpenRouter-form id it has no credential for (v6.82.0). Only providers whose
@@ -314,22 +371,41 @@ MINIMAX_DIRECT_DEFAULTS = {
 }
 
 ANTHROPIC_DIRECT_DEFAULTS = {
-    "main": "anthropic::claude-sonnet-5",
-    "heavy": "anthropic::claude-opus-5",
+    "main": "anthropic::claude-opus-5",
+    "heavy": "",
     "light": "anthropic::claude-sonnet-5",
-    "fallback": "anthropic::claude-opus-4-6",
+    "fallback": "anthropic::claude-sonnet-5",
     # Deep self-review is a real slot with a SHIPPED default; without a
     # per-provider value a direct-only install keeps an unreachable
     # OpenRouter-form id it has no credential for (v6.82.0).
     "deep_self_review": "anthropic::claude-opus-5",
 }
 
-_DIRECT_PROVIDER_DEFAULTS = {
+DIRECT_PROVIDER_DEFAULTS = {
     "openai": OPENAI_DIRECT_DEFAULTS,
     "anthropic": ANTHROPIC_DIRECT_DEFAULTS,
     "cloudru": CLOUDRU_DIRECT_DEFAULTS,
     "gigachat": GIGACHAT_DIRECT_DEFAULTS,
     "minimax": MINIMAX_DIRECT_DEFAULTS,
+}
+
+# Review panels are declared as provider ROLE sequences, then compiled against
+# the owner's current provider-prefixed Main/Light values. This keeps explicit
+# custom models useful while making the shipped single-provider policy obvious:
+# OpenAI and Anthropic run their strongest Main model three independent times.
+# The older MiniMax mixed panel is preserved because that profile was not part of
+# this policy change.
+DIRECT_PROVIDER_REVIEW_ROLES = {
+    "openai": ("main", "main", "main"),
+    "anthropic": ("main", "main", "main"),
+    "cloudru": ("main", "main", "main"),
+    "gigachat": ("main", "main", "main"),
+    "minimax": ("main", "light", "light"),
+}
+
+DIRECT_PROVIDER_SCOPE_DEFAULTS = {
+    provider: defaults["main"]
+    for provider, defaults in DIRECT_PROVIDER_DEFAULTS.items()
 }
 
 _ANTHROPIC_MODEL_ALIASES = {
@@ -379,23 +455,21 @@ def compute_direct_review_models_fallback(
     *,
     review_runs: int = 3,
 ) -> list[str]:
-    """Return direct-provider review fallback preserving commit-triad shape.
-
-    The quorum-safe shape is ``[main, light, light]`` when main/light are
-    distinct provider-prefixed lanes; otherwise it degrades to ``[main] * N``.
-    """
-    if provider not in _DIRECT_PROVIDER_DEFAULTS:
+    """Compile a direct-provider review panel from declarative role names."""
+    if provider not in DIRECT_PROVIDER_DEFAULTS:
         return []
     provider_prefix = f"{provider}::"
     main = migrate_model_value(provider, main_model)
     if not main.startswith(provider_prefix):
         return []
     light = migrate_model_value(provider, light_model) if light_model else ""
-    default_light = migrate_model_value(provider, _DIRECT_PROVIDER_DEFAULTS[provider].get("light", ""))
+    default_light = migrate_model_value(provider, DIRECT_PROVIDER_DEFAULTS[provider].get("light", ""))
     light_slot = light if light.startswith(provider_prefix) else default_light
-    if light_slot and light_slot != main:
-        return [main, light_slot, light_slot]
-    return [main] * int(review_runs or 3)
+    role_models = {"main": main, "light": light_slot or main}
+    roles = DIRECT_PROVIDER_REVIEW_ROLES.get(provider, ("main", "light", "light"))
+    compiled = [role_models.get(role, main) for role in roles]
+    count = max(1, int(review_runs or 3))
+    return [compiled[index % len(compiled)] for index in range(count)]
 
 
 # Conservative static vision map by normalized id/prefix. The OpenRouter

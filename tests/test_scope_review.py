@@ -98,8 +98,14 @@ def test_scope_review_refuses_ambiguous_workspace_root(tmp_path):
 
 
 def test_managed_resolver_enables_binary_metadata_context(tmp_path, monkeypatch):
+    """SUPERSESSION (lane L-review, Δ4): represent_binary now follows the managed
+    REVIEW SUBJECT (predicate + authorized tx artifact), not the raw predicate
+    alone — the same production condition, established one seam deeper. The
+    subject itself must also reach the prompt builder."""
     mod = _get_module("ouroboros.tools.scope_review")
     registry = _get_module("ouroboros.tools.registry")
+    admission = _get_module("ouroboros.tools.review_admission")
+    subject_mod = _get_module("ouroboros.tools.review_subject")
     repo = tmp_path / "repo"
     drive = tmp_path / "data"
     repo.mkdir()
@@ -108,18 +114,21 @@ def test_managed_resolver_enables_binary_metadata_context(tmp_path, monkeypatch)
 
     def fake_build(_repo_dir, _message, **kwargs):
         captured["represent_binary"] = kwargs["context"].represent_binary
+        captured["managed_subject"] = kwargs["context"].managed_subject
         return None, mod._TouchedContextStatus(status="empty")
 
     monkeypatch.setattr(mod, "_build_scope_prompt", fake_build)
+    fake_subject = object()
     monkeypatch.setattr(
-        registry, "_authorized_managed_update_resolver", lambda _ctx: True
+        subject_mod, "managed_review_subject", lambda _ctx, _repo: fake_subject
     )
+    assert admission  # the prepare half resolves the seams patched above
     ctx = registry.ToolContext(repo_dir=repo, drive_root=drive, task_id="resolver")
 
     result = mod.run_scope_review(ctx, "review assisted update", scope_model="test")
 
     assert result.blocked is True
-    assert captured == {"represent_binary": True}
+    assert captured == {"represent_binary": True, "managed_subject": fake_subject}
 
 
 # ---------------------------------------------------------------------------
@@ -1474,9 +1483,13 @@ class TestGitWiring:
         source = inspect.getsource(git._run_reviewed_stage_cycle)
         assert "_run_parallel_review" in source
         # The parallel helper must contain both triad and scope review
+        # (Q25-A two-phase contract: assembly, then dispatch).
         parallel_source = inspect.getsource(git._run_parallel_review)
-        assert "run_scope_review" in parallel_source
-        assert "_run_unified_review" in parallel_source
+        assert "_prepare_unified_review" in parallel_source
+        assert "_dispatch_unified_review" in parallel_source
+        # scope dispatch lives one seam deeper since the Q25-A split
+        from ouroboros.tools import parallel_review as _pr
+        assert "run_scope_review" in inspect.getsource(_pr._run_scope)
         # ThreadPoolExecutor must be used for parallel execution
         assert "ThreadPoolExecutor" in parallel_source
 
@@ -1486,27 +1499,38 @@ class TestGitWiring:
         source = inspect.getsource(git._repo_commit_push)
         assert "_run_reviewed_stage_cycle" in source
         shared_source = inspect.getsource(git._run_reviewed_stage_cycle)
-        assert "_check_advisory_freshness" in shared_source
+        # The advisory-freshness check lives in the extracted gate helper the
+        # stage cycle calls before any paid dispatch.
+        assert "_advisory_and_tests_gate" in shared_source
+        assert "_check_advisory_freshness" in inspect.getsource(git._advisory_and_tests_gate)
         assert "_run_parallel_review" in shared_source
         parallel_source = inspect.getsource(git._run_parallel_review)
-        assert "run_scope_review" in parallel_source
+        from ouroboros.tools import parallel_review as _pr
+        assert "run_scope_review" in inspect.getsource(_pr._run_scope)
         assert "ThreadPoolExecutor" in parallel_source
 
     def test_parallel_execution_both_always_run(self):
-        """Both triad and scope futures are always submitted regardless of each other's result."""
+        """SUPERSESSION (lane L-review, Q25=A): the retired contract was
+        "both futures always submitted regardless of each other's result" — it
+        let one side SPEND while the other failed assembly deterministically.
+        The ratified ordering: BOTH packets are assembled first, and both
+        dispatches are submitted to the pool only past the admission; each
+        submission still precedes any result() collection."""
         git = _get_module("ouroboros.tools.git")
         source = inspect.getsource(git._run_parallel_review)
-        # Both submissions must be present before any result() call
-        submit_triad = source.find("triad_fut = pool.submit")
-        submit_scope = source.find("scope_fut = pool.submit")
+        prepare_triad = source.find("_prepare_unified_review(")
+        prepare_scope = source.find("_prepare_scope_rows(")
+        submit_triad = source.find("pool.submit(_dispatch_unified_review")
+        submit_scope = source.find("pool.submit(_run_scope")
         result_triad = source.find("triad_fut.result()")
         result_scope = source.find("scope_fut.result()")
-        # Both must be submitted, and submissions must precede result() calls
-        assert submit_triad > 0
-        assert submit_scope > 0
-        assert result_triad > 0
-        assert result_scope > 0
-        # Both submitted before any result() is collected
+        for position in (prepare_triad, prepare_scope, submit_triad, submit_scope,
+                         result_triad, result_scope):
+            assert position > 0
+        # Assembly of BOTH sides precedes ANY dispatch submission...
+        assert prepare_triad < submit_triad and prepare_triad < submit_scope
+        assert prepare_scope < submit_triad and prepare_scope < submit_scope
+        # ...and both submissions precede their result() collection.
         assert submit_triad < result_triad
         assert submit_scope < result_scope
 
@@ -1747,11 +1771,18 @@ class TestGitWiring:
                 {"slot_id": "stale", "model_id": "old-scope", "status": "responded"}
             ],
         )
+        fake_slot = types.SimpleNamespace(
+            model="new-scope", slot_id="scope_slot_1", route=None, effort="",
+            session_target="", session_profile="")
         with mock.patch.object(pr_mod, "run_cmd", return_value=""):
-            with mock.patch("ouroboros.tools.review._run_unified_review", return_value=None):
-                with mock.patch.object(pr_mod, "run_scope_review", side_effect=RuntimeError("scope crashed")):
-                    review_err, scope_result, triad_block_reason, _ = pr_mod.run_parallel_review(
-                        ctx, "test commit")
+            with mock.patch("ouroboros.tools.review._prepare_unified_review",
+                            return_value=(None, None, True)):
+                with mock.patch.object(
+                        pr_mod, "_prepare_scope_rows",
+                        return_value=[{"slot": fake_slot, "prepared": {"p": 1}, "final": None}]):
+                    with mock.patch.object(pr_mod, "run_scope_review", side_effect=RuntimeError("scope crashed")):
+                        review_err, scope_result, triad_block_reason, _ = pr_mod.run_parallel_review(
+                            ctx, "test commit")
 
         assert review_err is None
         assert triad_block_reason == ""
@@ -2392,7 +2423,14 @@ def test_parallel_commit_scope_is_one_substantive_call(monkeypatch, tmp_path):
     monkeypatch.setattr(parallel_review, "run_cmd", lambda *_a, **_k: "staged diff")
     monkeypatch.setattr(parallel_review, "run_scope_review", fake_scope)
     monkeypatch.setattr(config, "get_scope_review_models", lambda: ["scope/model"])
-    monkeypatch.setattr(review, "_run_unified_review", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        review, "_prepare_unified_review", lambda *_a, **_k: (None, None, True)
+    )
+    from ouroboros.tools import review_admission
+    monkeypatch.setattr(
+        review_admission, "prepare_scope_review",
+        lambda *_a, **_k: ({"packet": 1}, None),
+    )
 
     parallel_review.run_parallel_review(ctx, "test commit")
 
@@ -3467,7 +3505,9 @@ def _run_scope_fanout(monkeypatch, tmp_path, models):
     monkeypatch.setattr(sr, "_scope_window",
                         lambda _model, **_k: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
     monkeypatch.setattr(parallel_review, "run_cmd", lambda *_a, **_k: "staged diff")
-    monkeypatch.setattr(review, "_run_unified_review", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        review, "_prepare_unified_review", lambda *_a, **_k: (None, None, True)
+    )
 
     ctx = SimpleNamespace(
         repo_dir=tmp_path, drive_root=tmp_path, task_id="scope-slot-identity",

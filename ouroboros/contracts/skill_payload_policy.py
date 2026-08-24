@@ -35,6 +35,9 @@ SKILL_PAYLOAD_CONTROL_DIRNAMES = frozenset({
     "__pycache__",
 })
 
+PRESENCE_PROFILE_STATE_FILENAME = "presence_profile_state.json"
+PRESENCE_PROFILE_STATE_STEM = "presence_profile_state"
+
 SKILL_OWNER_STATE_FILENAMES = frozenset({
     "enabled.json",
     "grants.json",
@@ -54,6 +57,10 @@ SKILL_OWNER_STATE_FILENAMES = frozenset({
     # skill" marker. The agent must NEVER forge it — that would self-bypass the immune
     # system's expensive review. Owner-issued via the owner-only endpoint only.
     "owner_attestation.json",
+    # Host-owned presence selections and local runtime overrides. A behavior
+    # skill may read its resolved projection, but payload/runtime writes must
+    # not be able to forge the owner's confirmed capability mapping.
+    PRESENCE_PROFILE_STATE_FILENAME,
 })
 
 SKILL_OWNER_STATE_STEMS = (
@@ -69,6 +76,7 @@ SKILL_OWNER_STATE_STEMS = (
     "auth_token",
     "health",
     "owner_attestation",
+    PRESENCE_PROFILE_STATE_STEM,
 )
 
 
@@ -561,6 +569,8 @@ __all__ = [
     "SKILL_PAYLOAD_CONTROL_DIRNAMES",
     "SKILL_OWNER_STATE_FILENAMES",
     "SKILL_OWNER_STATE_STEMS",
+    "PRESENCE_PROFILE_STATE_FILENAME",
+    "PRESENCE_PROFILE_STATE_STEM",
     "SkillPayloadPathError",
     "SkillPayloadTarget",
     "PayloadShortFormDecision",

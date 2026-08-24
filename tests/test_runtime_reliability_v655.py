@@ -659,7 +659,7 @@ def test_plan_task_skips_under_tight_deadline(tmp_path):
 
     deadline = (datetime.now(timezone.utc) + timedelta(seconds=400)).isoformat()
     ctx = _ctx(tmp_path, meta={"deadline_at": deadline})
-    out = _handle_plan_task(ctx, plan="do X then Y", goal="ship X")
+    out = _handle_plan_task(ctx, plan="do X then Y", goal="ship X", spec={"in_scope": ["X"]})
     assert out.startswith("PLAN_TASK_SKIPPED_DEADLINE")
     events = []
     while not ctx.event_queue.empty():

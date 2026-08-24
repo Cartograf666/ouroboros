@@ -17,16 +17,21 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import Any
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
 from devtools.benchmarks.common.manifests import (
-    MODEL_SLOT_KEYS,
+    ACTIVE_MODEL_SLOT_KEYS,
     admit_benchmark_run,
     finalize_run_manifest,
     model_slot_snapshot,
     write_json,
+)
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+    fixed_model_actor_snapshot,
 )
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
@@ -59,10 +64,11 @@ FRONTIER_BENCH_DATASET = "frontier-bench/frontier-bench"
 # effort by default (configurable). Exported to os.environ so the harbor subprocess and the adapter's forwarded-slot reads
 # (harbor_installed_agent._container_env) pick them up. This does NOT change repo config defaults.
 # Only slots the in-container adapter actually forwards (harbor_installed_agent._container_env).
-# Deliberately omitted because the container already covers them: HEAVY/CONSCIOUSNESS default to
-# OUROBOROS_MODEL when empty, and the adapter pins the fallback (singular AND plural) to the main
-# model itself — so setting them here would be a dead host-env write. CLAUDE_CODE_MODEL IS included
-# (and the adapter forwards it) so claude_code_edit cannot introduce a different model.
+# Deliberately omitted because the container already covers them: the internal Consciousness
+# role defaults to Main, the adapter pins both fallback spellings to Main, and child selection is
+# the explicit one-row Available-subagents value below. The Claude SDK advisory is explicitly
+# disabled by the structured fixed-model reviewer panel, so CLAUDE_CODE_MODEL stays empty rather
+# than receiving a provider-routed model id from a different namespace.
 _ALL_MODEL_SLOT_KEYS = (
     "OUROBOROS_MODEL",
     "OUROBOROS_MODEL_LIGHT",
@@ -70,16 +76,16 @@ _ALL_MODEL_SLOT_KEYS = (
     "OUROBOROS_WEBSEARCH_MODEL",
     "OUROBOROS_SCOPE_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODEL",
-    "CLAUDE_CODE_MODEL",
 )
 
 
-def apply_all_model(model: str, review_slots: int = 1, review_effort: str = "low") -> None:
+def apply_all_model(model: str, review_slots: int = 1,
+                    review_effort: str = "low") -> dict[str, Any]:
     """Force every FORWARDED model slot to ``model`` for a single-model run. Mutates only this
     process's env, which propagates to the harbor subprocess and the in-container adapter; it does
-    NOT edit repo config defaults. The container's HEAVY/CONSCIOUSNESS slots default to
-    OUROBOROS_MODEL and the adapter pins the fallback to the main model, so those need no explicit
-    value here.
+    NOT edit repo config defaults. The container's internal Consciousness role defaults to Main,
+    the adapter pins fallback to Main, and this function authors one exact API actor for child
+    work. Legacy Heavy is removed rather than pinned.
 
     Review for a single-model run defaults to ONE reviewer at ``low`` effort (configurable via
     --review-slots / --review-effort): three identical-model reviewers add latency/cost but no
@@ -87,11 +93,12 @@ def apply_all_model(model: str, review_slots: int = 1, review_effort: str = "low
     This is a BENCHMARK setting, NOT a claim that the review subsystem got more reliable
     (single_reviewer_no_diversity stays loud). EFFORT_SCOPE_REVIEW is set too for completeness
     ("там и там"); scope review does not fire on a terminal-bench task (it is a commit-time gate)."""
-    for key in _ALL_MODEL_SLOT_KEYS:
-        os.environ[key] = model
-    os.environ["OUROBOROS_REVIEW_MODELS"] = ",".join([model] * max(1, int(review_slots)))
-    os.environ["OUROBOROS_EFFORT_REVIEW"] = review_effort
-    os.environ["OUROBOROS_EFFORT_SCOPE_REVIEW"] = review_effort
+    return fixed_model_actor_snapshot(
+        model,
+        review_slots=review_slots,
+        review_effort=review_effort,
+        target=os.environ,
+    )
 
 
 @dataclass
@@ -489,9 +496,9 @@ def resolved_model_slots(config: HarborCommandConfig) -> dict[str, str]:
     Resolution order mirrors ``harbor_installed_agent._container_env`` exactly: the forwarded
     host env / settings snapshot first, then the job-config kwargs, which are the last word —
     so the recorded main model is the one the adapter pins, not whatever ``OUROBOROS_MODEL``
-    happened to sit in the operator's shell. ``ouroboros_model`` also drives HEAVY and both
-    fallback keys in the container, so they are recorded as the same model rather than left to
-    imply a second one.
+    happened to sit in the operator's shell. ``ouroboros_model`` also drives the one explicit
+    Available-subagent row and both fallback keys in the container. Heavy remains readable in
+    old manifests but is no longer an active slot written by a new benchmark run.
     """
     slots = {
         key: value
@@ -500,11 +507,10 @@ def resolved_model_slots(config: HarborCommandConfig) -> dict[str, str]:
     }
     if config.model:
         slots["OUROBOROS_MODEL"] = config.model
-        slots["OUROBOROS_MODEL_HEAVY"] = config.model
         slots["OUROBOROS_MODEL_FALLBACKS"] = config.model
     if config.light_model:
         slots["OUROBOROS_MODEL_LIGHT"] = config.light_model
-    return {key: value for key, value in slots.items() if key in MODEL_SLOT_KEYS}
+    return {key: value for key, value in slots.items() if key in ACTIVE_MODEL_SLOT_KEYS}
 
 
 def augment_manifest(manifest: dict, config: HarborCommandConfig) -> None:
@@ -512,11 +518,15 @@ def augment_manifest(manifest: dict, config: HarborCommandConfig) -> None:
 
     Same shape and same seam as GAIA's ``_augment_manifest`` (``gaia/run_gaia.py``): the
     settings-derived facts are added AFTER admission and persisted by the finalization seam, and
-    they land under ``model_slots`` filtered to ``MODEL_SLOT_KEYS``. Keeping the field name and
+    they land under ``model_slots`` filtered to ``ACTIVE_MODEL_SLOT_KEYS``. Keeping the field name and
     filter identical across families is the point — an auditor reading any benchmark's
     ``run_manifest.json`` finds the model in the same place.
     """
     manifest["model_slots"] = resolved_model_slots(config)
+    manifest["available_subagents"] = configured_subagents_snapshot(
+        config.settings_path,
+        exact_model=config.model,
+    )
 
 
 def harbor_command(config: HarborCommandConfig) -> list[str]:
@@ -951,8 +961,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
+    fixed_actor: dict[str, Any] = {}
     if args.all_model:
-        apply_all_model(args.all_model, review_slots=args.review_slots, review_effort=args.review_effort)
+        fixed_actor = apply_all_model(
+            args.all_model,
+            review_slots=args.review_slots,
+            review_effort=args.review_effort,
+        )
         args.model = args.all_model
         args.light_model = args.all_model
     if not args.model:
@@ -1078,6 +1093,15 @@ def main(argv: list[str] | None = None) -> int:
             ),
         },
     )
+    if fixed_actor:
+        manifest["model_slots"] = {
+            key: value for key, value in fixed_actor["model_slots"].items()
+            if key not in _UNFORWARDED_MODEL_SLOT_KEYS
+        }
+        manifest["available_subagents"] = fixed_actor["available_subagents"]
+        manifest["harness"]["fixed_model_actor"] = fixed_actor
+        # Durable before job-config discovery/version probes and the Harbor subprocess.
+        write_json(manifest_path, manifest)
     with finalize_run_manifest(manifest_path, manifest) as final:
         job_dir.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(

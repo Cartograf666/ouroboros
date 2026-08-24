@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 from typing import Any, Dict, List
@@ -107,26 +108,81 @@ def _running_tasks(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _task_file_inventory(task_dir: pathlib.Path) -> List[Dict[str, Any]]:
+    inventory: List[Dict[str, Any]] = []
+    if not task_dir.is_dir():
+        return inventory
+    for path in task_dir.glob("*.json"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if not path.is_file():
+            continue
+        inventory.append({
+            "name": path.name,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        })
+    inventory.sort(key=lambda row: (row["mtime_ns"], row["name"]), reverse=True)
+    return inventory
+
+
+def _recent_tasks_snapshot(
+    inventory: List[Dict[str, Any]],
+    *,
+    include_results: bool,
+    include_traces: bool,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "query": {
+            "include_results": bool(include_results),
+            "include_traces": bool(include_traces),
+        },
+        "files": inventory,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _handle_recent_tasks(
     ctx: ToolContext,
     limit: int = 5,
+    offset: int = 0,
+    snapshot: str = "",
     include_results: bool = False,
     include_traces: bool = False,
     **_kwargs: Any,
 ) -> str:
-    """Return recent completed task summaries from the current drive."""
-    drive_root = pathlib.Path(ctx.drive_root)
+    """Return recent completed task summaries from the canonical task root."""
+    from ouroboros.tool_access import canonical_data_root
+
+    drive_root = canonical_data_root(ctx)
     task_dir = drive_root / "task_results"
     task_limit = _coerce_limit(limit)
+    try:
+        skip = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        skip = 0
+    requested_snapshot = str(snapshot or "").strip().lower()
     tasks: List[Dict[str, Any]] = []
     unreadable_tasks: List[Dict[str, str]] = []
-    if task_dir.is_dir():
-        files = sorted(
-            (p for p in task_dir.glob("*.json") if p.is_file()),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
+    inventory: List[Dict[str, Any]] = []
+    current_snapshot = ""
+    stable = False
+    for _attempt in range(2):
+        tasks = []
+        unreadable_tasks = []
+        before = _task_file_inventory(task_dir)
+        current_snapshot = _recent_tasks_snapshot(
+            before,
+            include_results=bool(include_results),
+            include_traces=bool(include_traces),
         )
-        for path in files[:task_limit]:
+        selected = before[skip:skip + task_limit]
+        for item in selected:
+            path = task_dir / str(item["name"])
             record, error = _task_record(
                 path,
                 drive_root=drive_root,
@@ -137,11 +193,58 @@ def _handle_recent_tasks(
                 tasks.append(record)
             elif error is not None:
                 unreadable_tasks.append(error)
-    return json.dumps({
+        inventory = _task_file_inventory(task_dir)
+        stable = before == inventory
+        if stable:
+            break
+    total = len(inventory)
+    returned = min(task_limit, max(0, total - skip))
+    remaining = max(0, total - skip - returned)
+    base = {
         "running": _running_tasks(drive_root),
         "tasks": tasks,
         "unreadable_tasks": unreadable_tasks,
-    }, ensure_ascii=False, indent=2)
+        "source": {"reader": "recent_tasks", "root": "canonical_task_results"},
+        "total": total,
+        "returned": returned,
+        "offset": skip,
+        "remaining": remaining,
+        "snapshot": current_snapshot,
+        "next": ({
+            "limit": task_limit,
+            "offset": skip + returned,
+            "snapshot": current_snapshot,
+            "include_results": bool(include_results),
+            "include_traces": bool(include_traces),
+        } if remaining else None),
+    }
+    if not stable:
+        return json.dumps({
+            **base,
+            "tasks": [],
+            "unreadable_tasks": [],
+            "error": {
+                "code": "RECENT_TASKS_SNAPSHOT_CHANGED_DURING_READ",
+                "message": (
+                    "Task results changed while the page was captured; no mixed page "
+                    "was returned; restart with offset=0 and no snapshot."
+                ),
+            },
+        }, ensure_ascii=False, indent=2)
+    if requested_snapshot and requested_snapshot != current_snapshot:
+        return json.dumps({
+            **base,
+            "tasks": [],
+            "unreadable_tasks": [],
+            "error": {
+                "code": "RECENT_TASKS_SNAPSHOT_CHANGED",
+                "message": (
+                    "Task results changed after the prior page; no mixed page was "
+                    "returned; restart with offset=0 and no snapshot."
+                ),
+            },
+        }, ensure_ascii=False, indent=2)
+    return json.dumps(base, ensure_ascii=False, indent=2)
 
 
 def get_tools() -> List[ToolEntry]:
@@ -149,7 +252,7 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("recent_tasks", {
             "name": "recent_tasks",
             "description": (
-                "Read recent task results from this drive. Use when prior work, "
+                "Read recent task results from the canonical task root. Use when prior work, "
                 "continuations, retries, or incomplete current context may matter."
             ),
             "parameters": {
@@ -157,8 +260,18 @@ def get_tools() -> List[ToolEntry]:
                 "properties": {
                     "limit": {
                         "type": "integer",
-                        "description": "Number of recent completed tasks to return (1-20).",
+                        "description": "Page size for completed tasks (1-20).",
                         "default": 5,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Number of newer completed task files already consumed.",
+                        "default": 0,
+                    },
+                    "snapshot": {
+                        "type": "string",
+                        "description": "Stable cursor returned by the preceding page.",
+                        "default": "",
                     },
                     "include_results": {
                         "type": "boolean",

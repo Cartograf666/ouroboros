@@ -14,10 +14,9 @@ from typing import Any, Awaitable, Callable, Dict, Protocol, Sequence, runtime_c
 
 from ouroboros.skill_token import SkillToken
 
-# 1.3: additive/widening — execution-mode capability matrix + get_runtime_info now
-# exposes execution_mode/capabilities, and out-of-process extensions gained
-# on_unload / send_ws_message / register_companion_process (negotiated, not removed).
-PLUGIN_API_VERSION = "1.3"
+# 1.4: additive/widening — reviewed transport skills may submit authenticated
+# non-owner presence events through the Host Service's positive capability ceiling.
+PLUGIN_API_VERSION = "1.4"
 
 
 # Core settings keys require explicit content-hash-bound owner grants.
@@ -35,6 +34,7 @@ FORBIDDEN_EXTENSION_SETTINGS: frozenset[str] = FORBIDDEN_SKILL_SETTINGS
 VALID_EXTENSION_PERMISSIONS: frozenset[str] = frozenset({
     "net", "fs", "subprocess", "widget", "ws_handler", "route", "tool",
     "read_settings", "companion_process", "supervised_task", "subscribe_event", "inject_chat",
+    "presence",
 })
 
 VALID_EXTENSION_ROUTE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"})

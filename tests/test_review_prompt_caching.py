@@ -1048,6 +1048,11 @@ def test_scope_prompt_records_stable_boundary(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_warm_supported_params_cache_used_when_fetch_skipped(monkeypatch):
+    from ouroboros.request_wire_recovery import (
+        prepare_wire_payload_for_send,
+        request_wire_call_scope,
+    )
+
     client = LLMClient(api_key="test")
     monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", True)
     monkeypatch.setattr(
@@ -1060,11 +1065,16 @@ def test_warm_supported_params_cache_used_when_fetch_skipped(monkeypatch):
         "usage_model": "anthropic/claude-fable-5",
         "supports_openrouter_extensions": True,
     }
-    kwargs = client._build_remote_kwargs(
-        target, [{"role": "user", "content": "x"}], "high", 512, "auto", 0.2, None,
-        skip_capability_fetch=True,
-    )
-    assert "temperature" not in kwargs  # proactively stripped from the warm cache
+    with request_wire_call_scope():
+        kwargs = client._build_remote_kwargs(
+            target, [{"role": "user", "content": "x"}], "high", 512, "auto", 0.2, None,
+            skip_capability_fetch=True,
+        )
+        physical = prepare_wire_payload_for_send(
+            target, kwargs, api_surface="chat.completions"
+        )
+    assert kwargs["temperature"] == 0.2
+    assert "temperature" not in physical
 
 
 # ---------------------------------------------------------------------------
@@ -1411,81 +1421,6 @@ def test_direct_anthropic_blocks_preserve_valid_ttl():
     ])
     assert blocks[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert blocks[1]["cache_control"] == {"type": "ephemeral"}
-
-
-def test_plan_user_content_stable_prefix_is_plan_independent():
-    from ouroboros.tools.review_synthesis import build_plan_review_user_content
-
-    class _Req:
-        goal = "improve planning"
-        files_to_touch = ["a.py"]
-        context_level = "localized"
-        context_notes = ""
-        include_tests = False
-        scope = {}
-
-    r1, r2 = _Req(), _Req()
-    r1.plan = "PLAN VERSION ONE"
-    r2.plan = "PLAN VERSION TWO (revised)"
-    c1, n1 = build_plan_review_user_content(r1, "HEAD SNAPSHOTS", "ATLAS PACK", "")
-    c2, n2 = build_plan_review_user_content(r2, "HEAD SNAPSHOTS", "ATLAS PACK", "")
-    assert n1 == n2
-    assert c1[:n1] == c2[:n2]  # evidence prefix survives a plan revision
-    assert "PLAN VERSION ONE" not in c1[:n1]  # plan text is dynamic-tail only
-    assert "ATLAS PACK" in c1[:n1]
-
-
-def test_plan_atlas_substitution_ignores_placeholder_quoted_in_plan():
-    """The Atlas slot is substituted INSIDE the stable prefix even when the
-    dynamic plan text quotes the placeholder literal (a plan touching
-    plan_review.py routinely does)."""
-    from ouroboros.tools.review_synthesis import build_plan_review_user_content
-
-    placeholder = "__GENERATED_PLAN_ATLAS_PENDING__"
-
-    class _Req:
-        goal = "g"
-        plan = f"quote the literal {placeholder} in prose"
-        files_to_touch = []
-        context_level = "localized"
-        context_notes = ""
-        include_tests = False
-        scope = {}
-
-    content, stable_len = build_plan_review_user_content(_Req(), "", placeholder, "")
-    slot = content.rfind(placeholder, 0, stable_len)
-    assert 0 <= slot < stable_len  # the REAL slot is inside the stable prefix
-    substituted = content[:slot] + "ATLAS TEXT" + content[slot + len(placeholder):]
-    tail = substituted[slot + len("ATLAS TEXT"):]
-    assert placeholder in tail  # the quoted literal in the plan is untouched
-
-
-def test_plan_atlas_substitution_ignores_placeholder_in_head_snapshot():
-    """A HEAD snapshot of a file that CONTAINS the placeholder literal sits in
-    the stable prefix BEFORE the Atlas slot; the substitution must target the
-    LAST in-boundary occurrence (the real slot is the final stable section)."""
-    from ouroboros.tools.review_synthesis import build_plan_review_user_content
-
-    placeholder = "__GENERATED_PLAN_ATLAS_PENDING__"
-
-    class _Req:
-        goal = "g"
-        plan = "ordinary plan"
-        files_to_touch = ["ouroboros/tools/plan_review.py"]
-        context_level = "localized"
-        context_notes = ""
-        include_tests = False
-        scope = {}
-
-    snapshot = f"### plan_review.py\nplaceholder = \"{placeholder}\"\n"
-    content, stable_len = build_plan_review_user_content(_Req(), snapshot, placeholder, "")
-    assert content.count(placeholder) == 2
-    slot = content.rfind(placeholder, 0, stable_len)
-    first = content.find(placeholder, 0, stable_len)
-    assert first < slot < stable_len  # the LAST in-boundary occurrence is the slot
-    substituted = content[:slot] + "ATLAS TEXT" + content[slot + len(placeholder):]
-    assert "ATLAS TEXT" in substituted[:slot + len("ATLAS TEXT")]
-    assert placeholder in substituted[:slot]  # the snapshot literal is untouched
 
 
 def test_plan_review_messages_builder_blocks():

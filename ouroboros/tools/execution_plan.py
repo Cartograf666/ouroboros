@@ -48,9 +48,38 @@ def _proposal_error(message: str) -> str:
     return f"⚠️ TOOL_ARG_ERROR (propose_execution_plan): {message}"
 
 
+def available_subagents() -> Dict[str, Dict[str, str]]:
+    """The owner's Available-subagents catalog, keyed by id. {} when unusable.
+
+    THE list of what work can run on. It is the owner's standing configuration,
+    so a proposal may only offer rows from it — and the row's own name and
+    ``recommended_use`` are what the card shows, rather than a route the owner
+    would have to decode.
+    """
+    from ouroboros.config import load_settings
+    from ouroboros.configured_subagents import resolve_configured_subagents
+    from ouroboros.subagent_runtime import effective_runtime_subagent_settings
+
+    resolution = resolve_configured_subagents(
+        effective_runtime_subagent_settings(load_settings()))
+    config = resolution.config
+    if config is None or not config.enabled:
+        return {}
+    return {
+        row.subagent_id: {
+            "subagent_id": row.subagent_id,
+            "name": row.name,
+            "recommended_use": row.recommended_use,
+            "route_kind": row.route.kind,
+            "target_id": row.route.target_id,
+            "effort": row.effort,
+        }
+        for row in config.items
+    }
+
+
 def _validated_items(raw: Any) -> Tuple[List[Dict[str, Any]], str]:
     """Normalize the proposed rows. Returns ``(items, "")`` or ``([], refusal)``."""
-    from ouroboros.routing_plan import parse_route_pin
 
     if not isinstance(raw, list) or not raw:
         return [], _proposal_error("items must be a non-empty array of work items.")
@@ -72,15 +101,15 @@ def _validated_items(raw: Any) -> Tuple[List[Dict[str, Any]], str]:
         if item_id in seen:
             return [], _proposal_error(f"item_id {item_id!r} appears twice.")
         seen.add(item_id)
-        try:
-            pin = parse_route_pin(row.get("recommended_route"), where)
-        except ValueError as exc:
-            return [], _proposal_error(str(exc))
+        subagent_id = str(row.get("subagent_id") or "").strip()
+        if not subagent_id:
+            return [], _proposal_error(
+                f"{where} needs a subagent_id from the Available subagents catalog.")
         items.append({
             "item_id": item_id,
             "title": str(row.get("title") or "")[:_MAX_TEXT],
             "why": str(row.get("why") or "")[:_MAX_TEXT],
-            "recommended_route": pin.as_dict(),
+            "subagent_id": subagent_id,
             "estimate": row.get("estimate") if isinstance(row.get("estimate"), dict) else {},
         })
     return items, ""
@@ -89,22 +118,18 @@ def _validated_items(raw: Any) -> Tuple[List[Dict[str, Any]], str]:
 def _unchoosable(items: List[Dict[str, Any]]) -> List[str]:
     """Rows the owner could not act on, refused BEFORE they are rendered.
 
-    A proposal is a decision request, and every option in it has to be real: a
-    row pointing at a route the engine does not carry (or a model with no
-    credentials) would be approved in good faith and then fail at dispatch,
-    after the owner believed they had decided.
+    A proposal is a decision request, and every option in it has to be real: an
+    id the catalog does not carry would be approved in good faith and then fail
+    at dispatch, after the owner believed they had decided.
     """
-    from ouroboros.execution_targets import execution_targets, validate_pin
-    from ouroboros.routing_plan import parse_route_pin
-
-    catalog = execution_targets()
-    problems: List[str] = []
-    for row in items:
-        pin = parse_route_pin(row["recommended_route"], row["item_id"])
-        reason = validate_pin(pin, catalog=catalog)
-        if reason:
-            problems.append(f"{row['item_id']} -> {pin.target_id}: {reason}")
-    return problems
+    catalog = available_subagents()
+    if not catalog:
+        return ["the Available subagents catalog is empty or disabled — "
+                "configure subagents in Settings before allocating work across them"]
+    return [
+        f"{row['item_id']} -> {row['subagent_id']}: not in the Available subagents catalog"
+        for row in items if row["subagent_id"] not in catalog
+    ]
 
 
 def _decision_entry(ctx: ToolContext, task_id: str, seen: set) -> Dict[str, Any] | None:
@@ -235,7 +260,8 @@ def _apply_decision(
             f"OWNER_DECISION_UNREADABLE: {exc}. Nothing was scheduled. Re-propose "
             "the allocation so the owner can answer again."
         )
-    recommended = {row["item_id"]: row["recommended_route"] for row in items}
+    recommended = {row["item_id"]: row["subagent_id"] for row in items}
+    catalog = available_subagents()
     stamped = RoutingPlan(
         root_task_id=root_task_id,
         approved_at=str(entry.get("ts") or utc_now_iso()),
@@ -247,10 +273,10 @@ def _apply_decision(
             RoutingPlanItem(
                 item_id=row.item_id,
                 title=row.title,
-                route=row.route,
+                subagent_id=row.subagent_id,
                 source=(
                     SOURCE_RECOMMENDED
-                    if recommended.get(row.item_id) == row.route.as_dict()
+                    if recommended.get(row.item_id) == row.subagent_id
                     else SOURCE_EDITED
                 ),
             )
@@ -259,8 +285,8 @@ def _apply_decision(
     )
     write_routing_plan(stamped)
     lines = [
-        f"- {row.item_id}: {row.route.target_id}"
-        f"{' · ' + row.route.model if row.route.model else ''}"
+        f"- {row.item_id}: "
+        f"{(catalog.get(row.subagent_id) or {}).get('name') or row.subagent_id}"
         f" ({'as proposed' if row.source == SOURCE_RECOMMENDED else 'owner changed it'})"
         for row in stamped.items
     ]
@@ -271,8 +297,6 @@ def _apply_decision(
 
 
 def get_tools() -> list[ToolEntry]:
-    from ouroboros.routing_plan import ROUTE_KIND_API, ROUTE_KIND_SESSION
-
     return [
         ToolEntry("propose_execution_plan", {
             "name": "propose_execution_plan",
@@ -300,18 +324,13 @@ def get_tools() -> list[ToolEntry]:
                         "item_id": {"type": "string", "description": "Short stable id you will pass as schedule_subagent(plan_item_id=...) later, e.g. 'frontend'."},
                         "title": {"type": "string", "description": "What this piece of work IS, in the owner's words."},
                         "why": {"type": "string", "description": "Why you recommend this destination for it — speed, cost, quota, past results."},
-                        "recommended_route": {"type": "object", "properties": {
-                            "kind": {"type": "string", "enum": [ROUTE_KIND_API, ROUTE_KIND_SESSION],
-                                     "description": f"{ROUTE_KIND_API} = a metered or local API model; {ROUTE_KIND_SESSION} = a subscription harness."},
-                            "target_id": {"type": "string", "description": "The model id (api_chat) or the harness id (agent_session)."},
-                            "model": {"type": "string", "description": "Optional harness model for an agent_session row."},
-                        }, "required": ["kind", "target_id"]},
+                        "subagent_id": {"type": "string", "description": "Exact id from the Available subagents catalog — the same ids schedule_subagent takes. Propose only rows that exist."},
                         "estimate": {"type": "object", "properties": {
                             "cost_usd": {"type": "number", "description": "What you expect this item to cost there."},
                             "duration_sec": {"type": "number", "description": "How long you expect it to take there."},
                             "basis": {"type": "string", "description": "Where the estimate comes from — say 'no evidence yet' when there is none."},
                         }},
-                    }, "required": ["item_id", "recommended_route"]},
+                    }, "required": ["item_id", "subagent_id"]},
                 },
             }, "required": ["items"]},
         }, _propose_execution_plan, timeout_sec=PROPOSAL_WAIT_SEC + 120),

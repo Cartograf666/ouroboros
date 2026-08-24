@@ -6,7 +6,7 @@ import { apiClient, updateStrategyForPlan } from '../modules/api_client.js';
 import { updatePillText, verifiedUpdatePlan } from '../modules/update_status.js';
 
 
-test('ordinary update selects clean or assisted merge without recovery replacement', () => {
+test('ordinary update selects clean or assisted merge without recovery replacement or client-side stash', () => {
     assert.equal(updateStrategyForPlan({
         available: true,
         kind: 'clean',
@@ -38,7 +38,7 @@ test('ordinary update selects clean or assisted merge without recovery replaceme
         source.indexOf('async function replaceWithOfficial()'),
     );
     assert.doesNotMatch(ordinary, /['"]replace['"]/);
-    assert.doesNotMatch(ordinary, /stash/i);
+    assert.doesNotMatch(ordinary, /updateApply\(['"]stash['"]/);
 
     const dialog = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
     assert.match(dialog, /Git handles clean updates directly/);

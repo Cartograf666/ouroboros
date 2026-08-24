@@ -467,6 +467,182 @@ def _promoted_force_plan_metadata(evt: dict) -> dict:
     return {"metadata": {"force_plan": True, "force_plan_source": source}}
 
 
+def _stage_promoted_initial_attachments(
+    evt: dict, task: dict, tid: str, *, inherited_manifest: Any = None,
+) -> tuple[list[dict], Optional[dict]]:
+    """Stage before any durable project/workspace/task admission side effect."""
+
+    uploads = evt.get("attachment_uploads")
+    uploads = uploads if isinstance(uploads, list) else []
+    inherited = inherited_manifest if isinstance(inherited_manifest, list) else []
+    if not uploads and not inherited:
+        return [], None
+    manifest: list[dict] = []
+    try:
+        from ouroboros.artifacts import (
+            attachment_manifest_has_rejections,
+            materialize_inherited_attachment_manifest,
+            remove_staged_attachments,
+            stage_task_attachments,
+        )
+        from ouroboros.gateway.tasks import _render_attachment_lines
+
+        inherited_rows, inherited_error = materialize_inherited_attachment_manifest(
+            inherited, DRIVE_ROOT, tid,
+        )
+        if inherited_error:
+            failed_inherited = [
+                {
+                    **{
+                        key: row[key] for key in ("ordinal", "label")
+                        if isinstance(row, dict) and key in row
+                    },
+                    "status": "rejected",
+                    "reason": "inherited_source_unavailable",
+                }
+                for row in inherited
+            ]
+            return failed_inherited, {
+                "status": "needs_manual_target",
+                "reason": "attachment_admission_rejected",
+                "detail": f"Inherited attachment materialization failed: {inherited_error}",
+                "attachment_manifest": failed_inherited,
+                "task_id": tid,
+            }
+        upload_rows = stage_task_attachments(DRIVE_ROOT, tid, uploads) if uploads else []
+        # Preserve the private cleanup ownership carried by the staging helper so
+        # every later admission refusal remains atomic even after composing
+        # inherited and newly-uploaded inputs.
+        manifest = inherited_rows if inherited_rows else upload_rows
+        if inherited_rows and upload_rows:
+            inherited_rows.extend(upload_rows)
+            inherited_owned = getattr(inherited_rows, "_cleanup_owned_paths", None)
+            upload_owned = getattr(upload_rows, "_cleanup_owned_paths", None)
+            if isinstance(inherited_owned, set) and isinstance(upload_owned, set):
+                inherited_owned.update(upload_owned)
+        for ordinal, row in enumerate(manifest):
+            if isinstance(row, dict):
+                row["ordinal"] = ordinal
+        rendered = _render_attachment_lines(manifest)
+        if attachment_manifest_has_rejections(manifest):
+            remove_staged_attachments(manifest)
+            from ouroboros.headless import remove_subagent_task_drive
+
+            remove_subagent_task_drive(DRIVE_ROOT, tid)
+            return manifest, {
+                "status": "needs_manual_target",
+                "reason": "attachment_admission_rejected",
+                "detail": rendered,
+                "attachment_manifest": manifest,
+                "task_id": tid,
+            }
+        if rendered:
+            task["attachments"] = manifest
+            task["attachment_images"] = [
+                item for item in manifest
+                if str(item.get("status") or "staged") == "staged" and item.get("is_image")
+            ]
+        return manifest, None
+    except Exception:
+        log.warning("promote: attachment staging failed for %s", tid, exc_info=True)
+        if manifest:
+            try:
+                from ouroboros.artifacts import remove_staged_attachments
+
+                remove_staged_attachments(manifest)
+            except Exception:
+                log.debug("promote: partial composed attachment cleanup failed", exc_info=True)
+        declared = [*inherited, *uploads]
+        manifest = [
+            {
+                "ordinal": index,
+                "status": "rejected",
+                "reason": "staging_unavailable",
+                "label": str(item.get("label") or item.get("display_name") or f"attachment {index + 1}")
+                if isinstance(item, dict) else f"attachment {index + 1}",
+            }
+            for index, item in enumerate(declared)
+        ]
+        return manifest, {
+            "status": "needs_manual_target",
+            "reason": "attachment_admission_rejected",
+            "detail": "\n".join(
+                f"- {row['label']}: rejected (reason=staging_unavailable, ordinal={row['ordinal']})"
+                for row in manifest
+            ),
+            "attachment_manifest": manifest,
+            "task_id": tid,
+        }
+
+
+def _reject_promoted_after_attachment_stage(
+    outcome: dict, manifest: list[dict],
+) -> dict:
+    """Central idempotent cleanup for every non-scheduled post-stage exit."""
+
+    if manifest:
+        try:
+            from ouroboros.artifacts import remove_staged_attachments
+
+            remove_staged_attachments(manifest)
+        except Exception:
+            log.debug("promote: staged attachment cleanup failed", exc_info=True)
+    return outcome
+
+
+def _apply_presence_promotion_authority(
+    evt: dict, task: dict, *, objective: str, expected_output: str,
+) -> list[dict]:
+    """Preserve inherited Presence authority while rebinding the new root."""
+
+    presence = evt.get("presence") if isinstance(evt.get("presence"), dict) else None
+    if not presence:
+        return []
+    task["_presence_origin"] = True
+    task["source"] = "presence_promote"
+    task.setdefault("metadata", {})["presence"] = dict(presence)
+    contract = evt.get("task_contract") if isinstance(evt.get("task_contract"), dict) else {}
+    inherited_manifest = [
+        dict(row) for row in (contract.get("attachment_manifest") or [])
+        if isinstance(row, dict)
+    ]
+    promoted_contract = dict(contract)
+    promoted_contract.update({
+        "task_type": "task",
+        "objective": objective,
+        "expected_output": expected_output,
+        "attachment_manifest": [],
+    })
+    promoted_contract.pop("lineage", None)
+    task["task_contract"] = promoted_contract
+    return inherited_manifest
+
+
+def _relocate_promoted_attachments(task: dict, tid: str, manifest: list[dict]) -> bool:
+    """Move a pre-admitted manifest into the selected child drive, if any."""
+
+    staged = [row for row in manifest if row.get("status") == "staged" and row.get("abs_path")]
+    if not staged:
+        return True
+    target_root = pathlib.Path(str(task.get("drive_root") or DRIVE_ROOT))
+    source_dir = pathlib.Path(str(staged[0]["abs_path"])).parent
+    try:
+        from ouroboros.artifacts import task_artifact_dir_path
+
+        target_dir = task_artifact_dir_path(target_root, tid, create=False) / "attachments"
+        if source_dir.resolve(strict=False) == target_dir.resolve(strict=False):
+            return True
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        source_dir.replace(target_dir)
+        from ouroboros.artifacts import rebase_staged_attachment_manifest
+
+        rebase_staged_attachment_manifest(manifest, source_dir, target_dir)
+        return True
+    except Exception:
+        log.warning("promote: attachment relocation failed for %s", tid, exc_info=True)
+        return False
+
+
 def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     """Enqueue a first-class pooled owner task from a conversation-lane promote.
     The task carries the originating ``chat_id`` (its live card and replies
@@ -493,6 +669,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     evt = dict(evt)
     source_note = str(evt.get("_source_note") or "")
     effective_pid = str(evt.get("project_id") or "")
+    attachment_manifest: list[dict] = []
     repair_constraint, constraint_error = _canonical_promoted_repair_constraint(
         evt.get("task_constraint")
     )
@@ -533,6 +710,14 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "promotion_admission_token": admission_token,
         **_promoted_force_plan_metadata(evt),
     }
+    inherited_attachment_manifest = _apply_presence_promotion_authority(
+        evt, task, objective=objective, expected_output=expected_output,
+    )
+    attachment_manifest, attachment_rejection = _stage_promoted_initial_attachments(
+        evt, task, tid, inherited_manifest=inherited_attachment_manifest,
+    )
+    if attachment_rejection is not None:
+        return attachment_rejection
     if repair_constraint is not None:
         # X3: bind the admission hash to the REAL task id, durably, before the
         # task exists anywhere else — every payload write CAS-checks this chain.
@@ -548,11 +733,11 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
                 task_id=tid, base_content_hash=_base_content_hash)
         except Exception:
             log.warning("Failed to record skill repair admission for %s", tid, exc_info=True)
-            return {
+            return _reject_promoted_after_attachment_stage({
                 "status": "needs_manual_target",
                 "reason": "skill_repair_admission_unwritable",
                 "task_id": tid,
-            }
+            }, attachment_manifest)
         # Must be present before attach_task_contract so the managed root task
         # enters execution with its confined repair profile, never ephemeral.
         task["task_constraint"] = repair_constraint
@@ -562,10 +747,17 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         task["origin_message_ref"] = dict(evt["source_ref"])
         if isinstance(evt.get("source_text"), str) and evt.get("source_text"):
             task["origin_message_text"] = evt["source_text"]
+    if isinstance(evt.get("predecessor_authority_source"), dict):
+        task["predecessor_authority_source"] = dict(evt["predecessor_authority_source"])
+    # Owner Surface Fact: the promoting turn's sending-surface fact lands in
+    # METADATA (the renderer reads task["metadata"]["client_surface"]), never a
+    # top-level key — and metadata may not exist yet (only force_plan creates it).
+    if isinstance(evt.get("client_surface"), dict) and evt.get("client_surface"):
+        task.setdefault("metadata", {})["client_surface"] = dict(evt["client_surface"])
     pid = str(evt.get("project_id") or "").strip()
     if pid:
         # Deletion closes admission before cancellation/quiescence begins. Check
-        # the durable lifecycle before creating child drives or staging uploads;
+        # the durable lifecycle before creating projects or child drives;
         # enqueue_task repeats this check atomically under the queue lock.
         try:
             from ouroboros.projects_registry import get_reserved_project
@@ -573,19 +765,19 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
             existing_project = get_reserved_project(DRIVE_ROOT, pid)
             existing_lifecycle = str((existing_project or {}).get("lifecycle") or "active")
             if existing_project is not None and existing_lifecycle != "active":
-                return {
+                return _reject_promoted_after_attachment_stage({
                     "status": "needs_manual_target",
                     "reason": "project_routing_fence",
                     "project_lifecycle": existing_lifecycle,
                     "task_id": tid,
-                }
+                }, attachment_manifest)
         except Exception:
             log.warning("promote: project admission lookup failed for %s", pid, exc_info=True)
-            return {
+            return _reject_promoted_after_attachment_stage({
                 "status": "needs_manual_target",
                 "reason": "project_routing_fence_lookup_failed",
                 "task_id": tid,
-            }
+            }, attachment_manifest)
         task["project_id"] = pid
         # When the model is CREATING a named project (project_name set), pass the
         # human display name so the project isn't named after its bare id (v6.33.0).
@@ -623,11 +815,11 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
                 )
             except Exception as exc:
                 _report_binding_failure(tid, pid, exc, path="promote_chat_to_task")
-                return {
+                return _reject_promoted_after_attachment_stage({
                     "status": "needs_manual_target",
                     "reason": "project_binding_failed",
                     "task_id": tid,
-                }
+                }, attachment_manifest)
             # The promoted task runs in the PROJECT thread: route its live card +
             # owner mailbox to the project's chat_id (not the main chat it was
             # promoted from) so follow-ups steer to it via
@@ -652,69 +844,81 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
                     log.debug("promote: projects_changed broadcast failed for %s", pid, exc_info=True)
         except Exception:
             log.warning("promote: project registration failed for %s", pid, exc_info=True)
-            return {
+            return _reject_promoted_after_attachment_stage({
                 "status": "needs_manual_target",
                 "reason": "project_registration_failed",
                 "task_id": tid,
-            }
+            }, attachment_manifest)
     # Workspace admission (v6.58.0 SSOT + the Q10=A auto-provision) lives in one
     # helper so this entry point stays readable and under the method gate.
     workspace_outcome = _admit_promoted_workspace(evt, ctx, task, pid=pid, tid=tid)
     if workspace_outcome is not None:
-        return workspace_outcome
-    attachment_uploads = (
-        evt.get("attachment_uploads") if isinstance(evt.get("attachment_uploads"), list) else []
-    )
-    if attachment_uploads:
-        try:
-            from ouroboros.artifacts import stage_task_attachments
-            from ouroboros.gateway.tasks import _render_attachment_lines
+        return _reject_promoted_after_attachment_stage(
+            workspace_outcome, attachment_manifest,
+        )
+    if not _relocate_promoted_attachments(task, tid, attachment_manifest):
+        return _reject_promoted_after_attachment_stage({
+            "status": "needs_manual_target",
+            "reason": "attachment_admission_rejected",
+            "detail": "Attachment staging could not be finalized (reason=staging_unavailable).",
+            "attachment_manifest": [
+                {
+                    "ordinal": row.get("ordinal", index),
+                    "status": "rejected",
+                    "reason": "staging_unavailable",
+                    "label": str(row.get("label") or f"attachment {index + 1}"),
+                }
+                for index, row in enumerate(attachment_manifest)
+            ],
+            "task_id": tid,
+        }, attachment_manifest)
+    if attachment_manifest:
+        from ouroboros.gateway.tasks import _render_attachment_lines
 
-            attachment_root = pathlib.Path(str(task.get("drive_root") or DRIVE_ROOT))
-            manifest = stage_task_attachments(attachment_root, tid, attachment_uploads)
-            rendered = _render_attachment_lines(manifest)
-            if rendered:
-                task["text"] = f"{task['text']}\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]"
-                task["attachment_images"] = [item for item in manifest if item.get("is_image")]
-        except Exception:
-            log.warning("promote: attachment staging failed for %s", tid, exc_info=True)
+        rendered = _render_attachment_lines(attachment_manifest)
+        task["text"] = f"{task['text']}\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]"
+        public_manifest = [dict(row) for row in attachment_manifest]
+        task["attachments"] = public_manifest
+        task["attachment_images"] = [row for row in public_manifest if row.get("is_image")]
+        if isinstance(task.get("task_contract"), dict):
+            task["task_contract"]["attachment_manifest"] = public_manifest
     attach_task_contract(task)
     admitted = ctx.enqueue_task(task)
     if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-        return {
+        return _reject_promoted_after_attachment_stage({
             "status": "needs_manual_target",
             "reason": str(admitted.get("_admission_blocked") or "admission_fence"),
             "project_lifecycle": str(admitted.get("_project_lifecycle") or ""),
             "task_id": tid,
-        }
+        }, attachment_manifest)
     # A positive promote confirmation is allowed only after the durable queue
     # projection exists.  The event handler writes the scheduled task result
     # after the routing receipt; keeping that last step outside this function
     # makes the result itself the cross-process admission receipt.
     persist_snapshot = getattr(ctx, "persist_queue_snapshot", None)
     if not callable(persist_snapshot):
-        return {
+        return _reject_promoted_after_attachment_stage({
             "status": "needs_manual_target",
             "reason": "queue_snapshot_persist_unavailable",
             "task_id": tid,
             "admission_started": True,
-        }
+        }, attachment_manifest)
     try:
         if persist_snapshot(reason="promote_chat_to_task") is False:
-            return {
+            return _reject_promoted_after_attachment_stage({
                 "status": "needs_manual_target",
                 "reason": "queue_snapshot_persist_failed",
                 "task_id": tid,
                 "admission_started": True,
-            }
+            }, attachment_manifest)
     except Exception:
         log.warning("promote: queue snapshot persist failed for %s", tid, exc_info=True)
-        return {
+        return _reject_promoted_after_attachment_stage({
             "status": "needs_manual_target",
             "reason": "queue_snapshot_persist_failed",
             "task_id": tid,
             "admission_started": True,
-        }
+        }, attachment_manifest)
     # v6.82 (P5) disclosed residual: a PROMOTED root carries the host-attested
     # `cancelable` marker from its first RUNNING relay, not from enqueue — the
     # promote path emits no owner-facing progress frame of its own, and minting a
@@ -723,6 +927,8 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     # PENDING the Dashboard Activity row cancels it; the card action appears once
     # it starts.
     outcome = {"status": "scheduled", "task_id": tid}
+    if attachment_manifest:
+        outcome["attachment_manifest"] = [dict(row) for row in attachment_manifest]
     if effective_pid:
         outcome["project_id"] = effective_pid
     if source_note:
@@ -1067,6 +1273,15 @@ def _run_chat_task(
     ``ephemeral`` marks a SHORT-LIVED same-route turn (run on a separate agent
     instance while the shared chat agent is busy): it carries _ephemeral_turn so
     the task pipeline skips long-term memory / reflection / evolution writes."""
+    task: Optional[dict] = None
+    client_msg_id = ""
+    if task_metadata:
+        _cmid_ref = task_metadata.get("origin_message_ref")
+        if isinstance(_cmid_ref, dict):
+            client_msg_id = str(_cmid_ref.get("client_message_id") or "")
+        if not client_msg_id:
+            client_msg_id = str(task_metadata.get("client_message_id") or "")
+    kind = "ephemeral_decision" if ephemeral else "direct_chat"
     try:
         from ouroboros.contracts.task_contract import attach_task_contract
 
@@ -1097,19 +1312,6 @@ def _run_chat_task(
             pid = str(task_metadata.get("project_id") or "").strip()
             if pid:
                 task["project_id"] = pid
-                # A real project-thread conversation task is bound to its project so
-                # the frontend (all_task_bindings) recognises it and never offers a
-                # stray "turn into project" button (P2). Ephemeral same-route turns
-                # are transient decisions — never bound.
-                if not ephemeral:
-                    try:
-                        from ouroboros.projects_registry import bind_task_to_project
-                        bind_task_to_project(
-                            DRIVE_ROOT, task["id"], pid, chat_id,
-                            origin=_origin_from_mapping(task_metadata, absent="mid_task_no_origin"),
-                        )
-                    except Exception as exc:
-                        _report_binding_failure(task["id"], pid, exc, path="direct_project_turn")
         if image_data:
             # image_data is (base64, mime) or (base64, mime, caption). The caption
             # still seeds task['text'] (and the legacy inline image path below) so a
@@ -1132,18 +1334,50 @@ def _run_chat_task(
         meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
         uploads = meta.get("chat_attachment_uploads")
         if uploads:
-            from ouroboros.artifacts import stage_task_attachments
+            from ouroboros.artifacts import (
+                attachment_manifest_has_rejections,
+                remove_staged_attachments,
+                stage_task_attachments,
+            )
             from ouroboros.gateway.tasks import _render_attachment_lines
 
             manifest = stage_task_attachments(DRIVE_ROOT, str(task["id"]), uploads)
+            rendered = _render_attachment_lines(manifest)
+            if attachment_manifest_has_rejections(manifest):
+                remove_staged_attachments(manifest)
+                send_with_budget(
+                    chat_id,
+                    "⚠️ Task was not started because one or more declared attachments "
+                    f"could not be staged.\n{rendered}",
+                )
+                return
             if manifest:
+                manifest = [dict(row) for row in manifest]
                 task["drive_root"] = str(DRIVE_ROOT)
-                task["attachment_images"] = [m for m in manifest if m.get("is_image")]
-                rendered = _render_attachment_lines(manifest)
+                task["attachments"] = manifest
+                task["attachment_images"] = [
+                    m for m in manifest
+                    if str(m.get("status") or "staged") == "staged" and m.get("is_image")
+                ]
                 if rendered:
                     task["text"] = f"{task.get('text') or ''}\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]"
                 task.pop("image_base64", None)
                 task.pop("image_mime", None)
+        # A rejected initial UI task must leave no partial project assignment.
+        # Bind only after all declared attachments have passed admission.
+        pid = str(task.get("project_id") or "").strip()
+        if pid and not ephemeral:
+            try:
+                from ouroboros.projects_registry import bind_task_to_project
+
+                bind_task_to_project(
+                    DRIVE_ROOT, task["id"], pid, chat_id,
+                    origin=_origin_from_mapping(
+                        task_metadata or {}, absent="mid_task_no_origin",
+                    ),
+                )
+            except Exception as exc:
+                _report_binding_failure(task["id"], pid, exc, path="direct_project_turn")
         if not task["text"]:
             task["text"] = "(image attached)" if image_data else ""
         # Cluster B: proactively coin a project name for a fresh MAIN-CHAT direct card
@@ -1159,9 +1393,40 @@ def _run_chat_task(
         with _active_chat_task_lock:
             _active_chat_task_ids[chat_id] = str(task["id"])
         try:
-            events = agent.handle_task(task)
-            for e in events:
-                get_event_q().put(e)
+
+            pid = str(task.get("project_id") or "")
+
+            from supervisor.active_activity import track_direct_activity
+
+            with track_direct_activity(
+                activity_id=str(task["id"]),
+                chat_id=int(chat_id or 0),
+                client_message_id=client_msg_id,
+                project_id=pid,
+                kind=kind,
+                phase="thinking",
+            ):
+                # Announce the authoritative start immediately (owner decision 2A):
+                # the client's `Sending...` retires on this frame, not on a socket
+                # echo, and the frame carries the activity<->client_message_id link
+                # so even a turn that fails before its first LLM round concludes
+                # cleanly via its keyed error final.
+                try:
+                    from supervisor.message_bus import get_bridge
+
+                    get_bridge().send_chat_action(
+                        int(chat_id or 0),
+                        "typing",
+                        activity_id=str(task["id"]),
+                        client_message_id=client_msg_id,
+                        phase="thinking",
+                        kind=kind,
+                    )
+                except Exception:
+                    log.debug("Direct-turn start typing announce failed", exc_info=True)
+                events = agent.handle_task(task)
+                for e in events:
+                    get_event_q().put(e)
         finally:
             with _active_chat_task_lock:
                 if _active_chat_task_ids.get(chat_id) == str(task["id"]):
@@ -1179,7 +1444,29 @@ def _run_chat_task(
             },
         )
         try:
-            send_with_budget(chat_id, err_msg)
+            # Key the error final with the turn's activity id so the client
+            # concludes exactly this turn (active set, 4A) instead of leaving
+            # its `Sending.../Thinking...` state to an unkeyed sweep. If the
+            # failure happened before the start announce was broadcast, the
+            # client has no activity<->client_message_id link yet, so announce
+            # it first: the keyed final right after then retires both the
+            # activity and its linked `Sending...` submission.
+            failed_task_id = str(task.get("id") or "") if isinstance(task, dict) else ""
+            if failed_task_id and client_msg_id:
+                try:
+                    from supervisor.message_bus import get_bridge
+
+                    get_bridge().send_chat_action(
+                        int(chat_id or 0),
+                        "typing",
+                        activity_id=failed_task_id,
+                        client_message_id=client_msg_id,
+                        phase="thinking",
+                        kind=kind,
+                    )
+                except Exception:
+                    log.debug("Failed-turn typing announce failed", exc_info=True)
+            send_with_budget(chat_id, err_msg, task_id=failed_task_id)
         except Exception:
             log.debug("Suppressed exception", exc_info=True)
 
@@ -1502,6 +1789,7 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
                 out_q.put(e2)
         except Exception as _e:
             _log_worker_crash(wid, _drive, "handle_task", _e, _tb.format_exc())
+            return
 
 
 def _write_failure_result(
@@ -1924,6 +2212,8 @@ def kill_workers(
     archive_service_logs: bool = True,
     disable_reason: str = "",
     preserve_pending: bool = False,
+    preserve_running_task_ids: Optional[set[str]] = None,
+    reconcile_delegate_custody: bool = True,
 ) -> None:
     global _WORKER_POOL_DISABLED_REASON
     from supervisor import queue
@@ -1949,16 +2239,55 @@ def kill_workers(
         drained_ids = []
         try:
             done_status = terminal_status or "failed"
-            running_task_ids = set(RUNNING)
+            preserve_running = set(preserve_running_task_ids or ())
+            running_task_ids = set(RUNNING) - preserve_running
             interrupted_roots = {
                 str((meta.get("task") or {}).get("root_task_id") or task_id)
                 for task_id, meta in RUNNING.items()
-                if isinstance(meta, dict)
+                if isinstance(meta, dict) and task_id not in preserve_running
             }
+
+            def _audit_delegate_terminal(task_id: str, trigger: str) -> None:
+                if not reconcile_delegate_custody:
+                    return
+                try:
+                    from ouroboros import delegate_terminal
+
+                    audit = delegate_terminal.terminal_reconcile_task(
+                        DRIVE_ROOT, task_id, trigger=trigger,
+                    )
+                    delegate_terminal.record_terminal_reconciliation(
+                        DRIVE_ROOT, task_id, audit,
+                    )
+                except Exception:
+                    log.warning(
+                        "Terminal delegate reconciliation failed for %s", task_id,
+                        exc_info=True,
+                    )
+
             for task_id in list(RUNNING):
                 meta = RUNNING.get(task_id) or {}
                 task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
+                if task_id in preserve_running:
+                    successor = dict(task)
+                    successor["_attempt"] = int(meta.get("attempt") or task.get("_attempt") or 1) + 1
+                    try:
+                        from ouroboros.owner_hurry import retry_reset
+
+                        retry_reset(
+                            queue._task_drive_for_task(task, str(task_id)),
+                            DRIVE_ROOT, str(task_id), reason="planned_restart_requeue",
+                        )
+                    except Exception:
+                        log.debug(
+                            "Planned-restart retry reset failed for %s", task_id,
+                            exc_info=True,
+                        )
+                    PENDING.insert(0, successor)
+                    RUNNING.pop(str(task_id), None)
+                    continue
                 try:
+                    _audit_delegate_terminal(str(task_id), "worker_pool_kill")
                     persisted = _write_failure_result(task_id, reason=result_reason, status=terminal_status)
                     if archive_service_logs:
                         try:
@@ -1974,11 +2303,15 @@ def kill_workers(
             if preserve_pending:
                 kept = []
                 for task in PENDING:
+                    if str(task.get("id") or "") in preserve_running:
+                        kept.append(task)
+                        continue
                     parent_id = str(task.get("parent_task_id") or "")
                     root_id = str(task.get("root_task_id") or "")
                     if parent_id and (parent_id in running_task_ids or root_id in interrupted_roots):
                         tid = str(task.get("id") or "")
                         if tid:
+                            _audit_delegate_terminal(tid, "pending_parent_interrupted")
                             persisted = _write_failure_result(
                                 tid,
                                 reason="Parent task was interrupted before this child started.",
@@ -1995,6 +2328,7 @@ def kill_workers(
                     tid = task.get("id")
                     if tid:
                         try:
+                            _audit_delegate_terminal(str(tid), "pending_pool_kill")
                             persisted = _write_failure_result(tid, reason=result_reason, status=terminal_status)
                         except Exception:
                             log.warning("Failed to write failure result for pending task %s", tid, exc_info=True)
@@ -2574,6 +2908,8 @@ def assign_tasks() -> None:
                             task_group_id=task.get("task_group_id"),
                             task_group=task.get("task_group"),
                             subagent_envelope=task.get("subagent_envelope"),
+                            configured_subagent=task.get("configured_subagent"),
+                            parent_cognitive_route=task.get("parent_cognitive_route"),
                             metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
                             result="Subagent assigned to a worker.",
                         )
@@ -2638,15 +2974,11 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
     crashed_tasks = []
     respawn_ids: List[int] = []
     for wid, w in list(WORKERS.items()):
-        # Variant A: a slot marked `reaping` is owned end-to-end by the background reaper
-        # (kill -> join -> archive -> respawn). Its proc is expected to die mid-reap, so the
-        # crash detector must NOT also respawn it — that double-respawn would orphan a live
-        # worker process. The reaper installs a fresh Worker (reaping=False) when done.
+        # The reaper owns marked slots through replacement; never double-respawn them.
         if getattr(w, "reaping", False):
             continue
         if not w.proc.is_alive():
-            # Reserve the dead slot before the main loop releases the queue lock
-            # to start its replacement. assign_tasks skips reaping slots.
+            # Reserve the dead slot before the queue lock is released.
             w.reaping = True
             dead_detections += 1
             if w.busy_task_id is not None:
@@ -2694,11 +3026,7 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                 task = meta.get("task") if isinstance(meta, dict) else None
                 if isinstance(task, dict):
                     task_type = str(task.get("type") or "")
-                    # A negative exitcode means the worker died from a signal
-                    # (SIGSEGV/SIGBUS/SIGABRT/SIGKILL). These are deterministic
-                    # infrastructure crashes: retrying the same runtime path
-                    # reproduces them and only burns budget, so they are terminal
-                    # for EVERY task type (not just deep_self_review).
+                    # Signal crashes are terminal infrastructure failures for every task type.
                     is_crash_signal = isinstance(exitcode, int) and exitcode < 0
                     crash_signal = -exitcode if is_crash_signal else None
                     chat_id = coerce_chat_identity(task.get("chat_id"), 0)
@@ -2807,6 +3135,8 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             task, str(w.busy_task_id), "failed",
                             reason_code=reason_code, cost_fields=r_cost_fields,
                         )
+                        from ouroboros.delegate_recovery import reconcile_unrecoverable_task
+                        reconcile_unrecoverable_task(DRIVE_ROOT, str(w.busy_task_id))
                     elif task_type == "evolution" and not bool(load_state().get("evolution_mode_enabled")):
                         # Evolution was stopped: do not resurrect a dead evolution
                         # worker into another cycle (mirrors the hard-timeout gate
@@ -2826,9 +3156,17 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             task, str(w.busy_task_id), "cancelled",
                             cost_fields=r_cost_fields,
                         )
+                        from ouroboros.delegate_recovery import reconcile_unrecoverable_task
+                        reconcile_unrecoverable_task(DRIVE_ROOT, str(w.busy_task_id))
                     else:
                         task = dict(task)
                         task["_attempt"] = attempt + 1
+                        from ouroboros.delegate_recovery import prepare_worker_crash_handoff
+                        recovery_handoff = prepare_worker_crash_handoff(
+                            DRIVE_ROOT, task, old_attempt=attempt, new_attempt=attempt + 1,
+                            worker_id=wid,
+                            exitcode=exitcode if isinstance(exitcode, int) else None,
+                        )
                         try:
                             from ouroboros.task_results import STATUS_INTERRUPTED, write_task_result
                             write_task_result(
@@ -2839,10 +3177,6 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                         except Exception:
                             log.debug("Failed to write interrupted status for %s", w.busy_task_id, exc_info=True)
                         try:
-                            # The ONE shared same-id requeue reset (§19.7.2 item 11):
-                            # the crash-requeue used to clean nothing, so the retried
-                            # attempt inherited the dead attempt's mailbox controls
-                            # and executable owner_hurry latch. Fail-soft inside.
                             from ouroboros.owner_hurry import retry_reset
 
                             retry_reset(
@@ -2858,6 +3192,10 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             if isinstance(admitted, dict) else ""
                         )
                         if admission_block:
+                            from ouroboros.delegate_recovery import veto_worker_retry_handoff
+                            veto_worker_retry_handoff(
+                                DRIVE_ROOT, str(w.busy_task_id), recovery_handoff, admission_block,
+                            )
                             reason_code = "worker_crash_retry_admission_blocked"
                             try:
                                 from ouroboros.task_results import STATUS_FAILED, write_task_result

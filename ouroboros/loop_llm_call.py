@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
 
 from ouroboros import model_concurrency
+from ouroboros.anthropic_native_custody import public_custody_projection
 from ouroboros.deadline_utils import seconds_until
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
@@ -887,6 +888,26 @@ def _send_main_candidate(
             return llm.chat(**kwargs)
 
 
+def _take_custom_receipts(
+    usage: Dict[str, Any],
+    msg: Dict[str, Any],
+    accumulated_usage: Dict[str, Any],
+) -> None:
+    from ouroboros.openai_chat_dispatch import (
+        CUSTOM_RECEIPTS_USAGE_KEY,
+        pop_custom_validation_receipts,
+    )
+    receipts = pop_custom_validation_receipts(usage, msg.get("tool_calls") or [])
+    accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
+    if receipts:
+        accumulated_usage[CUSTOM_RECEIPTS_USAGE_KEY] = receipts
+
+
+def _clear_custom_receipts(accumulated_usage: Dict[str, Any]) -> None:
+    from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
+    accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
+
+
 def call_llm_with_retry(
     llm: LLMClient,
     messages: List[Dict[str, Any]],
@@ -963,7 +984,7 @@ def call_llm_with_retry(
                     task_id=task_id,
                     call_id=f"{llm_call_id}_request",
                     call_type="llm_request",
-                    payload={
+                    payload=public_custody_projection({
                         "messages": messages,
                         "send_messages": send_messages,
                         "tools": tools or [],
@@ -973,7 +994,7 @@ def call_llm_with_retry(
                         "use_local": bool(use_local),
                         "allow_server_web_search": bool(allow_server_web_search),
                         "response_cache_bypass_requested": response_cache_bypass_requested,
-                    },
+                    }),
                     manifest={
                         "execution_id": execution_id,
                         "round_id": round_id,
@@ -994,6 +1015,7 @@ def call_llm_with_retry(
                 physical_context=physical_context, candidate_predicate=candidate_predicate,
             )
             msg = resp_msg
+            _take_custom_receipts(usage, msg, accumulated_usage)
             accumulated_usage.pop("_last_llm_error", None)
             accumulated_usage.pop("_last_llm_error_kind", None)
             accumulated_usage.pop("_last_llm_retry_same_request", None)
@@ -1014,10 +1036,10 @@ def call_llm_with_retry(
                     task_id=task_id,
                     call_id=f"{llm_call_id}_response",
                     call_type="llm_response",
-                    payload={
+                    payload=public_custody_projection({
                         "message": msg,
                         "usage": usage,
-                    },
+                    }),
                     manifest={
                         "execution_id": execution_id,
                         "round_id": round_id,
@@ -1146,6 +1168,7 @@ def call_llm_with_retry(
         except UsageAccountingError:
             raise  # Monetary/ledger rails are not provider failures.
         except Exception as e:
+            _clear_custom_receipts(accumulated_usage)
             if _record_llm_call_error(
                 e,
                 _LlmErrorContext(

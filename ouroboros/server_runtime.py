@@ -6,11 +6,8 @@ import asyncio
 from typing import Awaitable, Callable
 
 from ouroboros.provider_models import (
-    ANTHROPIC_DIRECT_DEFAULTS,
-    CLOUDRU_DIRECT_DEFAULTS,
-    GIGACHAT_DIRECT_DEFAULTS,
-    MINIMAX_DIRECT_DEFAULTS,
-    OPENAI_DIRECT_DEFAULTS,
+    DIRECT_PROVIDER_DEFAULTS,
+    DIRECT_PROVIDER_SCOPE_DEFAULTS,
     compute_direct_review_models_fallback,
     migrate_model_value,
 )
@@ -18,42 +15,19 @@ from ouroboros.config import SETTINGS_DEFAULTS, _DIRECT_PROVIDER_REVIEW_RUNS, _p
 from ouroboros.utils import utc_now_iso
 
 
+_MODEL_ROLE_SETTING_KEYS = {
+    "main": "OUROBOROS_MODEL",
+    "light": "OUROBOROS_MODEL_LIGHT",
+    "fallback": "OUROBOROS_MODEL_FALLBACKS",
+    "deep_self_review": "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
+}
 _DIRECT_PROVIDER_AUTO_DEFAULTS = {
-    "openai": {
-        "OUROBOROS_MODEL": OPENAI_DIRECT_DEFAULTS["main"],
-        "OUROBOROS_MODEL_HEAVY": OPENAI_DIRECT_DEFAULTS["heavy"],
-        "OUROBOROS_MODEL_LIGHT": OPENAI_DIRECT_DEFAULTS["light"],
-        "OUROBOROS_MODEL_FALLBACKS": OPENAI_DIRECT_DEFAULTS["fallback"],
-        "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENAI_DIRECT_DEFAULTS["deep_self_review"],
-    },
-    "anthropic": {
-        "OUROBOROS_MODEL": ANTHROPIC_DIRECT_DEFAULTS["main"],
-        "OUROBOROS_MODEL_HEAVY": ANTHROPIC_DIRECT_DEFAULTS["heavy"],
-        "OUROBOROS_MODEL_LIGHT": ANTHROPIC_DIRECT_DEFAULTS["light"],
-        "OUROBOROS_MODEL_FALLBACKS": ANTHROPIC_DIRECT_DEFAULTS["fallback"],
-        "OUROBOROS_MODEL_DEEP_SELF_REVIEW": ANTHROPIC_DIRECT_DEFAULTS["deep_self_review"],
-    },
-    "cloudru": {
-        "OUROBOROS_MODEL": CLOUDRU_DIRECT_DEFAULTS["main"],
-        "OUROBOROS_MODEL_HEAVY": CLOUDRU_DIRECT_DEFAULTS["heavy"],
-        "OUROBOROS_MODEL_LIGHT": CLOUDRU_DIRECT_DEFAULTS["light"],
-        "OUROBOROS_MODEL_FALLBACKS": CLOUDRU_DIRECT_DEFAULTS["fallback"],
-    },
-    "gigachat": {
-        "OUROBOROS_MODEL": GIGACHAT_DIRECT_DEFAULTS["main"],
-        "OUROBOROS_MODEL_HEAVY": GIGACHAT_DIRECT_DEFAULTS["heavy"],
-        "OUROBOROS_MODEL_LIGHT": GIGACHAT_DIRECT_DEFAULTS["light"],
-        "OUROBOROS_MODEL_FALLBACKS": GIGACHAT_DIRECT_DEFAULTS["fallback"],
-    },
-    # NB: no OUROBOROS_MODEL_DEEP_SELF_REVIEW — MiniMax guarantees only a 512K
-    # window floor ("up to 1M"), below the 1M deep-review sizing target, so the
-    # slot takes the same clear-instead-of-fill branch as Cloud.ru/GigaChat.
-    "minimax": {
-        "OUROBOROS_MODEL": MINIMAX_DIRECT_DEFAULTS["main"],
-        "OUROBOROS_MODEL_HEAVY": MINIMAX_DIRECT_DEFAULTS["heavy"],
-        "OUROBOROS_MODEL_LIGHT": MINIMAX_DIRECT_DEFAULTS["light"],
-        "OUROBOROS_MODEL_FALLBACKS": MINIMAX_DIRECT_DEFAULTS["fallback"],
-    },
+    provider: {
+        setting_key: defaults[role]
+        for role, setting_key in _MODEL_ROLE_SETTING_KEYS.items()
+        if role in defaults
+    }
+    for provider, defaults in DIRECT_PROVIDER_DEFAULTS.items()
 }
 # Legacy values that should be auto-replaced with a provider's direct defaults.
 # Cloud.ru, GigaChat, and MiniMax intentionally have NO entry: such a provider-only user's
@@ -117,23 +91,59 @@ _LEGACY_GEMINI_3_FLASH_PREVIEW = "google/gemini-" + "3-flash-preview"
 for _legacy_defaults in _DIRECT_PROVIDER_LEGACY_DEFAULTS.values():
     for _slot in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT"):
         _legacy_defaults[_slot].add(_LEGACY_GEMINI_31_FLASH_LITE)
-# Outgoing SHIPPED OpenRouter defaults (v6.81 and earlier), applied for EVERY
+# Outgoing SHIPPED OpenRouter defaults (through v6.104), applied for EVERY
 # exclusive-direct provider (incl. cloudru/gigachat/minimax, which have no per-provider
-# legacy table): before v6.82.0 a stored copy of the shipped default matched the
+# legacy table): before each defaults refresh a stored copy of the shipped default matched the
 # `current in {"", default}` check because SETTINGS_DEFAULTS still carried it;
 # after the defaults refresh these stored copies are still "the old DEFAULT, not
 # an explicit choice" and must keep migrating to the provider slots. All models
 # here stay LIVE (no retirement remap).
 _PRIOR_SHIPPED_SLOT_DEFAULTS = {
-    "OUROBOROS_MODEL": {"google/gemini-3.5-flash"},
+    "OUROBOROS_MODEL": {
+        "google/gemini-3.5-flash",
+        "x-ai/grok-4.5",
+    },
     "OUROBOROS_MODEL_HEAVY": {"google/gemini-3.5-flash"},
-    "OUROBOROS_MODEL_LIGHT": {"google/gemini-3.5-flash"},
+    "OUROBOROS_MODEL_LIGHT": {
+        "google/gemini-3.5-flash",
+        "google/gemini-3.6-flash",
+    },
     "OUROBOROS_MODEL_FALLBACKS": {"anthropic/claude-sonnet-4.6"},
     # v6.81's shipped deep-review value: an upgraded direct-provider install still
     # carries it, and it is just as unreachable without an OpenRouter credential.
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW": {"openai/gpt-5.5-pro", "openai::gpt-5.5-pro"},
 }
-_ALL_MODEL_SLOT_KEYS = tuple(_DIRECT_PROVIDER_AUTO_DEFAULTS["openai"].keys())
+# Heavy is no longer an active role, but its bounded migration reader still
+# needs to distinguish an owner's custom value from values Ouroboros itself
+# shipped as defaults.  Equality has always been the provider-default
+# migration authority for these slots.  Keeping the classification here lets
+# active consumers ignore Heavy without laundering an old default into a new
+# explicit API actor.
+_RETIRED_SHIPPED_HEAVY_DEFAULTS = frozenset({
+    # Pre-Heavy CODE defaults that were migrated into the Heavy key on upgrade.
+    "anthropic/claude-opus-4.7",
+    "anthropic::claude-opus-4-7",
+    # Provider defaults retired in the same change that removed active Heavy.
+    "openai::gpt-5.6-sol",
+    "anthropic::claude-opus-5",
+    # Prior GigaChat default replaced before Heavy retirement.
+    "gigachat::GigaChat-3-Ultra",
+})
+_SHIPPED_LEGACY_HEAVY_DEFAULTS = frozenset({
+    *_PRIOR_SHIPPED_SLOT_DEFAULTS.get("OUROBOROS_MODEL_HEAVY", set()),
+    *(
+        value
+        for provider_defaults in _DIRECT_PROVIDER_LEGACY_DEFAULTS.values()
+        for value in provider_defaults.get("OUROBOROS_MODEL_HEAVY", set())
+    ),
+    *(
+        str(provider_defaults.get("heavy", "") or "").strip()
+        for provider_defaults in DIRECT_PROVIDER_DEFAULTS.values()
+        if str(provider_defaults.get("heavy", "") or "").strip()
+    ),
+    *_RETIRED_SHIPPED_HEAVY_DEFAULTS,
+})
+_ALL_MODEL_SLOT_KEYS = tuple(_MODEL_ROLE_SETTING_KEYS.values())
 _SCOPE_REVIEW_LEGACY_DEFAULTS = frozenset({
     "",
     "anthropic/claude-opus-4.6",
@@ -206,6 +216,13 @@ def _refresh_retired_model_defaults(settings: dict) -> tuple[dict, list[str]]:
         "OUROBOROS_SCOPE_REVIEW_MODEL",
     ]
     for key in keys:
+        # A local Heavy value is explicit owner routing intent.  Preserve its
+        # exact model string even when it happens to match a globally retired
+        # cloud identifier; the local runtime may intentionally serve that ID.
+        if key == "OUROBOROS_MODEL_HEAVY" and _truthy_setting(
+            normalized.get("USE_LOCAL_HEAVY")
+        ):
+            continue
         value = _setting_text(normalized, key)
         replacement = _RETIRED_MODEL_DEFAULT_REPLACEMENTS.get(value)
         if replacement:
@@ -307,19 +324,9 @@ def _normalize_direct_scope_review_model(settings: dict, provider: str) -> str:
     current = migrate_model_value(provider, current_raw) if current_raw else ""
     default = migrate_model_value(provider, default_raw) if default_raw else ""
     provider_prefix = _provider_prefix(provider)
-    if provider == "openai":
-        # Keep the OpenAI-only branch explicit even though the shipped scope-review
-        # default is an OpenAI model again (openai/gpt-5.6-terra as of v6.82.0; it was
-        # cross-provider fable-5 in v6.55.0-v6.81 and this branch kept the slot
-        # callable then). Pinning the designated OpenAI scope reviewer here keeps the
-        # slot on the terra reviewer (1M-window designated default) rather than on
-        # whatever main model the install migrated to.
-        auto_value = migrate_model_value(provider, "openai/gpt-5.6-terra")
-    else:
-        auto_value = migrate_model_value(
-            provider,
-            _DIRECT_PROVIDER_AUTO_DEFAULTS.get(provider, {}).get("OUROBOROS_MODEL", ""),
-        )
+    auto_value = migrate_model_value(
+        provider, DIRECT_PROVIDER_SCOPE_DEFAULTS.get(provider, ""),
+    )
     legacy_defaults = {
         migrate_model_value(provider, item) for item in _SCOPE_REVIEW_LEGACY_DEFAULTS
     }
@@ -402,19 +409,36 @@ def has_local_routing(settings: dict) -> bool:
     """Return True when a task-capable model slot is routed to local."""
     return any(
         _truthy_setting(settings.get(k))
-        for k in ("USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK")
+        for k in ("USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK")
     )
 
 
 def needs_local_model_autostart(settings: dict) -> bool:
-    """Return True when any configured model lane needs the local server running."""
-    return any(
+    """Return True when a configured root lane or API subagent needs local serving."""
+    if any(
         _truthy_setting(settings.get(k))
         for k in (
-            "USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT",
+            "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT",
             "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
         )
-    )
+    ):
+        return True
+    try:
+        from ouroboros.configured_subagents import resolve_configured_subagents
+
+        resolution = resolve_configured_subagents(settings)
+        config = resolution.config
+        return bool(
+            config
+            and config.enabled
+            and any(
+                row.route.kind == "api_model"
+                and row.route.target_id.endswith(" (local)")
+                for row in config.items
+            )
+        )
+    except Exception:
+        return False
 
 
 def has_startup_ready_provider(settings: dict) -> bool:
@@ -467,18 +491,38 @@ def _clear_shipped_defaults_for_local_only(settings: dict) -> list[str]:
     return changed
 
 
+def _clear_shipped_legacy_heavy(settings: dict) -> list[str]:
+    """Remove only old product-authored Heavy defaults before actor migration.
+
+    ``USE_LOCAL_HEAVY`` is explicit saved owner intent, so it wins even while
+    the local source is temporarily unavailable.  Arbitrary Heavy values also
+    survive verbatim; only values already classified by the existing default
+    migration tables are removed.
+    """
+    current = _setting_text(settings, "OUROBOROS_MODEL_HEAVY")
+    if not current or _truthy_setting(settings.get("USE_LOCAL_HEAVY")):
+        return []
+    if current not in _SHIPPED_LEGACY_HEAVY_DEFAULTS:
+        return []
+    settings["OUROBOROS_MODEL_HEAVY"] = ""
+    return ["OUROBOROS_MODEL_HEAVY"]
+
+
 def apply_runtime_provider_defaults(settings: dict) -> tuple[dict, bool, list[str]]:
     """Auto-fill safe runtime defaults for the agreed provider cases."""
     normalized, retired_changed = _refresh_retired_model_defaults(settings)
+    legacy_heavy_changed = _clear_shipped_legacy_heavy(normalized)
     provider = _exclusive_direct_remote_provider(normalized)
 
     if not provider:
         normalized, scope_changed = _migrate_scope_review_prior_default(normalized)
         local_changed = _clear_shipped_defaults_for_local_only(normalized)
-        changed_keys = _unique_changed_keys(retired_changed + scope_changed + local_changed)
+        changed_keys = _unique_changed_keys(
+            retired_changed + legacy_heavy_changed + scope_changed + local_changed
+        )
         return normalized, bool(changed_keys), changed_keys
 
-    changed_keys: list[str] = list(retired_changed)
+    changed_keys: list[str] = [*retired_changed, *legacy_heavy_changed]
     provider_defaults = _DIRECT_PROVIDER_AUTO_DEFAULTS[provider]
     main_shipped_default = _setting_text(SETTINGS_DEFAULTS, "OUROBOROS_MODEL")
     for key in _ALL_MODEL_SLOT_KEYS:
@@ -500,22 +544,27 @@ def apply_runtime_provider_defaults(settings: dict) -> tuple[dict, bool, list[st
         raw_current = _setting_text(normalized, key)
         current = migrate_model_value(provider, raw_current)
         default = _setting_text(SETTINGS_DEFAULTS, key)
+        migrated_default = migrate_model_value(provider, default)
         auto_value = provider_defaults[key]
         legacy_defaults = (
             _DIRECT_PROVIDER_LEGACY_DEFAULTS.get(provider, {}).get(key, set())
             | _PRIOR_SHIPPED_SLOT_DEFAULTS.get(key, set())
         )
-        # Heavy/Light default EMPTY -> Main (role-model, v6.39). Their pre-role-model
+        # Light default EMPTY -> Main (role-model, v6.39). Its pre-role-model
         # default was the shared Main default, so a stored value equal to it is the old
         # "follow Main" default and migrates to the provider slot exactly like "".
         extra_default = (
             main_shipped_default
-            if key in ("OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT")
+            if key == "OUROBOROS_MODEL_LIGHT"
             else ""
         )
+        migrated_extra_default = migrate_model_value(provider, extra_default)
         next_value = (
             auto_value
-            if current in {"", default, extra_default, *legacy_defaults}
+            if current in {
+                "", default, migrated_default, extra_default,
+                migrated_extra_default, *legacy_defaults,
+            }
             else current
         )
         if next_value != raw_current:

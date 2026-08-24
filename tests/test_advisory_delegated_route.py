@@ -203,9 +203,14 @@ def test_commit_gate_bypass_detection_rides_the_route_slot_aware_predicate():
 
     from ouroboros.tools import git as git_mod
 
-    source = inspect.getsource(git_mod._run_reviewed_stage_cycle)
-    assert "advisory_gate_unavailable" in source
-    assert 'os.environ.get("ANTHROPIC_API_KEY"' not in source
+    # The bypass decision lives in the advisory+tests gate helper the stage
+    # cycle calls (extracted whole at the function-size gate).
+    stage_source = inspect.getsource(git_mod._run_reviewed_stage_cycle)
+    assert "_advisory_and_tests_gate" in stage_source
+    assert 'os.environ.get("ANTHROPIC_API_KEY"' not in stage_source
+    gate_source = inspect.getsource(git_mod._advisory_and_tests_gate)
+    assert "advisory_gate_unavailable" in gate_source
+    assert 'os.environ.get("ANTHROPIC_API_KEY"' not in gate_source
 
 
 def _clear_session_route_envs(monkeypatch):

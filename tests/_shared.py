@@ -7,6 +7,7 @@ not fixtures — many callers need them at module import time.
 """
 from __future__ import annotations
 
+import json
 import sys
 import types
 from unittest.mock import MagicMock
@@ -79,3 +80,29 @@ def make_safe_mock_ctx(tmp_path, *, repo_dir=None):
     ctx.emit_progress_fn = lambda *a, **kw: None
     ctx.task_id = "test-task"
     return ctx
+
+
+def configure_test_subagent(
+    monkeypatch,
+    *,
+    subagent_id: str = "api-scout",
+    kind: str = "api_model",
+    target: str = "openai/gpt-5.6-sol",
+    profile_id: str = "",
+    effort: str = "high",
+) -> str:
+    """Install one explicit Available-subagent row for scheduling tests."""
+    route = {"kind": kind, "target_id": target}
+    if kind == "agent_session" and profile_id:
+        route["credential_profile_id"] = profile_id
+    monkeypatch.setenv("OUROBOROS_SUBAGENTS", json.dumps({
+        "enabled": True,
+        "items": [{
+            "subagent_id": subagent_id,
+            "name": "Test subagent",
+            "recommended_use": "Production-shaped test actor.",
+            "route": route,
+            "effort": effort,
+        }],
+    }))
+    return subagent_id

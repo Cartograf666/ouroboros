@@ -20,63 +20,43 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { bindStatusSurface, claudexorStatus } from './claudexor_status_store.js';
+import { bindStatusSurface, boundedStatusRefresh, claudexorStatus } from './claudexor_status_store.js';
 import { formatRelativeAge } from './ui_helpers.js';
+import * as routeEditor from './route_editor_primitives.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 export const ROUTE_KIND_API = 'api_chat';
-export const ROUTE_KIND_SESSION = 'agent_session';
+export const ROUTE_KIND_SESSION = routeEditor.ROUTE_KIND_AGENT_SESSION;
 // The route select's single API entry. The target model id never lives in
 // the select — display always matches the stored target (finding #6c: a
 // fresh row used to DISPLAY the first catalog model while storing '').
-export const API_ROUTE_CHOICE = 'api';
+export const API_ROUTE_CHOICE = routeEditor.API_ROUTE_CHOICE;
 
-export const EFFORT_CHOICES = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+export const EFFORT_CHOICES = routeEditor.EFFORT_CHOICES;
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
 // ---------------------------------------------------------------------------
 
 export function mintSlotId(prefix, takenIds) {
-    const taken = new Set(takenIds || []);
-    for (let attempt = 0; attempt < 1000; attempt += 1) {
-        const candidate = `${prefix}_${Math.random().toString(36).slice(2, 8)}`;
-        if (!taken.has(candidate)) return candidate;
-    }
-    return `${prefix}_${Date.now().toString(36)}`;
+    return routeEditor.mintStableId(prefix, takenIds);
 }
 
 export function encodeRouteChoice(row) {
-    const kind = row?.route?.kind || ROUTE_KIND_API;
-    const target = String(row?.route?.target_id || '');
-    if (kind === ROUTE_KIND_SESSION) {
-        return `session:${splitSessionTarget(target).harness}`;
-    }
-    return API_ROUTE_CHOICE;
+    return routeEditor.encodeRouteChoice(row);
 }
 
 export function decodeRouteChoice(value) {
-    const raw = String(value || '');
-    if (raw.startsWith('session:')) {
-        return { kind: ROUTE_KIND_SESSION, harness: raw.slice('session:'.length) };
-    }
-    // Every non-session choice is the API route; the target comes from the
-    // free-text input beside the select, never from the choice value.
-    return { kind: ROUTE_KIND_API };
+    return routeEditor.decodeRouteChoice(value, { apiKind: ROUTE_KIND_API });
 }
 
 // Claudexor's own reviewer-panel spelling: harness[=model]. Never '::'.
 export function composeSessionTarget(harness, model) {
-    const h = String(harness || '').trim();
-    const m = String(model || '').trim();
-    return m ? `${h}=${m}` : h;
+    return routeEditor.composeSessionTarget(harness, model);
 }
 
 export function splitSessionTarget(target) {
-    const raw = String(target || '');
-    const eq = raw.indexOf('=');
-    if (eq < 0) return { harness: raw, model: '' };
-    return { harness: raw.slice(0, eq), model: raw.slice(eq + 1) };
+    return routeEditor.splitSessionTarget(target);
 }
 
 // `catalogKnown` / `accountsKnown` = the matching facet of the status payload
@@ -93,77 +73,30 @@ export function splitSessionTarget(target) {
 // owner's saved value is almost certainly still there. The two facets are
 // INDEPENDENT: a failed account read must not silence the catalog's own honest
 // verdict.
-function undiscoveredLabel(value, known) {
-    return `${value} (${known ? 'not in discovery' : 'not checked'})`;
-}
-
 export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogKnown = true } = {}) {
-    const sessionValues = (harnesses || [])
-        .filter((h) => h && h.id)
-        .map((h) => ({
-            // Provider = the harness name itself; the engine underneath is an
-            // implementation detail the row never spells.
-            value: `session:${h.id}`,
-            label: `${h.display_name || h.id} (agent)`,
-            disabled: h.status && h.status !== 'ok' && !h.enabled,
-        }));
-    // A SAVED session route whose harness discovery no longer lists (daemon
-    // down, signed out) must keep an option, or the browser silently redraws
-    // the row as the first choice — same rule as profileOptionsFor.
-    const savedChoice = String(currentChoice || '');
-    if (savedChoice.startsWith('session:') && !sessionValues.some((o) => o.value === savedChoice)) {
-        sessionValues.push({
-            value: savedChoice,
-            label: undiscoveredLabel(savedChoice.slice('session:'.length), catalogKnown),
-        });
-    }
-    const groups = [{ label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'API model' }] }];
-    // With no daemon the group used to VANISH, while the section copy above still
-    // promised subscription delivery — the owner saw a broken promise and nowhere
-    // to go. Say why it is empty instead of hiding it. Accounts now live in the
-    // SAME tab, directly above, so the pointer is finally a place the owner can
-    // reach without leaving the page. Emptiness states ABSENCE only when the
-    // catalog was actually read; unread, the precise sentence (never asked vs
-    // read died) is the tab banner's, and this label only points at it.
-    groups.push(sessionValues.length
-        ? { label: 'Agents — subscriptions', options: sessionValues }
-        : { label: 'Agents — subscriptions', options: [{
-            value: '', disabled: true,
-            label: catalogKnown
-                ? 'None available — connect one under Accounts above'
-                : 'Could not be listed — see the service banner above',
-        }] });
-    return groups;
+    return routeEditor.routeChoiceGroups({ harnesses, currentChoice, catalogKnown });
 }
 
 export function indexProfilesByHarness(payload) {
-    // The REAL ControlCredentialProfilesResponse shape, same reader as
-    // harness_accounts.accountRows: `profiles` is an array of WRAPPERS
-    // `{profile, status, identity}` carrying snake_case fields. Reading flat
-    // camelCase off the wrapper matched nothing, so every session row's
-    // credential-profile picker was silently empty. Exported so the wire test can
-    // hold it against the same golden body the account list consumes.
-    const byHarness = {};
-    const profiles = payload?.profiles?.profiles || [];
-    for (const wrapper of Array.isArray(profiles) ? profiles : []) {
-        const profile = wrapper?.profile || {};
-        const harness = String(profile.harness_id || '');
-        const id = String(profile.profile_id || '');
-        if (!harness || !id) continue;
-        (byHarness[harness] = byHarness[harness] || []).push(id);
-    }
-    return byHarness;
+    return routeEditor.indexProfilesByHarness(payload);
+}
+
+// One index entry, whichever spelling it arrived in: the index emits
+// `{id, enabled}` objects; older call sites and tests still hand plain id
+// strings, which read as enabled (the same fail-open rule as the index).
+function profileEntry(entry) {
+    return routeEditor.profileEntry(entry);
 }
 
 export function buildReviewerSlotsSetting(state) {
     const rowOut = (row) => {
         const out = {
             slot_id: String(row.slot_id || ''),
-            route: { kind: row.route.kind, target_id: String(row.route.target_id || '') },
+            route: routeEditor.serializeRouteSpec(row.route, {
+                apiKind: ROUTE_KIND_API,
+                credentialField: 'profile_id',
+            }),
         };
-        if (row.route.kind === ROUTE_KIND_SESSION && row.route.profile_id) {
-            out.route.profile_id = String(row.route.profile_id);
-        }
         if (row.effort) out.effort = String(row.effort);
         return out;
     };
@@ -231,7 +164,7 @@ export function harnessModelsKnown(harness, catalogKnown = true) {
     // per-harness `harness_models` probe). Reading the empty list as discovery
     // then labelled a saved model "(not in discovery)", which claims a
     // successful discovery proved its absence — while no discovery happened.
-    return Boolean(catalogKnown) && !String(harness?.models_error || '');
+    return routeEditor.harnessModelsKnown(harness, catalogKnown);
 }
 
 export function modelsGapNote(harness, catalogKnown = true) {
@@ -239,8 +172,7 @@ export function modelsGapNote(harness, catalogKnown = true) {
     // the catalog itself was read: with the catalog unread the section note
     // above already explains everything, and this would be a second sentence
     // for the same silence.
-    return catalogKnown && String(harness?.models_error || '')
-        ? 'model list could not be read' : '';
+    return routeEditor.modelsGapNote(harness, catalogKnown);
 }
 
 export function sessionModelOptions(harness, currentModel, { catalogKnown = true } = {}) {
@@ -250,19 +182,7 @@ export function sessionModelOptions(harness, currentModel, { catalogKnown = true
     // lists keeps a "(not in discovery)" option, or the browser silently
     // redraws the select as the first entry and the next Save erases the pin
     // (same rule as profileOptionsFor / routeChoiceGroups).
-    const models = harness?.models || [];
-    const options = [{ value: '', label: 'Engine default model' },
-        ...models.map((m) => ({ value: String(m.id || m.value || m), label: String(m.id || m.label || m) }))];
-    if (currentModel && !options.some((o) => o.value === currentModel)) {
-        // Gated on the MODEL read, not on the catalog read (see above): the
-        // option survives either way; an unread list says "(not checked)"
-        // instead of accusing the pin.
-        options.push({
-            value: currentModel,
-            label: undiscoveredLabel(currentModel, harnessModelsKnown(harness, catalogKnown)),
-        });
-    }
-    return options;
+    return routeEditor.sessionModelOptions(harness, currentModel, { catalogKnown });
 }
 
 export function profileOptionsFor(profiles, savedPin, { accountsKnown = true } = {}) {
@@ -271,19 +191,11 @@ export function profileOptionsFor(profiles, savedPin, { accountsKnown = true } =
     // select fell back to its first entry and redrew the row as "automatic rotation".
     // The pin only LOOKED gone — until the owner saved the panel, which then really
     // did delete it, silently widening which account the reviewer may spend.
-    const options = [{ value: '', label: 'Account: automatic rotation' },
-        ...(profiles || []).map((p) => ({ value: p, label: `Account: ${p} (pinned)` }))];
-    if (savedPin && !options.some((o) => o.value === savedPin)) {
-        options.push({
-            value: savedPin,
-            // The suffix is the ACCOUNTS facet's own verdict: only a read
-            // account store may state the search result "(not in discovery)";
-            // unread, the honest label is "(not checked)" — the pin is almost
-            // certainly still there, and nobody looked.
-            label: `Account: ${undiscoveredLabel(savedPin, accountsKnown)}`,
-        });
-    }
-    return options;
+    // A DISABLED account stays selectable, labeled "(disabled)": the engine's
+    // typed refusal is the authority on whether a pinned run may use it
+    // (D-U6), so the label is honesty, not a gate — hiding or greying the
+    // option would be a second, client-side gate the design rejected.
+    return routeEditor.profileOptionsFor(profiles, savedPin, { accountsKnown });
 }
 
 export function pinnedAccountWarning({ triad = [], scope = [], advisory = null,
@@ -305,7 +217,7 @@ export function pinnedAccountWarning({ triad = [], scope = [], advisory = null,
         const pin = String(route.profile_id || '');
         if (!pin) continue;
         const harness = splitSessionTarget(route.target_id).harness;
-        if ((profilesByHarness[harness] || []).includes(pin)) continue;
+        if ((profilesByHarness[harness] || []).some((entry) => profileEntry(entry).id === pin)) continue;
         const label = `${harness} · ${pin}`;
         if (!missing.includes(label)) missing.push(label);
     }
@@ -403,8 +315,9 @@ export function renderReviewerSlotsSection() {
             </div>
             <div class="settings-inline-note">
                 Rows routed to a subscription never fall back to API spend: if every eligible window
-                is exhausted, the review waits for capacity. Plan review, task acceptance and skill
-                review are API-only surfaces today and keep running on the shipped default models.
+                is exhausted, the review waits for capacity. Task acceptance and skill review are
+                API-only surfaces today and keep running on the shipped default models; plan review
+                follows each triad row's own delivery.
             </div>
             <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
             <div id="reviewer-slots-pins" class="settings-inline-status" data-tone="warn" hidden></div>
@@ -412,7 +325,7 @@ export function renderReviewerSlotsSection() {
             <h4 class="reviewer-slots-heading">Triad slots <span class="muted" id="reviewer-triad-limit" title="The commit gate's real ceiling"></span></h4>
             <div id="reviewer-triad-rows" class="reviewer-slot-rows"></div>
             <div class="settings-toolbar">
-                <button type="button" class="settings-ghost-btn" id="btn-add-triad-slot">Add triad slot</button>
+                <button type="button" class="btn btn-default" id="btn-add-triad-slot">Add triad slot</button>
             </div>
             <h4 class="reviewer-slots-heading">Scope slots <span class="muted" id="reviewer-scope-limit" title="The scope pool's real width"></span></h4>
             <div class="settings-inline-note">An agent row reads the repository with its own read-only tools instead of
@@ -420,7 +333,7 @@ export function renderReviewerSlotsSection() {
                 confirmed at 200K or more; Ouroboros does not attest which files the agent opened.</div>
             <div id="reviewer-scope-rows" class="reviewer-slot-rows"></div>
             <div class="settings-toolbar">
-                <button type="button" class="settings-ghost-btn" id="btn-add-scope-slot">Add scope slot</button>
+                <button type="button" class="btn btn-default" id="btn-add-scope-slot">Add scope slot</button>
             </div>
             <h4 class="reviewer-slots-heading">Advisory pre-reviewer</h4>
             <div id="reviewer-advisory-row" class="reviewer-slot-rows"></div>
@@ -440,27 +353,14 @@ function harnessesById() {
 }
 
 function selectHtml(attrs, groups, selected) {
-    const options = groups.map((group) => {
-        const body = group.options.map((opt) => {
-            const sel = opt.value === selected ? ' selected' : '';
-            const dis = opt.disabled ? ' disabled' : '';
-            return `<option value="${escapeHtml(opt.value)}"${sel}${dis}>${escapeHtml(opt.label)}</option>`;
-        }).join('');
-        return group.label ? `<optgroup label="${escapeHtml(group.label)}">${body}</optgroup>` : body;
-    }).join('');
-    return `<select ${attrs}>${options}</select>`;
+    return routeEditor.selectHtml(attrs, groups, selected);
 }
 
 function effortSelectHtml(attrs, selected, surfaceDefault) {
     // Compact closed state (owner feedback on field proportions): the wordy
     // "Default (scope review effort)" label made this select as wide as the
     // model field. Which setting the default follows moves to the tooltip.
-    const options = [
-        { value: '', label: 'Default effort' },
-        ...EFFORT_CHOICES.map((effort) => ({ value: effort, label: effort })),
-    ];
-    return selectHtml(`${attrs} title="Reasoning effort — default: ${escapeHtml(surfaceDefault)}"`,
-        [{ label: '', options }], selected || '');
+    return routeEditor.effortSelectHtml(attrs, selected, surfaceDefault);
 }
 
 function rowHtml(row, group) {
@@ -491,7 +391,7 @@ function rowHtml(row, group) {
                 ${session ? selectHtml('data-slot-model aria-label="Harness model"', [{ label: '', options: modelOptions }], split.model) : ''}
                 ${session && profileOptions.length > 1 ? selectHtml('data-slot-profile aria-label="Credential account"', [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
                 ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort, surfaceDefault)}
-                <button type="button" class="settings-ghost-btn" data-slot-remove title="Remove this slot">Remove</button>
+                <button type="button" class="btn btn-default" data-slot-remove title="Remove this slot">Remove</button>
             </div>
             <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
         </div>
@@ -731,8 +631,14 @@ export async function reloadReviewerSlots() {
     }
     // ONE status read for the whole app (the accounts panel and the Subagents
     // section share this request; `includeModels` is sticky, so no later read
-    // downgrades the snapshot these selects depend on).
-    await state.store.refresh({ includeModels: true });
+    // downgrades the snapshot these selects depend on). Awaited only for a
+    // BOUNDED beat: this read can wake a cold Claudexor daemon and walk
+    // per-harness model discovery, and awaiting it outright held the Save
+    // button (loadSettings awaits this function) hostage for the whole probe.
+    // A warm daemon settles inside the beat and keeps the exact old
+    // semantics; a cold one keeps refreshing in the background and the status
+    // surface binding repaints these rows when the snapshot lands.
+    await boundedStatusRefresh(state.store);
     adoptStatusSnapshot();
     renderRows();
 }

@@ -30,9 +30,11 @@ import {
     facetGapClause,
     facetKnown,
     facetReadState,
+    nextUpAccount,
     readsFor,
     statusPayloadValid,
     statusUnavailableNote,
+    unifiedAccounts,
 } from '../modules/claudexor_status_store.js';
 
 // A payload shaped like the producer's own: `_status_payload` sets
@@ -614,6 +616,37 @@ test('any bound surface can keep the poll armed — not only the accounts panel'
     t.mock.timers.reset();
 });
 
+test('surface binding delegates a visible activation to its owner action', async () => {
+    const elements = { accounts: { offsetParent: {} }, hidden: { offsetParent: null } };
+    const doc = fakeDoc();
+    doc.getElementById = (id) => elements[id] || null;
+    const listeners = {};
+    const win = {
+        addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+        removeEventListener(type, fn) {
+            listeners[type] = (listeners[type] || []).filter((item) => item !== fn);
+        },
+        fire(type) { return Promise.all((listeners[type] || []).map((fn) => fn())); },
+    };
+    const store = createClaudexorStatusStore({ fetchImpl: async () => okResponse(RUNNING), doc });
+    let activations = 0;
+    const releaseVisible = bindStatusSurface(store, {
+        elementId: 'accounts', listener: () => {}, doc, win,
+        onActivate: () => { activations += 1; },
+    });
+    const releaseHidden = bindStatusSurface(store, {
+        elementId: 'hidden', listener: () => {}, doc, win,
+        onActivate: () => { activations += 100; },
+    });
+
+    await win.fire('ouro:settings-subtab-shown');
+    assert.equal(activations, 1, 'only the visible surface ran its owner action');
+
+    releaseHidden();
+    releaseVisible();
+    store.dispose();
+});
+
 test('a hidden page pauses polling, and a login hold keeps it awake off-surface', () => {
     const doc = fakeDoc();
     const store = createClaudexorStatusStore({
@@ -741,6 +774,81 @@ test('accountRows and accountLoginConfirmed read the wire shape from ONE place',
     assert.equal(accountLoginConfirmed(payload, 'claude', 'work'), true);
     assert.equal(accountLoginConfirmed(payload, 'claude', 'other'), false);
     assert.equal(accountLoginConfirmed({}, 'codex', ''), false);
+});
+
+test('a unified payload gets every row from profiles — no synthetic natives', () => {
+    // The unified engine (server-stamped `unified_accounts`) serves migrated
+    // default logins as ordinary registry rows and emits `harnessAccounts: []`.
+    // Even a compatibility row that slipped into that list must not
+    // double-render the account the profiles already carry.
+    const payload = {
+        unified_accounts: true,
+        profiles: {
+            harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }],
+            accountPools: [{ harness_id: 'codex', next_up: { kind: 'profile', profileId: 'codex-default' } }],
+            profiles: [
+                { profile: { harness_id: 'codex', profile_id: 'codex-default', enabled: true },
+                    status: { verification: 'passed', verification_source: 'local_store' } },
+                { profile: { harness_id: 'codex', profile_id: 'work', enabled: false },
+                    status: { verification: 'passed', verification_source: 'vendor' } },
+            ],
+        },
+    };
+    const rows = accountRows(payload);
+    assert.deepEqual(rows.map((r) => [r.harness, r.profile_id, r.kind, r.enabled]),
+        [['codex', 'codex-default', 'profile', true], ['codex', 'work', 'profile', false]]);
+    // The verify-race addresses the migrated row by its REAL id there; the
+    // legacy empty-string address resolves nothing on a unified payload.
+    assert.equal(accountLoginConfirmed(payload, 'codex', 'codex-default'), true);
+    assert.equal(accountLoginConfirmed(payload, 'codex', ''), false);
+    assert.equal(unifiedAccounts(payload), true);
+    // Fail-closed: absence of the stamp (old backend, unreadable catalog) is
+    // the LEGACY rendering, with the native synthesis intact.
+    const legacy = { profiles: payload.profiles };
+    assert.equal(unifiedAccounts(legacy), false);
+    assert.deepEqual(accountRows(legacy).map((r) => [r.profile_id, r.kind, r.enabled]),
+        [['', 'native', true], ['codex-default', 'profile', true], ['work', 'profile', false]]);
+});
+
+test('the enabled projection fails open on payloads that predate the field', () => {
+    const payload = { profiles: {
+        harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }],
+        profiles: [{ profile: { harness_id: 'claude', profile_id: 'work' },
+            status: {} }],
+    } };
+    // No `enabled` anywhere: nothing may claim an exclusion from rotation.
+    assert.deepEqual(accountRows(payload).map((r) => r.enabled), [true, true]);
+    // The legacy native row's ladder participation rides the same key.
+    const disabledNative = { profiles: { harnessAccounts: [
+        { harness_id: 'codex', native_login_detected: true, native_credentials_enabled: false },
+    ], profiles: [] } };
+    assert.deepEqual(accountRows(disabledNative).map((r) => r.enabled), [false]);
+});
+
+test('nextUpAccount reads accountPools first and the legacy next_up second', () => {
+    // DUAL-WIRE routing verdict, one reader. The unified pool wins when both
+    // are present (a unified engine keeps harnessAccounts as an empty
+    // compatibility key, but a transitional payload must still have one
+    // authority), the legacy row answers alone on an old engine, and a
+    // harness neither speaks for is an honest null.
+    const both = { profiles: {
+        accountPools: [{ harness_id: 'codex', next_up: { kind: 'api_key_route' } }],
+        harnessAccounts: [{ harness_id: 'codex', next_up: { kind: 'native', route: 'local_session' } }],
+    } };
+    assert.deepEqual(nextUpAccount(both, 'codex'), { kind: 'api_key_route' });
+    const legacy = { profiles: {
+        harnessAccounts: [{ harness_id: 'codex', next_up: { kind: 'native', route: 'local_session' } }],
+    } };
+    assert.deepEqual(nextUpAccount(legacy, 'codex'), { kind: 'native', route: 'local_session' });
+    assert.equal(nextUpAccount(legacy, 'claude'), null);
+    assert.equal(nextUpAccount({}, 'codex'), null);
+    assert.equal(nextUpAccount(legacy, ''), null);
+    // An unknown future kind rides through verbatim — the consumer renders it
+    // fail-safe; the reader never filters or rewrites it.
+    const future = { profiles: {
+        accountPools: [{ harness_id: 'codex', next_up: { kind: 'quantum_pool' } }],
+    } };
+    assert.deepEqual(nextUpAccount(future, 'codex'), { kind: 'quantum_pool' });
 });
 
 test('a refused wake does not stop the visible panel from polling', async (t) => {

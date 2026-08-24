@@ -199,7 +199,10 @@ def test_chat_shows_reconnect_banner_after_reconnect_and_reload():
     source = _read("web/modules/chat.js")
     assert "wsHasConnectedOnce" in source, "Missing reconnect-once tracking flag"
     assert "Reconnected" in source, "Missing reconnect banner text"
-    assert "Restart complete" in source, "Missing restart-complete banner text"
+    # reconnectBannerText moved verbatim to chat_activity.js (chat.js byte ceiling).
+    assert "Restart complete" in _read("web/modules/chat_activity.js"), (
+        "Missing restart-complete banner text"
+    )
     assert "_ouro_reason" in source, "Missing restart reload reason handling"
     assert "history.replaceState" in source, "Reconnect params should be cleared after showing banner"
     # Ensure banner is ephemeral (not persisted to history)
@@ -279,9 +282,11 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     assert "anchor: captureVisibleTimelineAnchor()" in source
     assert "restoreVisibleTimelineAnchor(scrollBeforeSync.anchor)" in source, \
         "Reconnect must restore a visible DOM anchor, not apply total height growth"
-    assert "taskId: card.dataset?.taskId || ''" in source, \
+    # The anchor itself lives in its own module (v6.111); chat.js only calls it.
+    anchor_source = _read("web/modules/timeline_anchor.js")
+    assert "taskId: card.dataset?.taskId || ''" in anchor_source, \
         "Nested viewport anchors must retain stable task identity"
-    assert "liveCardRecords.get(entry.taskId)" in source, \
+    assert "liveCardRecords.get(entry.taskId)" in anchor_source, \
         "A rebuilt live card whose earliest timestamp changed needs canonical task lookup"
     assert "reorderExisting: anchorMovedEarlier" in source, \
         "A mounted task card must be re-sorted if a later event lowers its anchor"
@@ -296,10 +301,18 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     # keep JS unit tests green (they exercise the exported helper directly).
     assert "insertTimelineNode(messagesDiv, node, typing" in source, \
         "insertMessageNode must route through chronological insertTimelineNode"
-    # Media producers (photo, video, document) must each stamp sortable
-    # data-ts from the raw source timestamp; text bubbles stamp msg.ts.
-    assert source.count("stampNodeTimestamp(bubble, rawTs);") >= 3, \
-        "photo/video/document bubbles must carry raw-timestamp data-ts"
+    # The shared photo/video builder and the separate document builder must
+    # each stamp sortable data-ts from the raw source timestamp.
+    media_builder = source.split("function buildMediaBubble", 1)[1].split(
+        "function appendMediaBubble", 1
+    )[0]
+    document_builder = source.split("function buildDocumentBubble", 1)[1].split(
+        "function documentMessageKey", 1
+    )[0]
+    assert "stampNodeTimestamp(bubble, rawTs);" in media_builder, \
+        "shared photo/video bubbles must carry raw-timestamp data-ts"
+    assert "stampNodeTimestamp(bubble, rawTs);" in document_builder, \
+        "document bubbles must carry raw-timestamp data-ts"
     assert "stampNodeTimestamp(bubble, ts);" in source, \
         "chat text bubbles must carry raw-timestamp data-ts"
 

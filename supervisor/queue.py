@@ -6,7 +6,6 @@ import datetime
 import json
 import logging
 import math
-import os
 import pathlib
 import queue as _stdqueue  # noqa: F401 — re-exported for the test suite's reap-queue isolation
 import threading
@@ -95,8 +94,6 @@ def init(drive_root: pathlib.Path, soft_timeout: int, hard_timeout: int) -> None
         legacy_keys.append("OUROBOROS_SOFT_TIMEOUT_SEC")
     if int(hard_timeout) != 1800:
         legacy_keys.append("OUROBOROS_HARD_TIMEOUT_SEC")
-    if str(os.environ.get("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "120")) != "120":
-        legacy_keys.append("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC")
     SOFT_TIMEOUT_SEC, HARD_TIMEOUT_SEC = 600, 1800
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec()
     BUDGET_ROOT_FENCES.clear()
@@ -112,8 +109,6 @@ def refresh_timeouts_from_settings(settings: dict) -> None:
         legacy_keys.append("OUROBOROS_SOFT_TIMEOUT_SEC")
     if str(settings.get("OUROBOROS_HARD_TIMEOUT_SEC", "1800")) != "1800":
         legacy_keys.append("OUROBOROS_HARD_TIMEOUT_SEC")
-    if str(settings.get("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "120")) != "120":
-        legacy_keys.append("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC")
     _emit_timeout_deprecation_once(legacy_keys)
 
 
@@ -151,9 +146,8 @@ from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
     reserve_task_admission,
 )
 
-# Variant A off-loop worker reaper lives in supervisor/task_reaper.py (extracted for
-# module size). Re-export the thin names the enforce path and tests use; monkeypatching
-# these queue-module names still works because the enforce path references them here.
+# Variant A off-loop worker reaper lives in supervisor/task_reaper.py (module size); re-export
+# the thin names the enforce path and tests use — monkeypatching these queue names still works.
 from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enforce path + tests
     ensure_reaper_started as _ensure_reaper_started,
     reap_queue as _reap_queue,
@@ -175,7 +169,7 @@ def init_queue_refs(pending: List[Dict[str, Any]], running: Dict[str, Dict[str, 
 
 def _task_priority(task_type: str) -> int:
     t = str(task_type or "").strip().lower()
-    if t in ("task", "review", "deep_self_review"):
+    if t in ("skill_publish", "task", "review", "deep_self_review"):
         return 0
     if t == "evolution":
         return 1
@@ -217,9 +211,8 @@ def enqueue_task(
         task_id = str(t.get("id") or "").strip()
         reserved_token = str(ADMISSION_RESERVATIONS.get(task_id) or "")
         if reserved_token and admission_token != reserved_token:
-            # A reservation owns this id until its request either enqueues or
-            # releases it.  Tokenless internal callers and competing ingress
-            # requests must not be able to consume/collide with that id.
+            # A reservation owns this id until its request either enqueues or releases it.
+            # Tokenless internal callers and competing ingress must not consume/collide with it.
             t["_admission_blocked"] = "admission_reservation_owned"
             return t
         if require_worker_pool:
@@ -487,7 +480,9 @@ def resync_skill_schedules(drive_root: pathlib.Path | None = None) -> Dict[str, 
 # module-size relief); imported under their historical private names.
 from supervisor.schedule_time import (  # noqa: E402
     next_cron_time as _next_cron_time,
+    once_due as _once_due,
     parse_schedule_time as _parse_schedule_time,
+    prune_consumed_once_records as _prune_consumed_once, record_last_error as _record_last_error,
     schedule_next_run as _schedule_next_run,
     timezone_for_schedule as _timezone_for_schedule,
 )
@@ -582,27 +577,38 @@ def check_scheduled_tasks() -> None:
                 continue
             tz = _timezone_for_schedule(record)
             now = now_utc.astimezone(tz)
-            if trigger_type != "cron":
-                record["last_error"] = f"unsupported trigger type: {trigger_type}"
-                changed = True
-                continue
-            expr = str(trigger.get("expr") or record.get("cron") or "").strip()
-            if not expr:
-                record["last_error"] = "missing cron expression"
-                changed = True
-                continue
-            next_run = _parse_schedule_time(record.get("next_run_at"), tz)
-            if next_run is None:
-                try:
-                    next_run = _next_cron_time(expr, now - datetime.timedelta(minutes=1))
-                    record["next_run_at"] = next_run.isoformat()
-                    changed = True
-                except Exception as exc:
-                    record["last_error"] = f"{type(exc).__name__}: {exc}"
-                    changed = True
+            expr = ""
+            if trigger_type == "once":
+                # One-shot (B2b W=A): fires once at/after run_at via the same admission path
+                # as cron, then is marked done below. A consumed receipt (non-empty completed_at)
+                # NEVER re-fires even re-enabled from UI; re-arm = gateway upsert, fresh run_at.
+                if record.get("completed_at"):
                     continue
-            if next_run > now:
+                due, once_error = _once_due(trigger, tz, now)
+                if once_error:
+                    changed = _record_last_error(record, once_error) or changed
+                    continue
+                if not due:
+                    continue
+            elif trigger_type != "cron":
+                changed = _record_last_error(record, f"unsupported trigger type: {trigger_type}") or changed
                 continue
+            else:
+                expr = str(trigger.get("expr") or record.get("cron") or "").strip()
+                if not expr:
+                    changed = _record_last_error(record, "missing cron expression") or changed
+                    continue
+                next_run = _parse_schedule_time(record.get("next_run_at"), tz)
+                if next_run is None:
+                    try:
+                        next_run = _next_cron_time(expr, now - datetime.timedelta(minutes=1))
+                        record["next_run_at"] = next_run.isoformat()
+                        changed = True
+                    except Exception as exc:
+                        changed = _record_last_error(record, f"{type(exc).__name__}: {exc}") or changed
+                        continue
+                if next_run > now:
+                    continue
             if str(record.get("source") or "") == "skill_manifest":
                 if collision_names is None:
                     collision_names = skill_identity_collision_names(DRIVE_ROOT)
@@ -637,11 +643,27 @@ def check_scheduled_tasks() -> None:
             record["last_run_at"] = now.isoformat()
             record["last_task_id"] = task["id"]
             record_scheduled_admission(task, admitted, record)
-            try:
-                record["next_run_at"] = _next_cron_time(expr, now).isoformat()
-            except Exception as exc:
-                record["last_error"] = f"{type(exc).__name__}: {exc}"
+            if trigger_type == "once":
+                if not (isinstance(admitted, dict) and admitted.get("_admission_blocked")):
+                    # Consumed ONLY when admission succeeded (durable receipt, never re-fired); a
+                    # refused admission left the record enabled with last_error → next tick retries.
+                    record["enabled"] = False
+                    record["completed_at"] = now.isoformat()
+                    record["next_run_at"] = ""
+            else:
+                try:
+                    record["next_run_at"] = _next_cron_time(expr, now).isoformat()
+                except Exception as exc:
+                    record["last_error"] = f"{type(exc).__name__}: {exc}"
             changed = True
+        # Consumed one-shot receipts age out past the unified GC retention (DEVELOPMENT
+        # Runtime Cleanup SSOT; enabled records are never pruned — see the helper).
+        from ouroboros.retention import age_cutoff, get_gc_retention_days
+
+        kept, pruned = _prune_consumed_once(list(data.get("tasks") or []),
+                                            age_cutoff(get_gc_retention_days()))
+        if pruned:
+            data["tasks"], changed = kept, True
         if changed:
             _write_scheduled_tasks(data)
             persist_queue_snapshot(reason="scheduled_tasks")
@@ -710,57 +732,9 @@ def persist_queue_snapshot(reason: str = "") -> bool:
             worker_pool_disabled_reason = "unknown"
             reaping_count = 0
             assignable_idle_workers = 0
-    pending_rows = []
-    for t in pending_items:
-        pending_rows.append({
-            "id": t.get("id"), "type": t.get("type"), "priority": t.get("priority"),
-            "attempt": t.get("_attempt"), "queued_at": t.get("queued_at"),
-            "queue_seq": t.get("_queue_seq"),
-            "task": {
-                "id": t.get("id"), "type": t.get("type"), "chat_id": t.get("chat_id"),
-                "text": t.get("text"), "priority": t.get("priority"),
-                "depth": t.get("depth"), "description": t.get("description"),
-                "objective": t.get("objective"), "title": t.get("title"),
-                "expected_output": t.get("expected_output"),
-                "constraints": t.get("constraints"), "role": t.get("role"),
-                "context": t.get("context"), "parent_task_id": t.get("parent_task_id"),
-                "root_task_id": t.get("root_task_id"), "session_id": t.get("session_id"),
-                "actor_id": t.get("actor_id"), "delegation_role": t.get("delegation_role"),
-                "workspace_root": t.get("workspace_root"), "workspace_mode": t.get("workspace_mode"),
-                "project_id": t.get("project_id"),
-                "allowed_resources": t.get("allowed_resources"), "deadline_at": t.get("deadline_at"),
-                "task_contract": t.get("task_contract"),
-                # Scheduling INTENT survives a restart and is all a PENDING child has;
-                # `parent_model_lane` and the F9 admission fact `required_model_lane`
-                # above all (R2-3). Pinned to SUBAGENT_INTENT_FIELDS by test_model_slot.
-                "model_lane": t.get("model_lane"), "parent_model_lane": t.get("parent_model_lane"),
-                "requested_model_lane": t.get("requested_model_lane"),
-                "required_model_lane": t.get("required_model_lane"), "requested_executor": t.get("requested_executor"),
-                # The owner's approved allocation for this child. A PENDING child
-                # has nothing else naming its destination, so dropping it here
-                # would silently re-route the work to the install-wide policy
-                # across a restart — after the owner had already approved it.
-                "routing_plan_item": t.get("routing_plan_item"),
-                "routing_pin": t.get("routing_pin"),
-                "effective_model_lane": t.get("effective_model_lane"),
-                "model": t.get("model"), "use_local_model": t.get("use_local_model"),
-                "effective_executor": t.get("effective_executor"), "tool_profile": t.get("tool_profile"),
-                "executor_route": t.get("executor_route"), "reasoning_effort": t.get("reasoning_effort"),
-                "capability_delta": t.get("capability_delta"),
-                "task_group_id": t.get("task_group_id"),
-                "task_group": t.get("task_group"),
-                "subagent_envelope": t.get("subagent_envelope"),
-                "memory_mode": t.get("memory_mode"), "drive_root": t.get("drive_root"),
-                "child_drive_root": t.get("child_drive_root"),
-                "budget_drive_root": t.get("budget_drive_root"),
-                "task_constraint": t.get("task_constraint"),
-                "metadata": t.get("metadata"), "origin_message_ref": t.get("origin_message_ref"),
-                "origin_message_text": t.get("origin_message_text"), "_attempt": t.get("_attempt"),
-                "review_reason": t.get("review_reason"), "review_source_task_id": t.get("review_source_task_id"),
-                "_budget_pause": t.get("_budget_pause"),
-                "budget_resumed_at": t.get("budget_resumed_at"),
-            },
-        })
+    from supervisor.queue_snapshot_rows import pending_snapshot_row
+
+    pending_rows = [pending_snapshot_row(t) for t in pending_items]
     running_rows = []
     now = time.time()
     for task_id, meta in running_items:
@@ -919,12 +893,10 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     log.warning("Failed to terminalize fenced snapshot task %s", task_id, exc_info=True)
                 continue
             # Never resurrect a terminal/cancelled task as a ghost pending entry.
-            # AR2-10 (§8-A1): the intent projection is consulted UNDER the queue
-            # lock at restore — the "no active intent" read and the enqueue form
-            # one serialized step against assignment/drop, the same invariant the
-            # pre-assignment consult keeps. Boot-time and contention-free;
-            # _queue_lock is an RLock, so enqueue_task's own acquisition stays
-            # re-entrant.
+            # AR2-10 (§8-A1): the intent projection is consulted UNDER the queue lock at
+            # restore — the "no active intent" read and the enqueue form one serialized step
+            # against assignment/drop (same invariant as the pre-assignment consult). Boot-time
+            # and contention-free; _queue_lock is an RLock, so enqueue_task stays re-entrant.
             with _queue_lock:
                 skip_revival = False
                 try:
@@ -1161,15 +1133,13 @@ def _has_pending_descendant(task_id: str) -> bool:
 def _enforce_task_timeouts_locked(
     workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
 ) -> None:
-    # ONE typed owner-stop predicate before every generic timeout-grace consumer
-    # (S3 §12.2 item 8): a task whose owner-requested finalization intent is
-    # still OPEN is bypassed whole — no spare-withdraw, no spare-clock reset,
-    # no second grace episode, no expiry kill, no RUNNING.pop, no reaper
-    # enqueue, no retry scheduling. The hold deliberately outlives the grace
-    # deadline (the expiry window): the deadline gates only the sweep's
-    # arm-vs-feed-custody decision in supervisor/owner_stop.py +
-    # sweep_cancel_intents; the intent stays the one owner will and custody
-    # stays the only killer.
+    # ONE typed owner-stop predicate before every generic timeout-grace consumer (S3
+    # §12.2 item 8): a task whose owner-requested finalization intent is still OPEN is
+    # bypassed whole — no spare-withdraw, no spare-clock reset, no second grace episode,
+    # no expiry kill, no RUNNING.pop, no reaper enqueue, no retry scheduling. The hold
+    # deliberately outlives the grace deadline (the expiry window): the deadline gates only
+    # the sweep's arm-vs-feed-custody decision in supervisor/owner_stop.py +
+    # sweep_cancel_intents; the intent stays the one owner will and custody stays the only killer.
     from supervisor.owner_stop import running_owner_stop_tasks
 
     owner_stop_held = running_owner_stop_tasks(
@@ -1217,24 +1187,22 @@ def _enforce_task_timeouts_locked(
         # is legitimate silence (hard-bounded by events._handle_external_wait_lease);
         # it spares ONLY this idle rail — ceiling/deadline/budget/cancel never consult it.
         lease_ts = meta.get("external_wait_lease_until")
-        # Keep an orchestrator alive on own progress, a freshly progressing RUNNING
-        # descendant, a QUEUED descendant (a kill would orphan the queued subtree), or a
-        # live external-wait lease; only abs ceiling / explicit deadline / budget are
-        # unconditional.
+        # Keep an orchestrator alive on own progress, a freshly progressing RUNNING descendant,
+        # a QUEUED descendant (a kill would orphan the queued subtree), or a live external-wait
+        # lease; only abs ceiling / explicit deadline / budget are unconditional.
         progressing = (own_progress or subtree_progressing or _has_pending_descendant(task_id)
                        or (isinstance(lease_ts, (int, float)) and float(lease_ts) > now))
         ceiling_reached = runtime_sec >= abs_ceiling
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the
-        # idle/subtree gate only spares a still-progressing task with NO explicit deadline
-        # — an explicit/caller deadline is honored promptly, while no blanket wall-clock
-        # kills a productively-waiting orchestrator.
+        # idle/subtree gate only spares a still-progressing task with NO explicit deadline —
+        # an explicit/caller deadline is honored promptly, while no blanket wall-clock kills
+        # a productively-waiting orchestrator.
         if not ceiling_reached and not deadline_reached and progressing:
-            # An outstanding episode outlives this reprieve or is withdrawn by it; the
-            # rule (own progress answers the request, sparing only suspends its clock)
-            # lives with the rest of the episode mechanics in task_reaper. The latch is
-            # checked here so the drive resolution (which may read the result record)
-            # stays off the no-episode path.
+            # An outstanding episode outlives this reprieve or is withdrawn by it; the rule
+            # (own progress answers the request, sparing only suspends its clock) lives with
+            # the rest of the episode mechanics in task_reaper. The latch is checked here so
+            # the drive resolution (which may read the result record) stays off the no-episode path.
             if meta.get("finalization_requested_at") and _resolve_grace_episode_for_spared_task(
                 _task_drive_for_task(task, str(task_id)), str(task_id), meta,
                 chat_id=int(task.get("chat_id") or owner_chat_id or 0),
@@ -1526,13 +1494,13 @@ def enqueue_evolution_task_if_needed() -> None:
         )
         return
 
-    # BUG3: pause if the SAME objective has been re-proposed and no-op'd
-    # OBJECTIVE_REPEAT_CAP times without ever absorbing. This is a SEPARATE breaker from
-    # consecutive_failures above: that counter is reset to 0 by ANY non-failing cycle
-    # (events.py), so it cannot catch a self-maintenance loop where a blocked objective is
-    # re-proposed NON-consecutively (interleaved with other no_op work). The per-objective
-    # count is keyed on the same canonical fingerprint the transaction stamps, accumulates
-    # across non-consecutive recurrence, and is cleared only on a genuine absorb.
+    # BUG3: pause if the SAME objective has been re-proposed and no-op'd OBJECTIVE_REPEAT_CAP
+    # times without ever absorbing. This is a SEPARATE breaker from consecutive_failures
+    # above: that counter is reset to 0 by ANY non-failing cycle (events.py), so it cannot
+    # catch a self-maintenance loop where a blocked objective is re-proposed NON-consecutively
+    # (interleaved with other no_op work). The per-objective count is keyed on the same
+    # canonical fingerprint the transaction stamps, accumulates across non-consecutive
+    # recurrence, and is cleared only on a genuine absorb.
     from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
 
     _objective_repeat_counts = campaign.get("objective_repeat_counts") or {}

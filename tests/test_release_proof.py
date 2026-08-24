@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
     "release_proof", REPO / "scripts" / "release_proof.py"
@@ -303,6 +302,34 @@ def test_linux_packages_declare_and_resolve_the_git_runtime_dependency():
     assert "rpm --install" not in smoke
 
 
+def test_every_future_release_receipt_requires_real_embedded_betterleaks():
+    assert set(release_proof.REQUIRED_SMOKE_CHECKS) == set(release_proof.PROOF_IDS)
+    for proof_id, checks in release_proof.REQUIRED_SMOKE_CHECKS.items():
+        assert "embedded_betterleaks_runtime" in checks, proof_id
+
+
+def test_future_final_artifact_lanes_smoke_betterleaks_from_the_artifact():
+    workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    build_job = workflow[
+        workflow.index("  build:") : workflow.index("  vendor-package-smoke:")
+    ]
+    assert build_job.count("scripts/betterleaks_platform_smoke.py") == 4
+    assert '--bundle-root "$MOUNT/Ouroboros.app/Contents/Resources"' in build_job
+    assert '--bundle-root "$SMOKE_ROOT/Ouroboros/_internal"' in build_job
+    assert '--bundle-root "$APPDIR/usr/lib/ouroboros/_internal"' in build_job
+    assert '--bundle-root "$SmokeRoot\\Ouroboros\\_internal"' in build_job
+    assert "betterleaks-standalone/bin/betterleaks" in build_job
+    assert "codesign --verify --strict" in build_job
+    assert "--check embedded_betterleaks_runtime" in build_job
+
+    package_smoke = (REPO / "scripts" / "smoke_linux_packages.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "betterleaks_platform_smoke.py:/tmp/betterleaks_platform_smoke.py:ro" in package_smoke
+    assert "PYTHONPATH=/opt/ouroboros/_internal" in package_smoke
+    assert "--bundle-root /opt/ouroboros/_internal" in package_smoke
+
+
 def test_linux_rpm_stage_recreates_the_absolute_cli_symlink():
     builder = (REPO / "scripts" / "build_linux_packages.sh").read_text(encoding="utf-8")
 
@@ -493,7 +520,11 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert workflow.count('git ls-remote --exit-code origin "$TAG_REF" "$PEELED_REF"') == 2
     assert workflow.count('test "$(git cat-file -t "$TAG_REF")" = "tag"') == 2
     assert workflow.count('[ "$PEELED_SHA" != "$GITHUB_SHA" ]') == 2
-    assert 'target_commitish: ${{ github.sha }}' in workflow
+    create_release_step = workflow[
+        workflow.index("- name: Create draft GitHub Release") :
+        workflow.index("- name: Verify uploaded draft")
+    ]
+    assert "target_commitish:" not in create_release_step
     assert '--source-digest "$GITHUB_SHA"' in workflow
     assert '--source-ref "$GITHUB_REF"' in workflow
     assert '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml"' in workflow

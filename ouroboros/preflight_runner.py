@@ -25,7 +25,7 @@ DEFAULT_PYTEST_ARGS = ["tests/", "-q", "--tb=line", "--no-header"]
 # tomllib parse): README pins Python 3.10+ and tomllib is 3.11+.
 LANE_EXCLUSION_EXPR = (
     "not integration and not browser and not ui_browser and not ui_browser_docker "
-    "and not portable_detail and not skill_smoke"
+    "and not portable_detail and not skill_smoke and not size_ratchet"
 )
 
 # Mirrors ci.yml `quick-test`/`full-test` exactly, including the per-test timeout
@@ -926,9 +926,18 @@ _TRUNCATION_MARKER = "\n...(truncated)..."
 
 
 def _bounded(output: str, max_output: int) -> str:
-    if len(output) > max_output:
-        return output[:max_output] + _TRUNCATION_MARKER
-    return output
+    """Bound pytest output by cutting the MIDDLE, never the tail.
+
+    pytest prints the FAILURES section and the short test summary at the END —
+    a head-only cut (the old shape) discarded exactly the lines that name the
+    failing tests once the run was long enough to need cutting. The head is
+    kept too (collection errors and the session header live there): one third
+    head, two thirds tail."""
+    if len(output) <= max_output:
+        return output
+    head = max_output // 3
+    tail = max_output - head
+    return output[:head] + _TRUNCATION_MARKER + "\n" + output[-tail:]
 
 
 def _diagnosis(header: str, remediation: str, body: str, max_output: int) -> str:
@@ -937,13 +946,13 @@ def _diagnosis(header: str, remediation: str, body: str, max_output: int) -> str
     The caller re-truncates this string from the TAIL at the same limit
     (ouroboros/tools/review_helpers.py (_run_review_preflight_tests) passes ``limit=MAX_OUTPUT=8000``),
     so a remediation printed after a full-budget body is the first thing lost —
-    precisely when the output is long enough to need it. The prefix and the
-    truncation marker are reserved out of the body's budget too, so the whole
-    string stays inside the caller's declared limit instead of overrunning it.
-    """
+    precisely when the output is long enough to need it. The prefix, the
+    truncation marker, and its newline are reserved out of the body's budget
+    too, so the whole string stays inside the caller's declared limit instead
+    of overrunning it (an overrun would cost the tail — the failure summary)."""
     prefix = f"{header}\n{remediation}\n" if remediation else f"{header}\n"
     body = body.strip()
-    room = max_output - len(prefix) - len(_TRUNCATION_MARKER)
+    room = max_output - len(prefix) - len(_TRUNCATION_MARKER) - 1
     if not body or room <= 0:
         # A limit too small to hold header+remediation+marker still may not be
         # overrun: the invariant is unconditional, so the prefix is cut too.

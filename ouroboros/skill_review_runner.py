@@ -150,7 +150,17 @@ def _review_provenance(ctx: Any, source: str, skill_name: str) -> Dict[str, Any]
         group_id = f"manual:{skill_name}"
         root_task_id = ""
     else:
-        root_task_id = origin_root_task_id or origin_task_id
+        # Ceiling/group root = the CURRENT task tree's root. The follow-up
+        # chain marker origin_root_task_id is deliberately NOT honored here
+        # (adversarial wave, machine-3): a scheduled follow-up is a fresh
+        # root with a fresh review-cycle ceiling — the "fresh task" exit the
+        # refusal advertises must be real. origin_* stay recorded below as
+        # provenance facts.
+        root_task_id = str(
+            metadata.get("root_task_id")
+            or getattr(ctx, "root_task_id", "")
+            or task_id
+        )
         group_id = f"task:{root_task_id}:{skill_name}"
     try:
         chat_id = int(getattr(ctx, "current_chat_id", 0) or 0)
@@ -208,6 +218,18 @@ def _terminal_history_payload(
         payload["raw_actor_records"] = raw_actor_records
     if bool(getattr(result, "single_reviewer_no_diversity", False)):
         payload["single_reviewer_no_diversity"] = True
+    # Max-Review-Cycles facts (Q17/Q23) ride the terminal row: paid panel
+    # dispatch (one chunked wave = ONE cycle), its wave id, the panel contract
+    # identity, the rebuttal content hash, and — for a $0 replay — the quoted
+    # verdict ts. A terminal with NO result (lifecycle timeout) still gets the
+    # facts: append_history_once merges the write-ahead dispatch marker by
+    # wave/job id (F3), so the money spent before the timeout stays counted.
+    if bool(getattr(result, "paid", False)):
+        payload["paid"] = True
+    for fact_key in ("wave_id", "review_contract_fingerprint", "rebuttal_sha256", "replayed_from_ts"):
+        value = str(getattr(result, fact_key, "") or "")
+        if value:
+            payload[fact_key] = value
     return payload
 
 
@@ -221,7 +243,7 @@ def _append_terminal_history(
     result: Any = None,
     ts: str,
 ) -> bool:
-    return skill_review_history.append_history_once(
+    appended = skill_review_history.append_history_once(
         drive_root,
         skill_name,
         _terminal_history_payload(
@@ -232,6 +254,24 @@ def _append_terminal_history(
             ts=ts,
         ),
     )
+    if not appended:
+        # LOUD failure (F3): a silently lost terminal row un-counts spent
+        # review money and hides the verdict from the derived ledger. The
+        # unmerged dispatch marker still preserves the paid fact.
+        log.warning("skill review terminal history row did not land for %s", skill_name)
+        append_jsonl(
+            _events_path(drive_root),
+            {
+                "ts": ts,
+                "type": "skill_review_history_append_failed",
+                "skill": skill_name,
+                "job_id": str(job_data.get("job_id") or ""),
+                "status": status,
+                "terminal_reason": terminal_reason,
+                "reason": "terminal history append failed",
+            },
+        )
+    return appended
 
 
 def _append_review_chat_summary(
@@ -397,13 +437,15 @@ def mark_stale_review_job_interrupted(
 def reconcile_stale_review_jobs(
     drive_root: pathlib.Path,
     *,
+    repo_path: str | None = None,
     stale_after_sec: int = _STALE_REVIEW_JOB_SEC,
 ) -> int:
     root = pathlib.Path(drive_root) / "state" / "skills"
     if not root.exists():
         return 0
     collision_names = skill_identity_collision_names(
-        pathlib.Path(drive_root), repo_path=get_skills_repo_path(),
+        pathlib.Path(drive_root),
+        repo_path=get_skills_repo_path() if repo_path is None else repo_path,
     )
     count = 0
     for path in root.glob("*/review_job.json"):

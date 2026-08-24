@@ -40,12 +40,34 @@ def test_settings_defaults_include_phase2_keys():
 
     assert SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert SETTINGS_DEFAULTS["OUROBOROS_SKILLS_REPO_PATH"] == ""
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL"] == "x-ai/grok-4.5"
-    # Heavy default EMPTY -> fall back to Main (role-model, v6.39). Since v6.82.0 the
-    # Light lane and the resilience Fallbacks chain carry real cheap defaults.
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL"] == "google/gemini-3.7-flash"
+    # Empty role slots inherit Main; Light and Fallback use Luna explicitly.
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_HEAVY"] == ""
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.6-flash"
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_VISION"] == ""
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_CONSCIOUSNESS"] == ""
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "openai/gpt-5.6-luna"
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACKS"] == "openai/gpt-5.6-luna"
+    assert (
+        SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]
+        == "openai/gpt-5.6-sol-pro"
+    )
+    assert SETTINGS_DEFAULTS["CLAUDE_CODE_MODEL"] == "claude-sonnet-5"
+    assert SETTINGS_DEFAULTS["TOTAL_BUDGET"] == 200.0
+    assert SETTINGS_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"] == 50.0
+
+
+def test_llm_internal_fallbacks_follow_shipped_model_defaults(monkeypatch):
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.llm import DEFAULT_LIGHT_MODEL, LLMClient
+
+    monkeypatch.delenv("OUROBOROS_MODEL", raising=False)
+    monkeypatch.delenv("OUROBOROS_MODEL_HEAVY", raising=False)
+    monkeypatch.delenv("OUROBOROS_MODEL_LIGHT", raising=False)
+    client = LLMClient.__new__(LLMClient)
+
+    assert DEFAULT_LIGHT_MODEL == SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"]
+    assert client.default_model() == SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
+    assert client.available_models() == [SETTINGS_DEFAULTS["OUROBOROS_MODEL"]]
 
 
 def test_valid_runtime_modes_is_frozen_tuple():
@@ -108,6 +130,11 @@ def test_apply_settings_to_env_propagates_phase2_keys(monkeypatch):
     settings = dict(SETTINGS_DEFAULTS)
     settings["OUROBOROS_RUNTIME_MODE"] = "light"
     settings["OUROBOROS_SKILLS_REPO_PATH"] = "/tmp/skills"
+    # ``apply_settings_to_env`` intentionally authors every supplied key. Track
+    # the whole write set so this in-process test restores the caller's env
+    # instead of leaking shipped empty credentials/defaults into later tests.
+    for key in settings:
+        monkeypatch.delenv(key, raising=False)
 
     apply_settings_to_env(settings)
 
@@ -320,12 +347,14 @@ def test_chat_context_mode_toggle_reports_owner_endpoint_errors():
 
 def test_onboarding_js_has_runtime_mode_selector_and_save_payload():
     src = (REPO / "web" / "modules" / "onboarding_wizard.js").read_text(encoding="utf-8")
+    agents = (REPO / "web" / "modules" / "onboarding_agents_step.js").read_text(encoding="utf-8")
     html = build_onboarding_html({})
     for mode in ("light", "advanced", "pro"):
         assert f'"value": "{mode}"' in html
     assert "data-runtime-mode" in src
-    assert "OUROBOROS_RUNTIME_MODE" in src
-    assert "OUROBOROS_SKILLS_REPO_PATH" in src
+    assert "onboardingSettingsDraft" in src
+    assert "OUROBOROS_RUNTIME_MODE" in agents
+    assert "OUROBOROS_SKILLS_REPO_PATH" in agents
 
 
 def test_phase4_ui_copy_matches_shipped_runtime():
@@ -374,6 +403,20 @@ def test_onboarding_css_has_three_column_variant():
 # ===========================================================================
 
 
+def _restore_gateway_settings_bindings_after_test(monkeypatch, server_module) -> None:
+    """Track assignments made by server's legacy gateway-sync compatibility seam."""
+    for name in (
+        "load_settings", "save_settings", "_apply_settings_to_env",
+        "apply_runtime_provider_defaults",
+    ):
+        monkeypatch.setattr(
+            server_module._gateway_settings,
+            name,
+            getattr(server_module._gateway_settings, name, None),
+            raising=False,
+        )
+
+
 def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
     """POSTing an invalid runtime mode must be normalized to 'advanced'
     before save — so /api/settings and /api/state can never disagree."""
@@ -382,6 +425,7 @@ def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
     from unittest.mock import patch
 
     saved: dict = {}
+    _restore_gateway_settings_bindings_after_test(monkeypatch, srv)
 
     def fake_load_settings():
         from ouroboros.config import SETTINGS_DEFAULTS
@@ -421,7 +465,7 @@ def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
         assert saved["OUROBOROS_RUNTIME_MODE"] == "advanced"
 
 
-def test_api_settings_post_silently_drops_runtime_mode_changes():
+def test_api_settings_post_silently_drops_runtime_mode_changes(monkeypatch):
     """v5.1.2 elevation ratchet: even a VALID runtime_mode in the body
     is silently dropped — the API never accepts mode changes."""
     import server as srv
@@ -429,6 +473,7 @@ def test_api_settings_post_silently_drops_runtime_mode_changes():
     from unittest.mock import patch
 
     saved: dict = {}
+    _restore_gateway_settings_bindings_after_test(monkeypatch, srv)
 
     def fake_load_settings():
         from ouroboros.config import SETTINGS_DEFAULTS
@@ -1218,12 +1263,8 @@ def test_light_data_write_with_bucket_skill_name_resolves_under_payload(tmp_path
     assert landed.is_file(), f"expected file at {landed}; got result={result[:200]}"
 
 
-def test_light_bucket_native_rejected_at_gate(tmp_path, monkeypatch):
-    """bucket=native MUST not be honoured — launcher seed update lane stays
-    authoritative. With the post-triad partial-args check in place, the gate
-    surfaces the specific SKILL_PAYLOAD_ARG_ERROR (which lists `native excluded`)
-    BEFORE the generic LIGHT_MODE_BLOCKED would fire — giving the agent a
-    clearer signal."""
+def test_light_missing_native_payload_creation_rejected_at_gate(tmp_path, monkeypatch):
+    """A missing native payload is not a user-managed package to create in place."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     reg = _registry(tmp_path)
     result = reg.execute(

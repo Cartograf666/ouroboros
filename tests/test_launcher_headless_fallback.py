@@ -466,3 +466,91 @@ def test_detect_headless_keeps_gui_mode_when_backend_works(monkeypatch):
     launcher._detect_headless()
 
     assert launcher._headless is False
+
+
+def test_headless_already_running_opens_browser_at_existing_url(monkeypatch, capsys):
+    """Second Open in browser mode must surface the running instance.
+
+    A desktop-icon launch has no visible stderr, so the printed notice alone
+    reads as "Open does nothing": the branch must also open the default
+    browser at the existing URL, and bound-join the opener thread so the
+    process does not exit under it (daemon threads die with the process)."""
+    import launcher
+
+    opened: list = []
+    joins: list = []
+
+    class _FakeThread:
+        def join(self, timeout=None):
+            joins.append(timeout)
+
+    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
+    monkeypatch.setattr(launcher, "_detect_headless", lambda: None)
+    monkeypatch.setattr(launcher, "_headless", True)
+    monkeypatch.setattr(launcher, "acquire_pid_lock", lambda: False)
+    monkeypatch.setattr(launcher, "_read_port_file", lambda: 8123)
+    monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=1.0: True)
+    monkeypatch.setattr(
+        launcher,
+        "_open_browser_detached",
+        lambda url: opened.append(url) or _FakeThread(),
+    )
+
+    launcher.main()
+
+    assert opened == ["http://127.0.0.1:8123"]
+    assert joins and joins[0] is not None, (
+        "the opener join must be bounded — an untimed join on a console "
+        "browser (GenericBrowser) would hang the notice process forever"
+    )
+    assert "already running at http://127.0.0.1:8123" in capsys.readouterr().err
+
+
+def test_headless_already_running_rereads_stale_port_file(monkeypatch):
+    """Open during the first launcher's bootstrap must land on the live port.
+
+    The lock loss usually races bootstrap: the port file can be absent or
+    stale (an older run's port) at first read. The branch polls server
+    health and re-reads the file between probes, so a mid-bootstrap Open
+    opens the port the server actually bound instead of a dead one."""
+    import launcher
+
+    opened: list = []
+    ports = iter([9999, 9999, 8123])  # stale, stale, freshly written
+    health: dict = {9999: False, 8123: True}
+
+    class _FakeThread:
+        def join(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
+    monkeypatch.setattr(launcher, "_detect_headless", lambda: None)
+    monkeypatch.setattr(launcher, "_headless", True)
+    monkeypatch.setattr(launcher, "acquire_pid_lock", lambda: False)
+    monkeypatch.setattr(launcher, "_read_port_file", lambda: next(ports))
+    monkeypatch.setattr(
+        launcher, "_wait_for_server", lambda port, timeout=1.0: health[port]
+    )
+    monkeypatch.setattr(launcher.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        launcher,
+        "_open_browser_detached",
+        lambda url: opened.append(url) or _FakeThread(),
+    )
+
+    launcher.main()
+
+    assert opened == ["http://127.0.0.1:8123"]
+
+
+def test_open_browser_detached_returns_joinable_thread(monkeypatch):
+    import launcher
+
+    calls: list = []
+    monkeypatch.setattr(launcher.webbrowser, "open", lambda url: calls.append(url))
+
+    thread = launcher._open_browser_detached("http://127.0.0.1:9999")
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert calls == ["http://127.0.0.1:9999"]

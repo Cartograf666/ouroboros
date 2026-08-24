@@ -13,40 +13,23 @@ from ouroboros.contracts.task_contract import effective_acceptance_claims
 from ouroboros.review_evidence import build_task_acceptance_evidence
 
 
+def _v2_wave(fingerprint: str, claims: list, *, aggregate: str = "GREEN", closed: bool = True) -> dict:
+    from ouroboros.tools.plan_spec import normalize_spec, spec_hash
+
+    spec, errors = normalize_spec({"goal": "g", "acceptance_claims": claims})
+    assert not errors
+    return {
+        "schema_version": 2, "cycle_index": 1, "request_fingerprint": fingerprint,
+        "spec": spec, "spec_hash": spec_hash(spec), "findings": [], "aggregate": aggregate,
+        "closed": closed, "dispositions": [], "paid": True,
+    }
+
+
 def _close_green_wave(root: Path, task_id: str, fingerprint: str, claims: list) -> None:
-    from ouroboros.task_results import (
-        STATUS_RUNNING,
-        record_plan_review_attempt,
-        record_plan_review_collection,
-        record_plan_review_result,
-        reserve_plan_review_wave,
-        write_task_result,
-    )
+    from ouroboros.task_results import STATUS_RUNNING, record_plan_review_wave, write_task_result
 
     write_task_result(root, task_id, STATUS_RUNNING, result="running")
-    record_plan_review_attempt(root, task_id, fingerprint=fingerprint)
-    reserve_plan_review_wave(
-        root, task_id, fingerprint=fingerprint, plan_text_hash="d" * 64,
-        scout_roles=[], cutoff_at="2026-08-08T00:00:00+00:00",
-        acceptance_claims=claims,
-    )
-    record_plan_review_collection(
-        root, task_id, fingerprint=fingerprint, included_task_ids=[], omissions=[],
-        stop_reason="complete",
-    )
-    record_plan_review_result(
-        root, task_id, fingerprint=fingerprint,
-        review={
-            "schema_version": 1,
-            "request_fingerprint": fingerprint,
-            "plan_text_hash": "d" * 64,
-            "aggregate_signal": "GREEN",
-            "findings": [],
-            "closed": True,
-            "reviewer_slots_degraded": False,
-        },
-        reviewed_result_hashes={},
-    )
+    record_plan_review_wave(root, task_id, _v2_wave(fingerprint, claims))
 
 
 def test_effective_acceptance_claims_ingress_wins():
@@ -145,6 +128,7 @@ def test_child_contract_restates_claims_after_parent_spread():
         "acceptance_claims": [{"id": "p1", "claim": "parent-only claim"}],
         "success_criteria": ["parent criterion"],
         "deadline_at": "",
+        "context": "API_CONTEXT_" + "x" * 900 + "_DECISIVE_TAIL",
     }
     base_spec = {
         "tid": "child1", "objective": "do child work", "expected_output": "a result",
@@ -157,6 +141,7 @@ def test_child_contract_restates_claims_after_parent_spread():
     bare = _build_child_subagent_contract(dict(base_spec))
     assert bare["acceptance_claims"] == []
     assert bare["success_criteria"] == []
+    assert bare["context"].endswith("_DECISIVE_TAIL")
 
     # Explicit child claims land normalized with positional ids.
     claimed = _build_child_subagent_contract(
@@ -169,11 +154,14 @@ def test_child_contract_restates_claims_after_parent_spread():
     assert claimed["success_criteria"] == []
 
 
-def test_schedule_subagent_claims_end_to_end(tmp_path):
+def test_schedule_subagent_claims_end_to_end(tmp_path, monkeypatch):
     import queue
 
     from ouroboros.tools.control import _schedule_task
     from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
 
     event_queue: queue.Queue = queue.Queue()
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
@@ -188,6 +176,7 @@ def test_schedule_subagent_claims_end_to_end(tmp_path):
 
     result = _schedule_task(
         ctx,
+        subagent_id=subagent_id,
         objective="Build the collision module",
         expected_output="A working module",
         acceptance_claims=["hull overlap is rejected", "  ", ""],
@@ -251,56 +240,44 @@ def test_success_criteria_is_an_input_alias_not_a_second_carrier():
 
 
 def test_wave_freeze_and_bind_preserve_reviewed_claim_whitespace():
-    """G3-6: the review panel sees ``normalize_plan_scope`` output — per-item strip
-    with internal whitespace PRESERVED. The frozen wave copy and the read-time
-    binder must carry that text byte-for-byte (apart from the DISCLOSED truncation
-    bound); the historical ``" ".join(split())`` rewrite made acceptance bind an
-    exact-output claim DIFFERENT from what the panel reviewed."""
-    from ouroboros.task_results import (
-        _bounded_wave_acceptance_claims,
-        closed_plan_review_wave,
-        load_plan_review_state,
-    )
-    from ouroboros.tools.review_synthesis import normalize_plan_scope
+    """G3-6: the review panel sees the normalized spec — per-item strip with internal
+    whitespace PRESERVED. The frozen v2 wave (the whole reviewed spec) and the read-time
+    binder must carry that text byte-for-byte, including decisive tails beyond the old cap;
+    the historical ``" ".join(split())`` rewrite made acceptance bind an exact-output
+    claim DIFFERENT from what the panel reviewed."""
+    from ouroboros.task_results import closed_plan_review_wave, load_plan_review_state
+    from ouroboros.tools.plan_spec import normalize_spec
 
     raw = "stdout is exactly:\n    def f():\n        return  'a  b'"
-    reviewed = normalize_plan_scope({"acceptance_claims": [f"  {raw}  "]})[
-        "acceptance_claims"
-    ]
+    spec, _errors = normalize_spec({"goal": "g", "acceptance_claims": [f"  {raw}  "]})
+    reviewed = [c["claim"] for c in spec["acceptance_claims"]]
     assert reviewed == [raw]  # the panel-reviewed surface preserves internal whitespace
 
     dr = Path(tempfile.mkdtemp())
     _close_green_wave(dr, "acc", "a" * 64, reviewed)
     wave = closed_plan_review_wave(load_plan_review_state(dr, "acc"))
-    assert wave["acceptance_claims"] == [raw]  # frozen byte-for-byte (validator round-trip)
+    assert [c["claim"] for c in wave["spec"]["acceptance_claims"]] == [raw]  # frozen byte-for-byte
 
     claims, source = effective_acceptance_claims({"acceptance_claims": []}, wave)
     assert source == "plan_review"
     assert [c["claim"] for c in claims] == [raw]  # bound text == reviewed text
 
-    # Over-cap claims keep a byte-exact prefix plus the DISCLOSED marker.
+    # Review/acceptance authority is not a preview: the old 600-char cut cannot
+    # certify a prefix as the complete claim.
     long_claim = "line with    significant\tspacing\n" * 40
-    bounded = _bounded_wave_acceptance_claims([long_claim])["acceptance_claims"][0]
-    assert bounded.startswith(long_claim.strip()[:600])
-    assert "OMISSION NOTE" in bounded
+    bounded_spec, _ = normalize_spec({"goal": "g", "acceptance_claims": [long_claim]})
+    bounded = bounded_spec["acceptance_claims"][0]["claim"]
+    assert bounded == long_claim.strip()
+    assert "OMISSION NOTE" not in bounded
 
 
 def test_packet_open_plan_wave_binds_no_claims():
-    from ouroboros.task_results import (
-        STATUS_RUNNING,
-        record_plan_review_attempt,
-        reserve_plan_review_wave,
-        write_task_result,
-    )
+    from ouroboros.task_results import STATUS_RUNNING, record_plan_review_wave, write_task_result
 
     dr = Path(tempfile.mkdtemp())
     write_task_result(dr, "acc", STATUS_RUNNING, result="running")
-    record_plan_review_attempt(dr, "acc", fingerprint="a" * 64)
-    reserve_plan_review_wave(
-        dr, "acc", fingerprint="a" * 64, plan_text_hash="d" * 64,
-        scout_roles=[], cutoff_at="2026-08-08T00:00:00+00:00",
-        acceptance_claims=["unreviewed claim"],
-    )
+    record_plan_review_wave(dr, "acc", _v2_wave("a" * 64, ["unreviewed claim"],
+                                                aggregate="REVIEW_REQUIRED", closed=False))
     ctx = _t.SimpleNamespace(
         task_contract={"requirements": "do X"},
         task_metadata={}, drive_root=str(dr), task_id="acc", repo_dir=str(dr),

@@ -10,11 +10,13 @@ import test from 'node:test';
 
 import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
 import {
+    normalizeProfileName,
+    profileNameSubmission,
+    preserveCardFocus,
     JOB_POLL_GIVE_UP_FAILURES,
     LOGIN_CUSTODY_RELEASED,
     LOGIN_CUSTODY_RETAINED,
     LOGIN_CUSTODY_UNKNOWN,
-    LOGIN_CARD_COMPACT,
     cancelLoginJob,
     createLoginCardController,
     loginCardHtml,
@@ -24,6 +26,7 @@ import {
     loginTimeoutHelp,
     deviceCodeDisclosure,
     loginInputSupport,
+    resolvedJobProfileId,
 } from '../modules/harness_login_cards.js';
 
 const json = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
@@ -34,6 +37,24 @@ function fakeHost() {
         contains: () => false,
         querySelector: () => null,
         querySelectorAll: () => [],
+    };
+}
+
+function interactiveHost() {
+    const listeners = new Map();
+    return {
+        innerHTML: '',
+        contains: () => false,
+        querySelector(selector) {
+            const marker = selector.match(/\[([^\]]+)\]/)?.[1] || '';
+            if (!marker || !this.innerHTML.includes(marker)) return null;
+            return {
+                open: false,
+                addEventListener(type, callback) { listeners.set(`${selector}:${type}`, callback); },
+            };
+        },
+        querySelectorAll: () => [],
+        click(selector) { listeners.get(`${selector}:click`)?.({ preventDefault() {} }); },
     };
 }
 
@@ -116,7 +137,8 @@ test('poll replaces the whole canonical envelope, preserving envelope-level devi
         fetchImpl: async (url, init = {}) => {
             if (url === '/api/claudexor/login' && init.method === 'POST') {
                 return json(200, { job_id: 'job-device', job: { state: 'running' },
-                    attach_command: 'claudexor setup attach job-device', disclosure_native: false });
+                    attach_command: 'claudexor setup attach job-device', attach_shell: 'powershell',
+                    setup_login_source: 'per_harness', disclosure_native: false });
             }
             if (init.method === 'DELETE') return json(200, { job: { state: 'cancelled' } });
             return json(200, {
@@ -133,6 +155,8 @@ test('poll replaces the whole canonical envelope, preserving envelope-level devi
     assert.equal(ctl.active?.envelope?.sequence, 2);
     assert.equal(ctl.active?.attachCommand, 'claudexor setup attach job-device',
         'replaceable poll envelope must not erase create-only metadata');
+    assert.equal(ctl.active?.attachShell, 'powershell');
+    assert.equal(ctl.active?.setupLoginSource, 'per_harness');
     assert.match(host.innerHTML, /data-open-signin/);
     assert.match(host.innerHTML, /ABCD-1234/);
     await ctl.dispose();
@@ -572,6 +596,48 @@ test('duplicate starts are COALESCED, so a double-click cannot create-cancel-cre
     t.mock.timers.reset();
 });
 
+test('the pending-start key includes transport and the external start uses the release guard', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let releaseCreate = null;
+    const gate = new Promise((resolve) => { releaseCreate = resolve; });
+    const bodies = [];
+    let deletes = 0;
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const ctl = createLoginCardController({
+        host: fakeHost(), store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                bodies.push(JSON.parse(init.body));
+                if (bodies.length === 1) await gate;
+                return json(200, { job_id: `job-${bodies.length}`, job: { state: 'running' },
+                    ...(bodies.at(-1).transport === 'client_pty'
+                        ? { attach_command: 'claudexor setup attach job-2', attach_shell: 'posix' } : {}) });
+            }
+            if (init.method === 'DELETE') {
+                deletes += 1;
+                return json(200, { job: { state: 'cancelled' } });
+            }
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    const ordinary = ctl.start('codex', 'work');
+    const external = ctl.start('codex', 'work', 'client_pty');
+    assert.notEqual(ordinary, external, 'different transports must not coalesce');
+    releaseCreate();
+    await Promise.all([ordinary, external]);
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[0].transport, undefined);
+    assert.equal(bodies[1].transport, 'client_pty');
+    assert.equal(deletes, 1, 'the external start passed through the existing custody release guard');
+    assert.equal(ctl.active.jobId, 'job-2');
+    await ctl.dispose();
+    store.dispose();
+    t.mock.timers.reset();
+});
+
 test('an unknown dispose can retry cancellation against the same retained job id', async (t) => {
     // The verdict is only useful if the caller can act on it. A retained job
     // must stay cancellable — otherwise a host that refuses to remount while
@@ -968,39 +1034,443 @@ test('typed reconcile transport classifies proof, retryable conflict, malformed 
     }
 });
 
-test('compact mode drops the terminal fallback, the paste-code entry and Close, and keeps retry', () => {
-    const active = {
-        harness: 'claude', profile: '', startedAtMs: 0, engineDegraded: true,
-        attachCommand: 'claudexor setup attach j1', error: '', verdict: null, confirming: false,
-        envelope: { job: { state: 'waiting_for_input' }, deviceCode: {
-            flow: 'oauth_url_input', verificationUrl: 'https://example.test/signin', userCode: '' } },
+test('the pre-job external action creates client_pty and immediately exposes a labelled command', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const host = interactiveHost();
+    const bodies = [];
+    let deletes = 0;
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                const body = JSON.parse(init.body);
+                bodies.push(body);
+                if (!body.transport) return json(409, {
+                    error: 'terminal helper unavailable',
+                    code: 'terminal_transport_unavailable',
+                    required_actions: ['use_external_terminal'],
+                });
+                return json(200, {
+                    job_id: 'external-job', job: { state: 'running' },
+                    attach_command: 'CLAUDEXOR_CONFIG_DIR=/owned claudexor setup attach external-job',
+                    attach_shell: 'posix', disclosure_native: false,
+                    setup_login_source: 'per_harness',
+                });
+            }
+            if (init.method === 'DELETE') {
+                deletes += 1;
+                return json(200, { job: { state: 'cancelled' } });
+            }
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    await ctl.start('one', 'work');
+    assert.equal(ctl.active.absent, true);
+    assert.equal(ctl.active.custodyStatus, LOGIN_CUSTODY_RELEASED);
+    assert.ok(host.innerHTML.includes('data-login-external-terminal'));
+    host.click('[data-login-external-terminal]');
+    await flush();
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[1].transport, 'client_pty');
+    assert.equal(deletes, 0, 'the proven pre-job absence needs no invented DELETE');
+    assert.ok(host.innerHTML.includes('data-login-external-command'), host.innerHTML);
+    assert.ok(host.innerHTML.includes('Command for POSIX shell'), host.innerHTML);
+    assert.ok(host.innerHTML.includes('claudexor setup attach external-job'), host.innerHTML);
+    assert.equal(await ctl.dispose(), LOGIN_CUSTODY_RELEASED);
+    assert.equal(deletes, 1, 'dispose releases the newly created external job');
+    store.dispose();
+});
+
+test('Retry preserves the exact active client_pty transport in the next create body', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const host = interactiveHost();
+    const bodies = [];
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                bodies.push(JSON.parse(init.body));
+                if (bodies.length === 1) return json(400, {
+                    error: 'temporary refusal', code: 'profile_temporarily_unavailable',
+                });
+                return json(200, { job_id: 'retry-external', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') return json(200, { job: { state: 'cancelled' } });
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+
+    await ctl.start('one', 'work', 'client_pty');
+    assert.ok(host.innerHTML.includes('data-login-retry'), host.innerHTML);
+    host.click('[data-login-retry]');
+    await flush();
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[0].transport, 'client_pty');
+    assert.equal(bodies[1].transport, 'client_pty');
+    assert.equal(bodies[1].profile_id, 'work');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('a durable native-command terminal receipt exposes the external action after polling', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(200, { job_id: 'durable-job', job: { state: 'running' } });
+            }
+            return json(200, { job: {
+                state: 'failed',
+                outcome: { reason: 'command_failed' },
+                nativeCommand: { errorCode: 'terminal_transport_failed' },
+            } });
+        },
+    });
+    await ctl.start('one', 'work');
+    t.mock.timers.tick(3000);
+    await flush();
+    assert.ok(host.innerHTML.includes('data-login-external-terminal'), host.innerHTML);
+    assert.ok(host.innerHTML.includes('Continue in external terminal'), host.innerHTML);
+    assert.equal(await ctl.dispose(), LOGIN_CUSTODY_RELEASED);
+    store.dispose();
+    t.mock.timers.reset();
+});
+
+// ---------------------------------------------------------------------------
+// The "name the account" face: an engine that returns the typed required-
+// profile action for a DEFAULT login asks for a named account instead of
+// leaving a dead error. The discriminator is the engine's exact typed code +
+// required action — never a harness name, family emptiness or prose.
+// ---------------------------------------------------------------------------
+
+function nameFaceStatusPayload(rows) {
+    return {
+        daemon: { state: 'running', engine_version: '3.5.0', runtime: {} },
+        config_dir: '/home/agent',
+        harnesses: [{ id: 'zephyr' }],
+        profiles: { harnessAccounts: rows, profiles: [] },
+        quota: [],
     };
-    const full = loginCardHtml(active, 999999);
-    assert.ok(full.includes('data-login-code-input'), 'full keeps the optional paste-code entry');
-    assert.ok(full.includes('data-login-advanced'), 'full keeps the collapsed terminal fallback');
-    assert.ok(full.includes('data-login-dismiss'));
+}
 
-    const compact = loginCardHtml(active, 999999, { mode: LOGIN_CARD_COMPACT });
-    // The sign-in action itself survives — a card that cannot start the login
-    // would be worse than none.
-    assert.ok(compact.includes('data-open-signin'), 'compact keeps the sign-in link');
-    assert.ok(compact.includes('data-login-state'), 'compact keeps the progress line');
-    assert.ok(!compact.includes('data-login-code-input'));
-    assert.ok(!compact.includes('data-login-advanced'));
-    assert.ok(!compact.includes('data-login-dismiss'));
-    assert.ok(compact.includes(`data-login-mode="${LOGIN_CARD_COMPACT}"`));
+const ENGINE_SAID = 'harness "zephyr" has no default credential store: '
+    + 'sign in from a named account (add one first, then start the login from it)';
+const REQUIRED_PROFILE = {
+    error: ENGINE_SAID,
+    code: 'credential_profile_required',
+    required_actions: ['add_named_account'],
+};
 
-    // A settled non-success verdict offers Try again in compact (the wizard has
-    // no account row behind it to retry from).
-    const failed = loginCardHtml({ ...active, verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' } },
-        999999, { mode: LOGIN_CARD_COMPACT });
-    assert.ok(failed.includes('data-login-retry'));
-    assert.ok(failed.includes('Could not confirm the sign-in yet'));
+test('create-400 on an EMPTY family becomes the name-the-account face, and its submit runs the standard NAMED flow', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const posts = [];
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                const body = JSON.parse(init.body);
+                posts.push(body);
+                if (!body.profile_id) return json(400, REQUIRED_PROFILE);
+                return json(200, { job_id: 'job-named', job: { state: 'running', phase: 'awaiting_user' } });
+            }
+            if (init.method === 'DELETE') return json(200, { job: { state: 'cancelled' } });
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    await ctl.start('zephyr', '');
+    // The engine's own sentence, verbatim (quotes render HTML-escaped).
+    assert.ok(host.innerHTML.includes('has no default credential store: '
+        + 'sign in from a named account (add one first, then start the login from it)'),
+        `the engine's own sentence is shown: ${host.innerHTML}`);
+    assert.equal(ctl.active.needsProfile.message, ENGINE_SAID,
+        'the card holds the engine sentence untouched');
+    assert.match(host.innerHTML, /data-profile-name-input/);
+    assert.match(host.innerHTML, /data-profile-name-submit/);
+    assert.ok(!host.innerHTML.includes('data-login-retry'),
+        'not the dead-end error face — its Try again would repeat the refused default login');
+    assert.ok(!host.innerHTML.includes('data-login-state'),
+        'no live progress line: nothing is running');
+    assert.equal(store.polling, false, 'a refused create holds no status poll');
 
-    const verified = loginCardHtml({ ...active, verdict: { kind: 'success', reason: '' } },
-        999999, { mode: LOGIN_CARD_COMPACT });
-    assert.ok(verified.includes('Connected.'));
-    assert.ok(!verified.includes('data-login-retry'), 'nothing to retry once verified');
+    // Same validation as Add account: a name normalization would rewrite is
+    // shown back editable, and does NOT start a login.
+    ctl.active.profileNameValue = 'Work Laptop';
+    ctl.submitProfileName();
+    assert.equal(posts.length, 1, 'an unstable name must not be submitted');
+    assert.ok(host.innerHTML.includes('will be saved as &quot;work-laptop&quot;')
+        || host.innerHTML.includes('will be saved as "work-laptop"'), host.innerHTML);
+    assert.equal(ctl.active.profileNameValue, 'work-laptop');
+
+    // The stable name starts the NAMED login through the one standard flow.
+    ctl.submitProfileName();
+    await flush();
+    assert.equal(posts.length, 2);
+    assert.equal(posts[1].harness, 'zephyr');
+    assert.equal(posts[1].profile_id, 'work-laptop');
+    assert.ok(host.innerHTML.includes('(work-laptop)'), `the card now runs the named login: ${host.innerHTML}`);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'), 'the name face was replaced');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('the name-the-account continuation preserves an explicit client_pty transport', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const posts = [];
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                const body = JSON.parse(init.body);
+                posts.push(body);
+                if (!body.profile_id) return json(400, REQUIRED_PROFILE);
+                return json(200, { job_id: 'named-external', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') return json(200, { job: { state: 'cancelled' } });
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+
+    await ctl.start('zephyr', '', 'client_pty');
+    ctl.active.profileNameValue = 'work';
+    ctl.submitProfileName();
+    await flush();
+    assert.equal(posts.length, 2);
+    assert.equal(posts[0].transport, 'client_pty');
+    assert.equal(posts[1].transport, 'client_pty');
+    assert.equal(posts[1].profile_id, 'work');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('an unrelated create-400 stays ordinary even when the family is empty', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, { error: 'loginFlow is not accepted for this harness' });
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.ok(host.innerHTML.includes('data-login-retry'), `ordinary error face: ${host.innerHTML}`);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'),
+        'empty-family heuristics must not turn an unrelated 400 into a name request');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('the typed required-profile action selects the name face independent of family rows', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([
+            { harness_id: 'zephyr', native_login_detected: true },
+        ])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, REQUIRED_PROFILE);
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.match(host.innerHTML, /data-profile-name-input/);
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('required-profile code without its action and unrelated 409 remain ordinary errors', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    let response = json(400, {
+        error: ENGINE_SAID, code: 'credential_profile_required', required_actions: [],
+    });
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => (
+            url === '/api/claudexor/login' && init.method === 'POST'
+                ? response : json(404, {})),
+    });
+    await ctl.start('zephyr', '');
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'));
+    response = json(409, { error: 'different conflict', code: 'credential_profile_ambiguous',
+        required_actions: ['disable_extra_profiles'] });
+    await ctl.start('zephyr', '');
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'));
+    assert.equal(ctl.active.absent, true, 'a typed pre-job conflict proves no job exists');
+    assert.equal(ctl.active.custodyStatus, LOGIN_CUSTODY_RELEASED);
+    assert.equal(await ctl.dispose(), LOGIN_CUSTODY_RELEASED);
+    store.dispose();
+});
+
+test('create 5xx / transport death stays the ordinary error face even for an empty family', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    let mode = '503';
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                if (mode === '503') return json(503, { error: 'daemon_unreachable: connect refused' });
+                throw new Error('network down');
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.ok(host.innerHTML.includes('data-login-retry'), host.innerHTML);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'),
+        'a 503 is no verdict about the login shape');
+    // Transport death: same rule.
+    mode = 'throw';
+    await ctl.start('zephyr', '');
+    assert.ok(host.innerHTML.includes('data-login-retry'), host.innerHTML);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'));
+    assert.equal(ctl.active.absent, false,
+        'untyped discovery/transport failure cannot prove whether create ran');
+    assert.equal(await ctl.dispose(), LOGIN_CUSTODY_UNKNOWN);
+    store.dispose();
+});
+
+test('a create-400 NAMED login never asks for a name again (only the default-login shape does)', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, { error: 'profile id is not acceptable' });
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', 'work');
+    assert.ok(host.innerHTML.includes('data-login-retry'), host.innerHTML);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'));
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('Close on the name-the-account face detaches as released — the refused create provably made no job', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const calls = [];
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            calls.push(`${init.method || 'GET'} ${url}`);
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, REQUIRED_PROFILE);
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.match(host.innerHTML, /data-profile-name-input/);
+    const closed = await ctl.close(ctl.active);
+    assert.equal(closed, LOGIN_CUSTODY_RELEASED, 'no job was ever created, custody is trivially released');
+    assert.equal(host.innerHTML, '', 'the card is gone');
+    assert.ok(!calls.some((c) => c.startsWith('DELETE')), 'nothing to DELETE');
+    store.dispose();
+});
+
+test('the verify-race adopts the job\'s OWN resolved profile id, and only a string one', () => {
+    // Unified engines resolve a default login onto their bootstrap registry
+    // row and the job record names it (plan §K.4) — the row the verify-race
+    // must ask about, because no row with the empty id exists there. A legacy
+    // engine's default job carries null, which reads as the empty-string
+    // address, byte-identical to the old behavior.
+    assert.equal(resolvedJobProfileId({ job: { profileId: 'codex-default' } }), 'codex-default');
+    assert.equal(resolvedJobProfileId({ job: { profileId: null } }), '');
+    assert.equal(resolvedJobProfileId({ job: {} }), '');
+    assert.equal(resolvedJobProfileId({}), '');
+    assert.equal(resolvedJobProfileId(null), '');
+    // Fail-safe against a future non-string spelling: never a coerced name.
+    assert.equal(resolvedJobProfileId({ job: { profileId: 42 } }), '');
+});
+
+test('preserveCardFocus keeps the caret in the name-the-account input across a re-render', () => {
+    let focused = null;
+    const nextInput = {
+        disabled: false,
+        focus() { focused = this; },
+        setSelectionRange(a, b) { this.sel = [a, b]; },
+    };
+    const prior = {
+        selectionStart: 2, selectionEnd: 4,
+        hasAttribute: (attr) => attr === 'data-profile-name-input',
+    };
+    const host = {
+        contains: (el) => el === prior,
+        querySelector: (sel) => (sel === '[data-profile-name-input]' ? nextInput : null),
+    };
+    preserveCardFocus(host, () => {}, { activeElement: prior });
+    assert.equal(focused, nextInput, 'focus lands on the replacement input');
+    assert.deepEqual(nextInput.sel, [2, 4], 'the selection survives the swap');
+});
+
+test('normalizeProfileName enforces the engine slug contract ^[a-z0-9][a-z0-9_-]{0,63}$', () => {
+    // The engine's profile registration refuses anything else; a name the
+    // normalization cannot make legal comes back '' so the dialog asks again
+    // instead of submitting a doomed create.
+    assert.equal(normalizeProfileName('Work Laptop'), 'work-laptop');
+    assert.equal(normalizeProfileName('-lead'), 'lead', 'a slug may not start with a separator');
+    assert.equal(normalizeProfileName('__x_'), 'x_');
+    assert.equal(normalizeProfileName('Работа'), '', 'no ASCII alphanumeric at all cannot become a slug');
+    assert.equal(normalizeProfileName('a'.repeat(80)).length, 64, 'capped at the engine 64');
+    assert.equal(normalizeProfileName('9start'), '9start', 'a digit is a legal first character');
+    const submitted = profileNameSubmission('Работа');
+    assert.equal(submitted.profile, '', 'an unslugifiable name never starts a login');
+    assert.ok(submitted.note.includes('starts with a lowercase letter or digit'));
 });
 
 

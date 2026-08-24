@@ -236,9 +236,9 @@ def test_search_code_has_result_limit():
     for _handoff_tool in ("wait_task", "wait_tasks", "get_task_result"):
         assert _handoff_tool in UNTRUNCATED_TOOL_RESULTS
     from ouroboros.tool_capabilities import FOREGROUND_MUTATIVE_TOOLS
-    # D10 retired claude_code_edit — the only foreground-mutative tool. The
-    # CLASS stays wired (an empty set) so a successor lands as one entry.
-    assert FOREGROUND_MUTATIVE_TOOLS == frozenset()
+    # Publication can create a remote branch/commit/PR. Its outer timeout must
+    # not return while that foreground mutator is still running.
+    assert FOREGROUND_MUTATIVE_TOOLS == frozenset({"submit_skill_to_hub"})
 
 
 def test_extract_video_frames_visible_where_media_siblings_are_visible():
@@ -564,15 +564,19 @@ def test_schedule_subagent_in_initial_schemas():
     assert "shell" in props["required_capabilities"]["items"]["enum"]
 
 
-def test_schedule_subagent_required_capabilities_fail_fast_for_readonly(tmp_path):
+def test_schedule_subagent_required_capabilities_fail_fast_for_readonly(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
     from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
 
     ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     ctx.repo_dir.mkdir(parents=True)
     ctx.drive_root.mkdir(parents=True)
     result = _schedule_task(
         ctx,
+        subagent_id=subagent_id,
         objective="Need git diff",
         expected_output="diff summary",
         required_capabilities=["shell", "vcs"],
@@ -581,9 +585,12 @@ def test_schedule_subagent_required_capabilities_fail_fast_for_readonly(tmp_path
     assert "SUBAGENT_CAPABILITY_MISMATCH" in result
 
 
-def test_schedule_subagent_required_delegate_capability_is_satisfied_for_readonly(tmp_path):
+def test_schedule_subagent_required_delegate_capability_is_satisfied_for_readonly(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
     from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
 
     events = []
     ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
@@ -593,6 +600,7 @@ def test_schedule_subagent_required_delegate_capability_is_satisfied_for_readonl
     ctx.task_id = "parent1"
     result = _schedule_task(
         ctx,
+        subagent_id=subagent_id,
         objective="Delegate deeper readonly work",
         expected_output="child id",
         required_capabilities=["delegate"],
@@ -603,9 +611,12 @@ def test_schedule_subagent_required_delegate_capability_is_satisfied_for_readonl
     assert events[0]["required_capabilities"] == ["delegate"]
 
 
-def test_schedule_subagent_required_vcs_capability_is_satisfied_for_readonly(tmp_path):
+def test_schedule_subagent_required_vcs_capability_is_satisfied_for_readonly(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
     from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
 
     events = []
     ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
@@ -615,6 +626,7 @@ def test_schedule_subagent_required_vcs_capability_is_satisfied_for_readonly(tmp
     ctx.task_id = "parent1"
     result = _schedule_task(
         ctx,
+        subagent_id=subagent_id,
         objective="Inspect git status in readonly child",
         expected_output="status summary",
         required_capabilities=["vcs"],
@@ -1265,6 +1277,7 @@ def test_protected_black_box_recursive_policy_maps_executor_backend_paths(tmp_pa
 def test_schedule_subagent_inherits_workspace_executor_ref(tmp_path, monkeypatch):
     from ouroboros.contracts.task_contract import build_task_contract
     from ouroboros.tools.registry import ToolContext, ToolRegistry
+    from tests._shared import configure_test_subagent
 
     system_repo = tmp_path / "system"
     workspace = tmp_path / "workspace"
@@ -1304,14 +1317,15 @@ def test_schedule_subagent_inherits_workspace_executor_ref(tmp_path, monkeypatch
     )
     registry.set_context(ctx)
     monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "4")
+    subagent_id = configure_test_subagent(monkeypatch)
 
     result = registry.execute(
         "schedule_subagent",
         {
+            "subagent_id": subagent_id,
             "objective": "Inspect the workspace contract.",
             "expected_output": "A concise report.",
             "role": "auditor",
-            "model_lane": "light",
         },
     )
 

@@ -94,16 +94,16 @@ def _nanny_finalization_message(
     """The honest nanny reminder for a harness-dispatched child at finalization —
     or '' when no reminder is deserved.
 
-    F4 (2026-08-10 saga): the old reminder accused children whose delegated runs
-    CRASHED of "choosing" not to delegate, and fired even when the delegate verbs
+    F4 (2026-08-10 saga): the old reminder accused children whose delegated
+    runs CRASHED of "choosing" not to delegate, and fired even when the verbs
     were policy-hidden. Two structural facts fix both: the task's own visible
     toolset, and durable custody evidence (delegate_custody.
     task_execution_evidence), which spans the WHOLE task — per-execution
     llm_trace resets on continuation. `trace_attempted` is the third fact: a
-    delegate_start in THIS execution's trace. It must not suppress the failure
-    message (triad finding on e84475f2: delegate, run dies, finish by hand,
-    finalize — all inside ONE execution), only the accusation when custody has
-    no rows yet (a pending/uncustodied start is an attempt, not a choice)."""
+    delegate_start in THIS execution's trace; it must not suppress the failure
+    message (triad, e84475f2: delegate, run dies, finish by hand, finalize —
+    all in ONE execution), only the accusation when custody has no rows yet (a
+    pending/uncustodied start is an attempt, not a choice)."""
     try:
         if "delegate_start" not in set(tools.available_tools()):
             return ""  # the verbs are invisible here; "you chose not to" would be false
@@ -113,11 +113,10 @@ def _nanny_finalization_message(
     try:
         from ouroboros.delegate_custody import custody_root, task_execution_evidence
 
-        # Split-root fix (2026-08-10 amendments): custody WRITES land on the
-        # CANONICAL (budget) root, but this read used the loop's drive_root —
-        # a split-root subagent's child drive has no custody rows, leaving
-        # the nanny blind. Resolve the SAME root the writers use; the passed
-        # drive_root stays the fallback (e.g. unit-test stubs).
+        # Split-root fix (2026-08-10): custody WRITES land on the CANONICAL
+        # (budget) root, but this read used the loop's drive_root — a split-root
+        # child drive has no custody rows, leaving the nanny blind. Resolve the
+        # SAME root the writers use; drive_root stays the unit-stub fallback.
         try:
             evidence_root = custody_root(tools._ctx)
         except Exception:
@@ -150,20 +149,18 @@ def _nanny_finalization_message(
         # evidence: an unreadable custody log (or a failed read above) proves
         # nothing (scope finding on a5e59bdf).
         return ""
-    if not started and trace_attempted:
-        # A start this execution's trace saw but custody has no row for: pending
-        # settlement or an uncustodied start. An attempt either way — neither
-        # accusation fits, and the wait/cancel path owns its own disclosure.
+    if not started and (trace_attempted or evidence.get("delegate_start_attempted")):
+        # Pending, refused or uncustodied starts are still real attempts.
         return ""
     settled = int(evidence.get("delegated_runs_settled") or 0)
     failure_states = [str(s) for s in (evidence.get("delegated_run_failure_states") or [])]
     pending = max(0, started - settled)
     if pending:
-        # PENDING ≠ FAILED (sol review on b49f8192): a STARTED row with no
+        # PENDING ≠ FAILED (sol review, b49f8192): a STARTED row with no
         # settlement may still be executing — calling it failed invites a
         # duplicate run, and finalizing over it orphans the result. Takes
-        # precedence over the failed message: with a run in flight, "retry"
-        # is wrong even when an earlier sibling died (still a fact below).
+        # precedence over the failed message: with a run in flight, "retry" is
+        # wrong even when an earlier sibling died (still a fact below).
         failed_note = (
             f" {len(failure_states)} earlier run(s) already ended: {', '.join(failure_states)}."
             if failure_states else ""

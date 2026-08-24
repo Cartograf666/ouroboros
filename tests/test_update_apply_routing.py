@@ -265,6 +265,14 @@ def _wire_smart(monkeypatch, plans):
     monkeypatch.setattr(update_merge, "acquire_update_lock", lambda: object())
     monkeypatch.setattr(update_merge, "release_update_lock", lambda _lock: None)
     monkeypatch.setattr(control, "_quiesce_repo_writers", lambda _reason: [])
+    # Stash-first prologue (Q9): stub the shared stash step and its unwind so
+    # routing tests exercise ONLY the lane choice.
+    monkeypatch.setattr(
+        control,
+        "_stash_local_work_fenced",
+        lambda **_kwargs: ({"phase": "stashing_local_work", "stash_sha": "", "local_work_carrier": "none"}, None),
+    )
+    monkeypatch.setattr(control, "_unwind_stashed_update", lambda _tx, _context: "")
 
 
 def test_smart_update_routes_clean_plan_to_supervisor_apply(monkeypatch):
@@ -272,12 +280,12 @@ def test_smart_update_routes_clean_plan_to_supervisor_apply(monkeypatch):
     monkeypatch.setattr(
         control,
         "_apply_clean_merge_fenced",
-        lambda _request, plan: JSONResponse({"route": "clean", "target": plan["target_sha"]}),
+        lambda _request, plan, _tx: JSONResponse({"route": "clean", "target": plan["target_sha"]}),
     )
     monkeypatch.setattr(
         control,
         "_start_assisted_merge_fenced",
-        lambda _plan: (_ for _ in ()).throw(AssertionError("assisted should not run")),
+        lambda *_args: (_ for _ in ()).throw(AssertionError("assisted should not run")),
     )
 
     response = asyncio.run(control._apply_smart_update(
@@ -293,7 +301,7 @@ def test_smart_update_routes_clean_divergence_to_deterministic_git_path(monkeypa
     monkeypatch.setattr(
         control,
         "_apply_clean_merge_fenced",
-        lambda _request, plan: JSONResponse({"route": "clean", "merge": plan["merge_commit"]}),
+        lambda _request, plan, _tx: JSONResponse({"route": "clean", "merge": plan["merge_commit"]}),
     )
     monkeypatch.setattr(
         control,
@@ -308,9 +316,15 @@ def test_smart_update_routes_clean_divergence_to_deterministic_git_path(monkeypa
     assert _body(response) == {"route": "clean", "merge": "c" * 40}
 
 
-def test_smart_update_routes_dirty_or_conflicting_plan_to_assisted(monkeypatch):
-    dirty = _plan(local_dirty_count=1, merge_commit="")
-    _wire_smart(monkeypatch, [dirty, dirty])
+def test_smart_update_routes_conflicting_plan_to_assisted(monkeypatch):
+    """Stash-first supersession: the OLD contract routed a DIRTY plan to
+    assisted; since Q9 the apply-path replan runs post-stash on a clean tree,
+    so the assisted route is chosen by CONFLICTS alone (a dirty plan2 is the
+    late-local-changes abort, pinned by its own test below)."""
+    conflicting = _plan(
+        kind="conflicting", merge_commit="", code_conflict_paths=["ouroboros/loop.py"]
+    )
+    _wire_smart(monkeypatch, [conflicting, conflicting])
     monkeypatch.setattr(
         control,
         "_apply_clean_merge_fenced",
@@ -319,14 +333,14 @@ def test_smart_update_routes_dirty_or_conflicting_plan_to_assisted(monkeypatch):
     monkeypatch.setattr(
         control,
         "_start_assisted_merge_fenced",
-        lambda plan: JSONResponse({"route": "assisted", "dirty": plan["local_dirty_count"]}),
+        lambda plan, _tx: JSONResponse({"route": "assisted", "conflicts": plan["code_conflict_paths"]}),
     )
 
     response = asyncio.run(control._apply_smart_update(
         _Request(), expected_base_sha=BASE, expected_target_sha=TARGET
     ))
 
-    assert _body(response) == {"route": "assisted", "dirty": 1}
+    assert _body(response) == {"route": "assisted", "conflicts": ["ouroboros/loop.py"]}
 
 
 def test_assisted_update_refuses_before_mutation_when_budget_is_exhausted(monkeypatch):
@@ -349,21 +363,70 @@ def test_assisted_update_refuses_before_mutation_when_budget_is_exhausted(monkey
         local_dirty_count=1,
         local_snapshot=BASE,
         code_conflict_paths=["local.py"],
-    ))
+    ), {"phase": "stashing_local_work", "stash_sha": "", "local_work_carrier": "none"})
 
     assert response.status_code == 409
     assert "needs model budget" in _body(response)["error"]
+
+
+def test_assisted_update_refuses_when_one_review_wave_is_unaffordable(monkeypatch):
+    """Affordability floor: remaining budget above zero but below one estimated
+    triad+scope wave refuses BEFORE any repo mutation (rescue included)."""
+    import ouroboros.reviewer_slot_config as reviewer_slot_config
+    import ouroboros.usage_accounting as usage_accounting
+    import supervisor.git_ops as git_ops
+    import supervisor.state as state
+
+    monkeypatch.setattr(state, "load_state", lambda: {})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 0.4)
+    monkeypatch.setattr(control, "_respawn_workers_after_failed_update", lambda: None)
+    api_row = SimpleNamespace(target_id="openai/gpt-test", is_session=False)
+    monkeypatch.setattr(reviewer_slot_config, "commit_triad_rows", lambda: [api_row])
+    monkeypatch.setattr(reviewer_slot_config, "commit_scope_rows", lambda: [api_row])
+    monkeypatch.setattr(
+        usage_accounting,
+        "review_wave_admission",
+        lambda **kwargs: {
+            "fits": False,
+            "estimated_wave_usd": 3.21,
+            "remaining_usd": kwargs.get("remaining_usd_override"),
+        },
+    )
+    monkeypatch.setattr(
+        git_ops,
+        "_create_rescue_snapshot",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("floor refusal must happen before rescue/materialization")
+        ),
+    )
+
+    response = control._start_assisted_merge_fenced(_plan(
+        kind="conflicting",
+        local_dirty_count=0,
+        local_snapshot=BASE,
+        code_conflict_paths=["local.py"],
+    ), {"phase": "stashing_local_work", "stash_sha": "", "local_work_carrier": "none"})
+
+    assert response.status_code == 409
+    body = _body(response)
+    assert "review wave" in body["error"]
+    assert body["estimated_wave_usd"] == 6.42  # triad + scope surfaces summed
 
 
 @pytest.mark.parametrize(("ready", "expected_status"), [(True, 200), (False, 409)])
 def test_assisted_resolver_boots_before_conflicts_reach_live_tree(
     monkeypatch, ready, expected_status
 ):
+    import ouroboros.reviewer_slot_config as reviewer_slot_config
     import supervisor.git_ops as git_ops
     import supervisor.state as state
     import supervisor.update_merge as update_merge
     import supervisor.workers as workers
 
+    # No API reviewer rows -> the wave-floor estimator is skipped entirely
+    # (agent-session rows ride subscriptions, not USD budget).
+    monkeypatch.setattr(reviewer_slot_config, "commit_triad_rows", lambda: [])
+    monkeypatch.setattr(reviewer_slot_config, "commit_scope_rows", lambda: [])
     calls = []
     monkeypatch.setattr(git_ops, "BRANCH_DEV", "ouroboros")
     monkeypatch.setattr(git_ops, "_create_rescue_snapshot", lambda *_a, **_k: None)
@@ -374,9 +437,16 @@ def test_assisted_resolver_boots_before_conflicts_reach_live_tree(
             "unpushed_lines": [], "warnings": [],
         },
     )
-    monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (
-        (0, "ouroboros", "") if "--abbrev-ref" in cmd else (0, "", "")
-    ))
+    def _capture(cmd):
+        if "--abbrev-ref" in cmd:
+            return 0, "ouroboros", ""
+        if "MERGE_HEAD" in cmd:
+            return 1, "", ""
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            return 0, BASE, ""
+        return 0, "", ""
+
+    monkeypatch.setattr(git_ops, "git_capture", _capture)
     monkeypatch.setattr(state, "load_state", lambda: {"owner_chat_id": 1})
     monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 10.0)
     monkeypatch.setattr(update_merge, "create_rescue_local_ref", lambda _sha: True)
@@ -393,7 +463,7 @@ def test_assisted_resolver_boots_before_conflicts_reach_live_tree(
     monkeypatch.setattr(
         update_merge,
         "materialize_assisted_merge_live",
-        lambda *_a: (calls.append("materialize") or True, "ok"),
+        lambda *_a: (calls.append("materialize") or True, "ok", "m0tree"),
     )
     monkeypatch.setattr(
         update_merge,
@@ -419,7 +489,7 @@ def test_assisted_resolver_boots_before_conflicts_reach_live_tree(
     response = control._start_assisted_merge_fenced(_plan(
         kind="conflicting", local_dirty_count=1,
         local_snapshot=BASE, code_conflict_paths=["ouroboros/config.py"],
-    ))
+    ), {"phase": "stashing_local_work", "stash_sha": "", "local_work_carrier": "none"})
 
     assert response.status_code == expected_status
     if ready:
@@ -432,6 +502,79 @@ def test_assisted_resolver_boots_before_conflicts_reach_live_tree(
             "close_gate", f"resolver_ready:{BASE}",
             "kill_rejected_worker", "respawn_clean_pool",
         ]
+
+
+def test_stash_lookup_unknown_keeps_the_durable_tx_for_boot(monkeypatch):
+    """A push whose entry exists but cannot be LISTED must keep the
+    stashing_local_work tx on disk — boot retries the lookup and restores;
+    clearing it would orphan the owner's work behind an HTTP error."""
+    import supervisor.git_ops as git_ops
+    import supervisor.update_merge as update_merge
+
+    monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (0, " M dirty.txt", ""))
+    writes, cleared = [], []
+    monkeypatch.setattr(update_merge, "write_update_tx", lambda tx: writes.append(dict(tx)))
+    monkeypatch.setattr(
+        update_merge, "stash_local_changes_for_update",
+        lambda _attempt: ("lookup_unknown", "", "storage down"),
+    )
+    monkeypatch.setattr(
+        update_merge, "clear_update_tx",
+        lambda: cleared.append(True) or True,
+    )
+    monkeypatch.setattr(control, "_respawn_workers_after_failed_update", lambda: None)
+
+    tx, failure = control._stash_local_work_fenced(
+        branch="ouroboros", base_sha=BASE, target_sha=TARGET, plan=_plan(),
+    )
+
+    assert tx is None and failure is not None
+    assert failure.status_code == 409
+    assert _body(failure)["reason"] == "stash_lookup_unknown"
+    assert writes, "the durable stashing_local_work tx was never written"
+    assert cleared == [], "the tx was cleared — boot can no longer recover the stash"
+
+
+def test_resolver_fence_blockers_still_unwind_the_stash(monkeypatch):
+    """Hung writers after a failed resolver boot must not strand the owner's
+    stashed work behind a live tx: the tree was never touched, so the prologue
+    is unwound and the fence response discloses the restore."""
+    import ouroboros.reviewer_slot_config as reviewer_slot_config
+    import supervisor.git_ops as git_ops
+    import supervisor.state as state
+    import supervisor.update_merge as update_merge
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(reviewer_slot_config, "commit_triad_rows", lambda: [])
+    monkeypatch.setattr(reviewer_slot_config, "commit_scope_rows", lambda: [])
+    monkeypatch.setattr(git_ops, "BRANCH_DEV", "ouroboros")
+    monkeypatch.setattr(git_ops, "_create_rescue_snapshot", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        git_ops, "_collect_repo_sync_state",
+        lambda: {"current_branch": "ouroboros", "dirty_lines": [], "unpushed_lines": [], "warnings": []},
+    )
+    monkeypatch.setattr(state, "load_state", lambda: {"owner_chat_id": 1})
+    monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 10.0)
+    monkeypatch.setattr(update_merge, "create_rescue_local_ref", lambda _sha: "rescue-local-x")
+    monkeypatch.setattr(update_merge, "ensure_assisted_resolver_ready", lambda _sha: False)
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda _reason: None)
+    monkeypatch.setattr(workers, "kill_workers_for_update", lambda **_k: ["stuck-writer"])
+    unwound = []
+    monkeypatch.setattr(
+        control, "_unwind_stashed_update",
+        lambda _tx, context: unwound.append(context) or "local changes restored",
+    )
+
+    response = control._start_assisted_merge_fenced(_plan(
+        kind="conflicting", local_dirty_count=0,
+        local_snapshot=BASE, code_conflict_paths=["x.py"],
+    ), {"phase": "stashing_local_work", "stash_sha": "s" * 40, "local_work_carrier": "stash"})
+
+    assert response.status_code == 409
+    body = _body(response)
+    assert body["reason"] == "update_writer_fence_blocked"
+    assert body["stash_note"] == "local changes restored"
+    assert unwound == ["assisted_resolver_fence_blocked"]
 
 
 def test_unknown_plan_refuses_before_writer_fence(monkeypatch):
@@ -470,6 +613,24 @@ def test_post_fence_sha_drift_aborts_and_respawns(monkeypatch):
     assert calls == ["respawn"]
 
 
+def test_late_local_changes_after_stash_abort_the_update(monkeypatch):
+    """The post-stash replan must describe a CLEAN tree: late dirt (a human
+    editing between the stash and the replan) aborts fail-closed instead of
+    riding the synthetic-snapshot path into committed history."""
+    dirty_plan2 = _plan(local_dirty_count=2, merge_commit="")
+    _wire_smart(monkeypatch, [_plan(merge_commit=""), dirty_plan2])
+    calls = []
+    monkeypatch.setattr(control, "_respawn_workers_after_failed_update", lambda: calls.append("respawn"))
+
+    response = asyncio.run(control._apply_smart_update(
+        _Request(), expected_base_sha=BASE, expected_target_sha=TARGET
+    ))
+
+    assert response.status_code == 409
+    assert _body(response)["reason"] == "late_local_changes"
+    assert calls == ["respawn"]
+
+
 def test_landed_update_without_restart_callback_is_a_successful_manual_restart_response():
     request = _Request()
     request.app.state = SimpleNamespace()
@@ -494,16 +655,25 @@ def test_clean_apply_publishes_smoke_proof_only_after_pass(monkeypatch):
             "unpushed_lines": [], "warnings": [],
         },
     )
-    monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (
-        (0, "ouroboros", "")
-        if "--abbrev-ref" in cmd
-        else (0, "", "")
-    ))
+    def _capture(cmd):
+        if "--abbrev-ref" in cmd:
+            return 0, "ouroboros", ""
+        if "MERGE_HEAD" in cmd:
+            return 1, "", ""
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            return 0, BASE, ""
+        return 0, "", ""
+
+    monkeypatch.setattr(git_ops, "git_capture", _capture)
     monkeypatch.setattr(update_merge, "write_update_tx", lambda tx: writes.append(dict(tx)))
     monkeypatch.setattr(update_merge, "apply_managed_merge_update", lambda *_a: (True, "ok"))
     monkeypatch.setattr(update_merge, "update_restart_smoke", lambda: {"ok": True})
 
-    response = control._apply_clean_merge_fenced(_Request(), _plan())
+    response = control._apply_clean_merge_fenced(
+        _Request(), _plan(),
+        {"phase": "stashing_local_work", "stash_sha": "", "local_work_carrier": "none",
+         "pre_update_sha": BASE, "pre_update_branch": "ouroboros", "attempt_id": "attempt"},
+    )
 
     assert response.status_code == 200
     assert [tx["pre_restart_smoke"] for tx in writes] == ["pending", "passed"]

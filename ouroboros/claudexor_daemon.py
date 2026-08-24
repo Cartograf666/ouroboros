@@ -27,10 +27,13 @@ reached through the ``/v2`` control API (``gateways/claudexor.py``).
 """
 
 from __future__ import annotations
+import json
+import re
 
 import logging
 import os
 import pathlib
+import shlex
 import subprocess
 import threading
 import time
@@ -41,6 +44,44 @@ log = logging.getLogger(__name__)
 _OWNED_DIR_NAME = "claudexor"
 _SPAWN_WAIT_SEC = 20.0
 _SPAWN_POLL_SEC = 0.25
+# Admission, distinct from reachability: a 3.4+ daemon serves the authenticated
+# handshake BEFORE its admission gate (the body says `servingMode`), while every
+# product route answers 503 `daemon_recovery_only` (retryable) until journal
+# recovery completes. Recovery can persist indefinitely (blocked journal
+# partitions), so the wait is bounded and ends in the typed refusal the 503
+# already produces (D28) — never a silent indefinite wait, never a kill of a
+# recovering daemon. The 150 ms cadence is the engine CLI's own.
+_ADMISSION_WAIT_SEC = 5.0
+_ADMISSION_POLL_SEC = 0.15
+
+# Engines at/above this version own the limit-action default themselves
+# (kind-aware "auto" semantics, Clawdexor A6): subscription profiles rotate,
+# metered API keys fail, and the OWNER's explicit choices always win. Blanket
+# "rotate" writes from this side would overwrite that judgment, so reconcile
+# skips those engines entirely. Confirmed shipped in the actual 3.6.0 release
+# (claudexor 31aa51c9, schema limit_action enum carries kind-aware "auto"), so
+# this floor names the real release wave (issue #246); it is deliberately not
+# CLAUDEXOR_MIN_VERSION (owner decision 5=A: no floor bump).
+_ROTATION_AUTO_SEMANTICS_MIN_VERSION = "3.6.0"
+_ROTATION_RECEIPT_NAME = "claudexor_rotation_provisioning.json"
+_SETUP_ATTACH_ROLE = "setup_attach"
+_SHELL_POSIX = "posix"
+_SHELL_POWERSHELL = "powershell"
+
+
+def _handshake_serving_mode(body: Any) -> str:
+    """The handshake's explicit admission mode, '' when the engine says nothing.
+
+    Only an EXPLICIT ``recovery_only`` ever counts as recovering: pre-3.4
+    engines carry no ``servingMode`` at all, and an absent or unknown value must
+    read as normal admission — byte-identical behavior for every engine that
+    predates the field.
+    """
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("servingMode") or "").strip().lower()
+
+
 def owned_config_dir() -> pathlib.Path:
     """The data-plane root the owned daemon lives under."""
     from ouroboros.config import DATA_DIR
@@ -133,14 +174,78 @@ def resolve_claudexord() -> str:
     return resolve_external_claudexord()
 
 
-def attach_login_command(job_id: str) -> str:
-    """The copy-paste fallback card's command (D30): run by the USER in the
-    user's own terminal, outside the Ouroboros UI. There is no in-app terminal
-    and there will not be one."""
-    return (
-        f"CLAUDEXOR_CONFIG_DIR={owned_config_dir()} "
-        f"claudexor setup attach {str(job_id)}"
-    )
+def attach_login_shell() -> str:
+    """The explicit shell target for the host's copy-paste fallback."""
+    from ouroboros.platform_layer import IS_WINDOWS
+
+    return _SHELL_POWERSHELL if IS_WINDOWS else _SHELL_POSIX
+
+
+def resolve_attach_login_argv(engine: Any) -> list[str]:
+    """Resolve the packaged attach role on the exact serving engine.
+
+    A live daemon may intentionally lag the reviewed next-spawn pin.  The
+    handshake's version, build SHA and absolute entry therefore select the
+    preserved tree, whose own additive probe role is the capability fact.
+    Older probes remain readable but advertise no role, so they yield a typed
+    unavailable result rather than a bare ``claudexor`` PATH command.
+    """
+    from ouroboros.claudexor_runtime import ClaudexorRuntimeError, get_runtime_manager
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    row = engine if isinstance(engine, dict) else {}
+    try:
+        command = get_runtime_manager().resolve_serving_role_command(
+            engine_version=str(row.get("version") or ""),
+            engine_build_sha=str(row.get("sha") or ""),
+            engine_entry=str(row.get("entry") or ""),
+            role=_SETUP_ATTACH_ROLE,
+        )
+    except ClaudexorRuntimeError as exc:
+        if exc.code == "runtime_role_unavailable":
+            code = "terminal_transport_unsupported"
+            status_code = 409
+            actions: tuple[str, ...] = ()
+        elif exc.code in {
+            "runtime_probe_failed",
+            "runtime_probe_identity_mismatch",
+            "runtime_node_version_mismatch",
+        }:
+            code = "terminal_transport_probe_failed"
+            status_code = 503
+            actions = ("retry_setup_login",)
+        else:
+            code = "terminal_transport_unavailable"
+            status_code = 409
+            actions = ()
+        raise ClaudexorUnavailable(
+            code,
+            f"the packaged external-terminal recovery is unavailable: {exc}",
+            status_code=status_code,
+            required_actions=actions,
+        ) from exc
+    return [*command, "setup", "attach"]
+
+
+def attach_login_command(job_id: str, *, argv: list[str], shell: str = "") -> str:
+    """Render the already-probed packaged attach command for copy/paste."""
+    target = str(shell or attach_login_shell())
+    args = [str(value) for value in (*argv, str(job_id))]
+    env = {
+        "CLAUDEXOR_CONFIG_DIR": str(owned_config_dir()),
+        # Never let an operator socket redirect the exact packaged entry away
+        # from the owned config home.
+        "CLAUDEXOR_DAEMON_SOCK": "",
+    }
+    if target == _SHELL_POSIX:
+        assignments = [f"{key}={shlex.quote(value)}" for key, value in env.items()]
+        return " ".join([*assignments, *(shlex.quote(arg) for arg in args)])
+    if target == _SHELL_POWERSHELL:
+        quote = lambda value: "'" + value.replace("'", "''") + "'"
+        assignments = [f"$env:{key}={quote(value)}" for key, value in env.items()]
+        command = " ".join(["&", *(quote(arg) for arg in args)])
+        return "; ".join([*assignments, command])
+    raise ValueError(f"unsupported shell target: {target}")
 
 
 class OwnedClaudexorDaemon:
@@ -152,6 +257,9 @@ class OwnedClaudexorDaemon:
         self._last_error = ""
         self._engine_version = ""
         self._engine_build_sha = ""
+        # Rotation reconcile (B3): a non-blocking lock dedups CONCURRENT
+        # ensures so they never double-POST settings; nothing else is gated.
+        self._rotation_lock = threading.Lock()
 
     # -- state ------------------------------------------------------------
 
@@ -186,6 +294,9 @@ class OwnedClaudexorDaemon:
                 self._engine_version = gateway.engine_version
                 engine = handshake.get("engine") if isinstance(handshake.get("engine"), dict) else {}
                 self._engine_build_sha = str(engine.get("sha") or "")
+                # Reachable-recovering is still "running" (the handshake proves
+                # identity and liveness); admission is a separate, later
+                # question answered by `ensure_owned_gateway`'s own handshakes.
             return endpoint, "running", ""
         except ClaudexorUnavailable as exc:
             self._engine_version = ""
@@ -357,7 +468,6 @@ class OwnedClaudexorDaemon:
                 endpoint = self._alive_endpoint()
                 if endpoint is not None:
                     self._last_error = ""
-                    self._enable_rotation(endpoint)
                     return endpoint
                 time.sleep(_SPAWN_POLL_SEC)
             # Two Ouroboros processes can race only on first provisioning: the
@@ -370,7 +480,6 @@ class OwnedClaudexorDaemon:
                 if self._proc.poll() is not None:
                     self._proc = None
                 self._last_error = ""
-                self._enable_rotation(endpoint)
                 return endpoint
             tail = ""
             try:
@@ -390,6 +499,14 @@ class OwnedClaudexorDaemon:
                 + (f"; log tail: {tail}" if tail else ""),
             )
 
+    # Spawn-path rotation deferral (the sprint's `_admit_spawned` /
+    # `run_deferred_rotation` pair) was SUPERSEDED at merge by the mainline's
+    # `reconcile_rotation`, which rides EVERY `ensure_owned_gateway` (spawn and
+    # attach), is conditional and idempotent, and treats the recovery-window
+    # 503 as an ordinary retry-next-ensure failure — the same incident class
+    # closed without spawn-time state. REACHABLE stays the whole spawn exit
+    # predicate; the bounded admission wait stays in `ensure_owned_gateway`.
+
     def _terminate_child(self) -> None:
         """Stop and forget the child this manager spawned. Caller holds the lock."""
         proc, self._proc = self._proc, None
@@ -406,28 +523,109 @@ class OwnedClaudexorDaemon:
         except Exception:
             proc.terminate()
 
-    def _enable_rotation(self, endpoint: Any) -> None:
-        """D28 at provisioning: ONE settings patch turns profile auto-rotation
-        on for every discovered harness (the engine default is fail). Config,
-        not code — the daemon owns the rotation engine; best-effort because a
-        patch failure must not eat the login that provisioned the daemon."""
-        try:
-            from ouroboros.gateways.claudexor import ClaudexorGateway
+    def reconcile_rotation(self, gateway: Any) -> None:
+        """D28 as reconciliation (B3): default the MISSING limit-action
+        policies to "rotate", never touching a persisted one.
 
-            with ClaudexorGateway(endpoint) as gateway:
-                gateway.handshake()
-                harness_ids = [
-                    str(row.get("id") or "")
-                    for row in gateway.agent_capabilities().get("harnesses") or []
-                    if isinstance(row, dict) and row.get("id")
-                ]
-                if harness_ids:
+        The predecessor was a spawn-only best-effort patch: one attempt at
+        provisioning, a bare except, and no read-back — so a race with the
+        daemon's startup "serving recovery only" window failed it forever,
+        attach paths never patched at all, and a harness discovered later was
+        never covered. This runs on EVERY ``ensure_owned_gateway`` instead
+        (owner decision 5=A, literal: no read-path TTL — each ensure does the
+        GET, computes the missing set and POSTs conditionally), against the
+        gateway that ensure just handshook:
+
+        * GET the effective settings snapshot, then POST only when a
+          discovered harness carries NO ``profileLimitAction`` at all — an
+          explicitly persisted ``fail``/``ask``/``rotate`` is the owner's (or
+          the engine's) word and is never overwritten (owner decision 3=A);
+        * skip engines whose version owns kind-aware "auto" defaults (A6+):
+          their judgment is strictly better than a blanket "rotate";
+        * the non-blocking lock exists purely to dedup CONCURRENT ensures —
+          the overlapping caller is covered by the reconcile in flight;
+        * ANY failure — the daemon's typed startup "recovery only" refusal
+          included — simply retries on the next ensure; no special case;
+        * a POST that actually changed policy leaves a durable receipt under
+          ``state/`` naming the daemon and the patched harnesses;
+        * never patches a home ``verify_owned_home`` rejects (never-adopt).
+
+        Best-effort by contract: raises nothing, so a reconcile hiccup can
+        never eat the delegation or login that ensured the daemon.
+        """
+        if not self._rotation_lock.acquire(blocking=False):
+            return  # a concurrent ensure is reconciling right now; it covers us
+        try:
+            try:
+                from ouroboros.gateways.claudexor import engine_at_least
+
+                if engine_at_least(str(getattr(gateway, "engine_version", "") or ""),
+                                   _ROTATION_AUTO_SEMANTICS_MIN_VERSION):
+                    return
+                ownership_problem = verify_owned_home()
+                if ownership_problem:
+                    log.warning("rotation reconcile refused (never-adopt): %s",
+                                ownership_problem)
+                    return
+                snapshot = gateway.get_settings()
+                raw_configured = snapshot.get("harnesses") if isinstance(snapshot, dict) else None
+                if not isinstance(raw_configured, dict):
+                    # Shape drift (no harnesses table, or not a dict): unknown state
+                    # must never read as "nothing persisted" — a blanket POST here
+                    # would overwrite judgments this side simply failed to read.
+                    log.warning(
+                        "rotation reconcile skipped: settings snapshot carries no "
+                        "harnesses dict (engine %s)",
+                        str(getattr(gateway, "engine_version", "") or "unknown"))
+                    return
+                configured = raw_configured
+                missing = []
+                for row in gateway.agent_capabilities().get("harnesses") or []:
+                    hid = str(row.get("id") or "") if isinstance(row, dict) else ""
+                    if not hid:
+                        continue
+                    stored = configured.get(hid)
+                    action = stored.get("profileLimitAction") if isinstance(stored, dict) else None
+                    if not str(action or ""):
+                        missing.append(hid)
+                if missing:
                     gateway.patch_settings({
-                        "harnesses": {hid: {"profileLimitAction": "rotate"} for hid in harness_ids},
+                        "harnesses": {hid: {"profileLimitAction": "rotate"} for hid in missing},
                     })
-        except Exception:
-            log.warning("rotation enablement patch failed (D28); the daemon keeps "
-                        "its own default until the next provisioning", exc_info=True)
+                    self._record_rotation_receipt(
+                        str(getattr(gateway, "engine_version", "") or ""), missing)
+            except Exception:
+                log.warning("rotation reconcile failed; the next ensure retries",
+                            exc_info=True)
+        finally:
+            self._rotation_lock.release()
+
+    def _record_rotation_receipt(self, engine_version: str, patched: list) -> None:
+        """Durable half of the reconcile: a settings POST that changed the
+        daemon's policy leaves a record naming the daemon identity, the
+        patched harnesses and the moment — not just a log line (the
+        ``_record_api_fallback_substitution`` pattern)."""
+        import json
+
+        from ouroboros.config import DATA_DIR
+        from ouroboros.utils import utc_now_iso, write_text_atomic
+
+        path = pathlib.Path(DATA_DIR) / "state" / _ROTATION_RECEIPT_NAME
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(path, json.dumps({
+                "ts": utc_now_iso(),
+                "daemon_config_dir": str(owned_config_dir()),
+                "engine_version": str(engine_version or ""),
+                "patched_harnesses": sorted(str(h) for h in patched),
+                "limit_action": "rotate",
+                "reason": "limit_action_absent_defaulted_to_rotate",
+            }, ensure_ascii=False, indent=1))
+        except OSError as exc:
+            # Residual: the POST itself landed — the next ensure's GET sees the values
+            # present and correctly skips — so the only gap is this missing receipt.
+            log.warning("rotation provisioning receipt write failed at %s: %s",
+                        path, exc, exc_info=True)
 
     def stop(self) -> bool:
         """Terminate ONLY a self-started daemon; attached daemons are left alone."""
@@ -449,23 +647,85 @@ def get_owned_daemon() -> OwnedClaudexorDaemon:
         return _MANAGER
 
 
-def ensure_owned_gateway() -> Any:
+def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None) -> Any:
     """Return an authenticated gateway to the lazily ensured owned daemon.
 
-    This is the explicit start/probe seam. The gateway transport itself stays
-    pure I/O; callers own ``close()`` (or use it as a context manager). Daemon
-    stop semantics are unchanged: only ``get_owned_daemon().stop()`` may stop a
-    process this manager spawned, and it never kills an attached process.
-    """
-    from ouroboros.gateways.claudexor import ClaudexorGateway
+    This is the explicit start/probe seam — the ONE funnel every consumer
+    (delegation, review sessions, account surfaces, login) passes through,
+    which is why the rotation reconcile rides it: spawn AND attach paths are
+    both covered, on every ensure, best-effort (see ``reconcile_rotation``).
+    The gateway transport itself stays pure I/O; callers own ``close()`` (or
+    use it as a context manager). Daemon stop semantics are unchanged: only
+    ``get_owned_daemon().stop()`` may stop a process this manager spawned,
+    and it never kills an attached process.
 
-    endpoint = get_owned_daemon().ensure_running()
+    ADMISSION is waited for here — outside the daemon manager's lock, the same
+    way for a fresh spawn and an attach. A daemon whose handshake explicitly
+    says ``servingMode=recovery_only`` answers every product route 503
+    (``daemon_recovery_only``, retryable), so the handshake is re-polled about
+    every 150 ms under a wall-clock deadline of ``admission_wait_sec`` seconds
+    (default ``_ADMISSION_WAIT_SEC``, resolved at call time so tests can shrink
+    it), each poll's read phase bounded by what is left of the window. Expiry
+    raises the SAME typed refusal the 503 produces — the dispatch table already
+    classifies it (auto → native with a loud marker, pin → blocked) — and the
+    recovering daemon is left alive (D28: bounded wait, then typed refusal;
+    never a silent indefinite wait, never a kill). ``admission_wait_sec=0`` is
+    the zero-wait variant for callers that must not stall on ADMISSION: a
+    recovering daemon is an immediate typed refusal there, and the initial
+    handshake below is read-bounded by the same small window. The wait bounds
+    admission only — ``ensure_running``'s own liveness/spawn probes keep their
+    pre-existing finite transport ceilings (connect 5s; they are one identity
+    handshake, not a poll loop), unchanged for every caller of this seam.
+    An expired/failed admission also skips the reconcile: the recovering
+    daemon 503s settings reads anyway, and the next ensure retries it.
+    """
+    from ouroboros.gateways.claudexor import (
+        SHORT_POLL_TIMEOUT_SEC, ClaudexorGateway, ClaudexorUnavailable,
+    )
+
+    wait = _ADMISSION_WAIT_SEC if admission_wait_sec is None else max(
+        0.0, float(admission_wait_sec))
+    daemon = get_owned_daemon()
+    endpoint = daemon.ensure_running()
     gateway = ClaudexorGateway(endpoint)
     try:
-        gateway.handshake()
+        # Read-bounded: a daemon that accepts the socket but withholds the
+        # handshake must not hold a zero/small-wait caller for the transport's
+        # 60s default read — the sweep's whole posture is "skip, next tick".
+        body = gateway.handshake(timeout_sec=max(wait, SHORT_POLL_TIMEOUT_SEC))
+        deadline = time.monotonic() + wait
+
+        def _expired() -> ClaudexorUnavailable:
+            return ClaudexorUnavailable(
+                "daemon_recovery_only",
+                "the owned daemon is reachable but still admitting only "
+                f"recovery work after {wait:.1f}s; its product routes "
+                "answer 503 (retryable) until journal recovery completes",
+            )
+
+        while _handshake_serving_mode(body) == "recovery_only":
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _expired()
+            time.sleep(min(_ADMISSION_POLL_SEC, remaining))
+            # The WHOLE declared window is usable (proton0 review): the last
+            # read gets the thin residue, floored so a loopback handshake can
+            # still complete — a daemon that admitted normal work at the
+            # window's edge is observed, not discarded. A transport failure
+            # inside that final residue counts as expiry (typed, never a
+            # transport mislabel); a mid-window one propagates unchanged.
+            remaining = deadline - time.monotonic()
+            try:
+                body = gateway.handshake(
+                    timeout_sec=max(remaining, _ADMISSION_POLL_SEC / 3.0))
+            except ClaudexorUnavailable:
+                if deadline - time.monotonic() <= 0:
+                    raise _expired() from None
+                raise
     except Exception:
         gateway.close()
         raise
+    daemon.reconcile_rotation(gateway)
     return gateway
 
 
@@ -475,6 +735,8 @@ __all__ = [
     "read_ownership_marker",
     "verify_owned_home",
     "attach_login_command",
+    "attach_login_shell",
+    "resolve_attach_login_argv",
     "ensure_owned_gateway",
     "get_owned_daemon",
     "owned_config_dir",
@@ -482,3 +744,228 @@ __all__ = [
     "owned_descriptor_path",
     "resolve_claudexord",
 ]
+
+
+# --- Connect's vendor-CLI install (domain operation of the owned data plane;
+# the accounts gateway only invokes it and translates the typed result) ---
+_HARNESS_INSTALL_STDOUT_LIMIT = 64 * 1024
+_HARNESS_INSTALL_CORE_FIELDS = frozenset({
+    "ok", "dryRun", "exitCode", "target", "harness", "command",
+    "installLocation", "installedBinary", "installedVersion", "pinnedVersion",
+    "verification",
+})
+_HARNESS_INSTALL_PROVENANCE_FIELDS = frozenset({"installerSha256", "installerByteLength"})
+_LOCAL_INSTALL_VERIFICATIONS = frozenset({
+    "release_verified", "deterministic_only", "unattended_unpinned",
+})
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def is_immediate_missing_cli_job(job: Dict[str, Any], harness: str, gateway: Any) -> bool:
+    """Match only the pinned engine's synchronous missing-vendor-CLI result."""
+    if not isinstance(job, dict):
+        return False
+    outcome = job.get("outcome")
+    if (
+        not isinstance(job.get("jobId"), str)
+        or not job["jobId"]
+        or job.get("harness") != harness
+        or job.get("action") != "login"
+        or job.get("state") != "not_supported"
+        or job.get("phase") != "completed"
+        or not isinstance(outcome, dict)
+        or outcome.get("reason") != "not_supported"
+        or "command" not in job
+        or job.get("command") is not None
+        or job.get("authorization") is not None
+        or job.get("nativeCommand") is not None
+    ):
+        return False
+
+    from ouroboros.claudexor_runtime import get_runtime_manager
+
+    pin = get_runtime_manager().pin
+    return bool(
+        pin is not None
+        and pin.cli_entrypoint is not None
+        and gateway.engine_version == pin.version
+        and gateway.engine_build_sha == pin.build_sha
+    )
+
+
+def _drain_installer_stdout(pipe: Any, output: bytearray, state: Dict[str, bool]) -> None:
+    try:
+        while True:
+            chunk = pipe.read(8192)
+            if not chunk:
+                break
+            remaining = _HARNESS_INSTALL_STDOUT_LIMIT - len(output)
+            if remaining > 0:
+                output.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                state["overflow"] = True
+    except Exception:
+        state["read_error"] = True
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
+def _valid_install_success(payload: Any, harness: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    fields = frozenset(payload)
+    with_provenance = _HARNESS_INSTALL_CORE_FIELDS | _HARNESS_INSTALL_PROVENANCE_FIELDS
+    if fields not in (_HARNESS_INSTALL_CORE_FIELDS, with_provenance):
+        return False
+    verification = payload.get("verification")
+    if (
+        payload.get("ok") is not True
+        or payload.get("dryRun") is not False
+        or type(payload.get("exitCode")) is not int
+        or payload["exitCode"] != 0
+        or payload.get("target") != "local"
+        or payload.get("harness") != harness
+        or not isinstance(payload.get("command"), str)
+        or not payload["command"]
+        or not isinstance(payload.get("installLocation"), str)
+        or not payload["installLocation"]
+        or not isinstance(payload.get("installedBinary"), str)
+        or not os.path.isabs(payload["installedBinary"])
+        or not isinstance(payload.get("installedVersion"), str)
+        or not payload["installedVersion"].strip()
+        or len(payload["installedVersion"]) > 256
+        or not isinstance(verification, str)
+        or verification not in _LOCAL_INSTALL_VERIFICATIONS
+        or (
+            verification == "unattended_unpinned"
+            and payload.get("pinnedVersion") is not None
+        )
+        or (
+            verification != "unattended_unpinned"
+            and not (
+                isinstance(payload.get("pinnedVersion"), str)
+                and bool(payload["pinnedVersion"])
+            )
+        )
+    ):
+        return False
+    if fields == with_provenance:
+        return bool(
+            verification == "unattended_unpinned"
+            and isinstance(payload.get("installerSha256"), str)
+            and _SHA256_HEX.fullmatch(payload["installerSha256"])
+            and type(payload.get("installerByteLength")) is int
+            and payload["installerByteLength"] > 0
+        )
+    return True
+
+
+def install_missing_harness_cli(harness: str) -> None:
+    from ouroboros.claudexor_runtime import ClaudexorRuntimeError, get_runtime_manager
+    from ouroboros.config import get_claudexor_harness_install_timeout_sec
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.platform_layer import merge_hidden_kwargs, subprocess_new_group_kwargs
+    # The same custody set /panic reaps (isolated_deps._run is the template):
+    # an in-flight vendor installer must not survive an emergency stop.
+    from ouroboros.tools.shell import _active_subprocesses, _kill_process_group, _subprocess_lock
+
+    try:
+        command = get_runtime_manager().ensure_cli_command()
+    except ClaudexorRuntimeError as exc:
+        raise ClaudexorUnavailable(exc.code, str(exc)) from exc
+    if len(command) != 2:
+        raise ClaudexorUnavailable(
+            "runtime_cli_unavailable", "the exact managed Claudexor CLI is not selectable"
+        )
+    argv = [
+        *command, "harness", "install", harness,
+        "--target", "local", "--yes", "--json",
+    ]
+    # The SAME data-plane binding the owned daemon starts with: the config-dir
+    # override is the complete relocatable root (D30), and the cross-home
+    # overrides the daemon scrubs must not reach the installer either —
+    # otherwise the CLI acts on the operator's personal Claudexor home.
+    env = dict(os.environ)
+    env["CLAUDEXOR_CONFIG_DIR"] = str(owned_config_dir())
+    for crossing in ("CLAUDEXOR_DAEMON_SOCK", "CLAUDEXOR_CONTROL_PORT"):
+        env.pop(crossing, None)
+    kwargs = merge_hidden_kwargs(subprocess_new_group_kwargs())
+    timeout_sec = get_claudexor_harness_install_timeout_sec()
+    try:
+        # Registration is atomic WITH the spawn: /panic snapshots the tracked
+        # set under this same lock, so it can never observe the child alive
+        # but untracked (the round-2 reviewer's interleaving).
+        with _subprocess_lock:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                **kwargs,
+            )
+            _active_subprocesses.add(proc)
+    except OSError as exc:
+        raise ClaudexorUnavailable(
+            "harness_install_spawn_failed",
+            f"managed Claudexor installer could not start: {type(exc).__name__}",
+        ) from exc
+
+    output = bytearray()
+    state: Dict[str, bool] = {}
+    reader = threading.Thread(
+        target=_drain_installer_stdout,
+        args=(proc.stdout, output, state),
+        name="claudexor-installer-stdout",
+        daemon=True,
+    )
+    reader.start()
+    try:
+        try:
+            exit_code = proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_group(proc)
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+            raise ClaudexorUnavailable(
+                "harness_install_timeout",
+                f"managed Claudexor installer exceeded {timeout_sec:d}s",
+            ) from exc
+    finally:
+        with _subprocess_lock:
+            _active_subprocesses.discard(proc)
+        # Bounded CLEANUP of an already-finished/killed child's pipe, not a
+        # behavioral wait: the drain thread ends when the pipe does.
+        reader.join(timeout=10)
+        if reader.is_alive():
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            reader.join(timeout=1)
+        if reader.is_alive():
+            state["read_error"] = True
+
+    if exit_code != 0:
+        raise ClaudexorUnavailable(
+            "harness_install_failed", f"managed Claudexor installer exited with code {exit_code}"
+        )
+    if state.get("overflow") or state.get("read_error"):
+        raise ClaudexorUnavailable(
+            "harness_install_invalid_response", "managed Claudexor installer output was invalid"
+        )
+    try:
+        payload = json.loads(bytes(output))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ClaudexorUnavailable(
+            "harness_install_invalid_response", "managed Claudexor installer returned invalid JSON"
+        ) from exc
+    if not _valid_install_success(payload, harness):
+        raise ClaudexorUnavailable(
+            "harness_install_invalid_response", "managed Claudexor installer receipt was invalid"
+        )

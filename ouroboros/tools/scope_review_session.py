@@ -87,6 +87,7 @@ def build_scope_session_task(
     intent: ScopeIntentContext,
     drive_root: Optional[pathlib.Path] = None,
     governance_repo_dir: Optional[pathlib.Path] = None,
+    managed_subject: Optional[Any] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """The scope task in SESSION delivery, plus its forensic coverage manifest.
 
@@ -138,17 +139,45 @@ def build_scope_session_task(
     nav_docs = governance_nav_maps(
         pathlib.Path(governance_repo_dir or repo_dir), _CANONICAL_CONTEXT_DOCS,
     )
+    if managed_subject is not None and not managed_subject.fallback_full_diff:
+        # Managed resolution (Δ4): the AUTHORITATIVE delta artifact is inlined —
+        # a session that retrieved `git diff --cached` itself would re-review the
+        # whole two-parent candidate instead of the resolver's work.
+        touched_slot = (
+            "(managed resolution — the reviewed path set is the resolution delta "
+            "plus its conflict anchors: "
+            + (", ".join(managed_subject.touched_paths()) or "(none)") + ")"
+        )
+        diff_slot = (
+            "The inlined artifact below is the AUTHORITATIVE review subject for "
+            "this managed-update resolution commit. Judge it as rendered; do NOT "
+            "substitute your own `git diff --cached` — the staged diff is the "
+            "whole two-parent merge candidate and re-renders already-released "
+            "code. Read the touched files with your own tools as needed.\n\n"
+            + managed_subject.render_prompt_diff()
+        )
+    else:
+        touched_slot = (
+            "(not inlined — session delivery: find the touched files yourself, with "
+            "`git diff --cached --name-status` if your read-only mode lets you run "
+            "commands and by reading the tree if it does not)"
+        )
+        diff_slot = (
+            "(not inlined — session delivery: retrieve the staged change in this "
+            "repository root yourself, with `git diff --cached` when your read-only "
+            "mode permits commands and by reading the files when it does not)"
+        )
+        if managed_subject is not None:  # M0 missing: disclose, keep retrieval
+            # Session delivery renders no diff body: the header's fallback line
+            # must instruct retrieval, never claim a rendering below.
+            diff_slot = f"{managed_subject.header(body_rendered=False)}\n\n{diff_slot}"
     task_text, _stable_len = build_scope_review_prompt(
-        "(not inlined — session delivery: find the touched files yourself, with "
-        "`git diff --cached --name-status` if your read-only mode lets you run "
-        "commands and by reading the tree if it does not)",
+        touched_slot,
         scope_checklist=scope_checklist,
         canonical_docs=nav_docs,
         intent_context=f"{scope_section}\n\n{goal_section}",
         history_block=f"{rebuttal_section}{history_section}{scope_history_section}",
-        diff_text="(not inlined — session delivery: retrieve the staged change in this "
-                  "repository root yourself, with `git diff --cached` when your read-only "
-                  "mode permits commands and by reading the files when it does not)",
+        diff_text=diff_slot,
         repo_pack_placeholder=(
             "(no assembled repository pack in session delivery — the navigation "
             "maps above index the governance docs; retrieve everything else with "

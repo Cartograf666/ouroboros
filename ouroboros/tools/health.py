@@ -123,6 +123,23 @@ def _codebase_health(ctx: ToolContext) -> str:
                 f"all non-grandfathered modules <= {MAX_MODULE_LINES} lines)"
             )
 
+        # Size-ratchet validator findings (manifest exactness + shrink-only
+        # transition). The official repository CI `size_ratchet` lane is the
+        # enforcing surface; this report and check_worktree_readiness only warn.
+        try:
+            from ouroboros.review import validate_size_ratchet
+
+            ratchet_findings = validate_size_ratchet(repo_dir)
+        except Exception as ratchet_exc:
+            lines.append(f"\n### Size-Ratchet Findings\n  ⚠️ validator unavailable: {ratchet_exc}")
+        else:
+            if ratchet_findings:
+                lines.append("\n### Size-Ratchet Findings (official CI will enforce)")
+                for finding in ratchet_findings:
+                    lines.append(f"  - {finding}")
+            else:
+                lines.append("\n✅ Size-ratchet manifest is exact and shrink-only against the committed authority")
+
         return "\n".join(lines)
 
     except Exception as e:

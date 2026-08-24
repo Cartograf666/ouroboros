@@ -1,11 +1,10 @@
 import { apiFetch } from './api_client.js';
+import { setInlineStatus } from './ui_helpers.js';
 const MODEL_CATALOG_TIMEOUT_MS = 25000;
 let catalogRefreshSeq = 0;
 
 function setCatalogStatus(statusEl, text, tone = 'muted') {
-    if (!statusEl) return;
-    statusEl.textContent = text;
-    statusEl.dataset.tone = tone;
+    setInlineStatus(statusEl, text, tone);
 }
 
 function broadcastCatalog(items) {
@@ -28,10 +27,14 @@ function fillCatalogDatalist(items) {
     broadcastCatalog(items);
 }
 
-export async function refreshModelCatalog() {
+export async function refreshModelCatalog({ button } = {}) {
     const refreshSeq = ++catalogRefreshSeq;
     const statusEl = document.getElementById('settings-model-catalog-status');
     setCatalogStatus(statusEl, 'Refreshing model catalog...', 'muted');
+    if (button) {
+        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
+    }
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), MODEL_CATALOG_TIMEOUT_MS);
 
@@ -84,5 +87,9 @@ export async function refreshModelCatalog() {
         return { items: [], errors: [{ provider_id: 'catalog', error: String(message) }] };
     } finally {
         clearTimeout(timeoutId);
+        if (button && refreshSeq === catalogRefreshSeq) {
+            button.disabled = false;
+            button.removeAttribute('aria-busy');
+        }
     }
 }

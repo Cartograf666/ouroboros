@@ -967,6 +967,28 @@ def _write_contributor_packet(
     return packet_path
 
 
+def _diff_size_refusal(args, resolved_config: dict, reviewable_chars: int, cap: int) -> bool:
+    """Whether the advisory hard cap actually binds THIS panel.
+
+    It protects a reviewer that receives the diff AS PROMPT TEXT: the Claude advisory lane and
+    any ``api_chat`` slot. An ``agent_session`` slot is handed a pointer ("the subject is the
+    staged diff of the repository you are running in" — ``review._triad_session_task``) and
+    retrieves it with its own tools, so the diff never enters its prompt and the cap guards
+    nothing. Applying it there refused a review the panel could actually do (owner decision,
+    2026-08-16)."""
+    if reviewable_chars <= cap:
+        return False
+    if not getattr(args, "contributor", False):
+        return True
+    return any(
+        (row.get("route") or {}).get("kind") == "api_chat"
+        for row in [
+            *list(resolved_config.get("triad_slots") or []),
+            *list(resolved_config.get("scope_slots") or []),
+        ]
+    )
+
+
 def _parse_args():
     import argparse
 
@@ -1134,12 +1156,6 @@ def _prepare_review_configuration(args) -> tuple[dict | None, str, dict]:
                 probe_models=openrouter_models,
             )
     else:
-        if not os.environ.get("TOTAL_BUDGET", "").strip():
-            print(
-                "WARN: TOTAL_BUDGET is not configured; the $10 default can "
-                "starve a full production review.",
-                file=sys.stderr,
-            )
         _select_healthy_openrouter_key()
     return contributor_snapshot, review_base_commit, resolved_config
 
@@ -1209,11 +1225,13 @@ def main() -> int:
     )
     from ouroboros.tools.claude_advisory_review import _MAX_DIFF_CHARS_ERROR
 
-    if reviewable_chars > _MAX_DIFF_CHARS_ERROR:
+    if _diff_size_refusal(args, resolved_config, reviewable_chars, _MAX_DIFF_CHARS_ERROR):
         print(
             f"ERROR: staged diff is {reviewable_chars:,} chars — over the advisory hard cap "
-            f"({_MAX_DIFF_CHARS_ERROR:,}). Policy: split the phase into smaller "
-            "single-intent commits instead of relaxing the gate.",
+            f"({_MAX_DIFF_CHARS_ERROR:,}) and at least one reviewer receives the diff as prompt "
+            "text. Policy: split the phase into smaller single-intent commits instead of "
+            "relaxing the gate (an all-`agent_session` panel retrieves the diff itself and is "
+            "not bound by this cap).",
             file=sys.stderr,
         )
         return 3

@@ -173,8 +173,8 @@ def test_build_and_apply_clean_merge(tmp_path, monkeypatch):
 
     # Q1=C: local dirty work rides a stash through the apply — it never becomes
     # part of committed history — and is restored as uncommitted content after.
-    ok, stash_sha, stash_error = update_merge.stash_local_changes_for_update("plan-test")
-    assert ok and stash_sha, stash_error
+    status, stash_sha, stash_error = update_merge.stash_local_changes_for_update("plan-test")
+    assert status == "ok" and stash_sha, stash_error
     ok, msg = update_merge.apply_managed_merge_update(head, plan["merge_commit"])
     assert ok, msg
     assert (repo / "b.txt").exists()
@@ -259,7 +259,8 @@ def test_finalize_rolls_back_after_unhealthy_boot(tmp_path, monkeypatch):
 def test_rollback_still_resets_when_the_forensics_ref_cannot_be_written(tmp_path, monkeypatch):
     """Recovery must not be traded away for a forensics branch name.
 
-    `rollback_managed_update` writes `failed-update-<sha>` before it resets, so the
+    `rollback_managed_update` publishes `failed-update-<target12>` (falling back to
+    the candidate's own sha when the tx names no target) before it resets, so the
     rejected candidate keeps a name. That write is BEST-EFFORT on purpose: this
     function's job is to get the machine back onto a working revision, and every
     caller but the commit gate is a recovery path that ignores the boolean and
@@ -283,7 +284,7 @@ def test_rollback_still_resets_when_the_forensics_ref_cannot_be_written(tmp_path
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "bad update")
 
-    short = _git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
+    short = _git(repo, "rev-parse", "HEAD").stdout.strip()[:12]
     blocked = _git(repo, "branch", f"failed-update-{short}/child", "HEAD")
     assert blocked.returncode == 0, blocked.stderr
     assert _git(repo, "branch", "-f", f"failed-update-{short}", "HEAD").returncode != 0, (

@@ -49,6 +49,18 @@ export function initLogs({ ws, state, mount }) {
         });
     }
 
+    // Live entries must not yank the view away from history the reader
+    // scrolled up to: per-entry autoscroll sticks only while the reader is
+    // already at the bottom. Callers capture this BEFORE appending — the
+    // append itself grows scrollHeight, which would misread a pinned reader
+    // as scrolled-up. Deliberate jumps (filter toggle, tab switch, backfill)
+    // stay unconditional. A hidden panel measures 0/0/0 → pinned, matching
+    // the tab-switch jump the reader gets on return.
+    const PINNED_SLACK_PX = 48;
+    function isPinnedToLatest() {
+        return logEntries.scrollHeight - logEntries.scrollTop - logEntries.clientHeight <= PINNED_SLACK_PX;
+    }
+
     function updateVisibility(entry) {
         entry.hidden = !state.activeFilters[entry.dataset.category];
     }
@@ -174,6 +186,7 @@ export function initLogs({ ws, state, mount }) {
         `;
         bindRawToggle(entry);
         updateVisibility(entry);
+        const pinned = isPinnedToLatest();
         logEntries.appendChild(entry);
 
         if (dedupeKey) {
@@ -181,7 +194,7 @@ export function initLogs({ ws, state, mount }) {
         }
 
         trimEntries();
-        if (state.activeFilters[cat]) scrollToLatest();
+        if (state.activeFilters[cat] && pinned) scrollToLatest();
     }
 
     function createTaskGroupCard(groupId, category) {
@@ -259,6 +272,11 @@ export function initLogs({ ws, state, mount }) {
         const category = groupId === 'bg-consciousness'
             ? 'consciousness'
             : (eventCategory === 'errors' ? 'errors' : 'tasks');
+        // Captured before ANY record mutation: an already-mounted card grows
+        // in place (summary rewrite, review unhide, timeline render) before
+        // the append below, and that growth alone can push a pinned reader
+        // past the slack allowance.
+        const pinned = isPinnedToLatest();
         const record = taskGroups.get(groupId) || createTaskGroupCard(groupId, category);
         const ts = normalizeLogTs(evt.ts || evt.timestamp);
 
@@ -309,7 +327,7 @@ export function initLogs({ ws, state, mount }) {
         updateVisibility(record.entry);
         logEntries.appendChild(record.entry);
         trimEntries();
-        if (state.activeFilters[category]) scrollToLatest();
+        if (state.activeFilters[category] && pinned) scrollToLatest();
     }
 
     function addLogEntry(evt) {
@@ -382,5 +400,16 @@ export function initLogs({ ws, state, mount }) {
 
     window.addEventListener('ouro:dashboard-subtab-shown', (event) => {
         if (event.detail?.tab === 'logs') scrollToLatest();
+    });
+
+    // A `.page` display round-trip destroys the scroll position (documented in
+    // chat.js: WebKit re-shows a hidden column at scrollTop=0), which would
+    // read as scrolled-up and silently disarm the pinned-only autoscroll.
+    // Returning to the dashboard is the same class of deliberate navigation
+    // as a subtab switch (evolution.js listens to both events the same way),
+    // so re-pin on it; this also covers the very first dashboard show, where
+    // the backfill's own jump ran while the panel was still hidden.
+    window.addEventListener('ouro:page-shown', (event) => {
+        if (event.detail?.page === 'dashboard' && state.dashboardActiveSubtab === 'logs') scrollToLatest();
     });
 }

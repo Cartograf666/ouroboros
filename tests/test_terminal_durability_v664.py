@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import pathlib
 import tempfile
 from types import SimpleNamespace
@@ -241,11 +242,40 @@ def test_self_finalized_reaper_event_preserves_managed_update_metadata(
 def test_top_level_retry_preserves_logical_root_and_typed_attempt_lineage(
     tmp_path, monkeypatch,
 ):
+    from ouroboros.artifacts import stage_task_attachments
+    from ouroboros.gateway.tasks import _render_attachment_lines
     from ouroboros.task_results import resolve_task_lineage
     from ouroboros.task_results import STATUS_SCHEDULED, load_task_result
+    from ouroboros.owner_mailbox import (
+        KIND_HURRY,
+        drain_owner_entries,
+        write_owner_message,
+    )
     from supervisor.task_reaper import reap_timed_out_task
 
     _events, enqueued = _patch_reaper(tmp_path, monkeypatch)
+    initial = tmp_path / "initial.txt"
+    initial.write_text("initial-readable", encoding="utf-8")
+    later = tmp_path / "later.txt"
+    later.write_text("later-readable", encoding="utf-8")
+    initial_manifest = stage_task_attachments(
+        tmp_path, "old-root", [{"path": str(initial), "label": "initial"}],
+    )
+    later_manifest = stage_task_attachments(
+        tmp_path, "old-root", [{"path": str(later), "label": "later"}],
+    )
+    initial_report = _render_attachment_lines(initial_manifest)
+    later_report = _render_attachment_lines(later_manifest)
+    write_owner_message(
+        tmp_path,
+        f"exact owner correction\n\n[ATTACHMENTS]\n{later_report}\n[END_ATTACHMENTS]",
+        "old-root",
+        msg_id="owner-1",
+        attachment_manifest=later_manifest,
+    )
+    write_owner_message(
+        tmp_path, "owner_hurry", "old-root", msg_id="hurry-1", kind=KIND_HURRY,
+    )
     reap_timed_out_task({
         "worker_id": 4,
         "proc": None,
@@ -257,6 +287,12 @@ def test_top_level_retry_preserves_logical_root_and_typed_attempt_lineage(
             "root_task_id": "old-root",
             "parent_task_id": "",
             "delegation_role": "root",
+            "text": f"initial task\n\n[ATTACHMENTS]\n{initial_report}\n[END_ATTACHMENTS]",
+            "attachments": [dict(row) for row in initial_manifest],
+            "attachment_images": [],
+            "task_contract": {
+                "attachment_manifest": [dict(row) for row in initial_manifest],
+            },
             "metadata": {
                 "task_id": "old-root",
                 "root_task_id": "old-root",
@@ -280,6 +316,30 @@ def test_top_level_retry_preserves_logical_root_and_typed_attempt_lineage(
     assert queued["parent_task_id"] == ""
     assert queued["original_task_id"] == "old-root"
     assert queued["timeout_retry_from"] == "old-root"
+    retry_entries = drain_owner_entries(
+        tmp_path, "new-root", attempt_key=str(queued["_attempt"]),
+    )
+    assert len(retry_entries) == 1
+    assert retry_entries[0]["text"].startswith("exact owner correction")
+    assert retry_entries[0]["msg_id"] == "owner-1"
+    assert retry_entries[0]["attachment_manifest"][0]["label"] == "later"
+    old_attachment_root = str(
+        tmp_path / "task_results" / "artifacts" / "old-root" / "attachments"
+    )
+    assert old_attachment_root not in queued["text"]
+    assert old_attachment_root not in retry_entries[0]["text"]
+    assert old_attachment_root not in json.dumps(retry_entries[0]["attachment_manifest"])
+    assert old_attachment_root not in json.dumps(queued["task_contract"])
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
+
+    tool_ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="new-root")
+    assert "initial-readable" in _read_file(
+        tool_ctx, queued["attachments"][0]["relpath"], root="artifact_store",
+    )
+    assert "later-readable" in _read_file(
+        tool_ctx, later_manifest[0]["relpath"], root="artifact_store",
+    )
     assert resolve_task_lineage(
         queued["id"],
         metadata=queued["metadata"],
@@ -297,6 +357,60 @@ def test_top_level_retry_preserves_logical_root_and_typed_attempt_lineage(
     assert scheduled["original_task_id"] == "old-root"
     assert scheduled["timeout_retry_from"] == "old-root"
     assert scheduled["delegation_role"] == "root"
+
+
+def test_top_level_retry_refuses_if_owner_mailbox_handoff_fails(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.owner_mailbox as owner_mailbox
+    from ouroboros.task_results import STATUS_FAILED, load_task_result
+    from supervisor.task_reaper import reap_timed_out_task
+
+    _events, enqueued = _patch_reaper(tmp_path, monkeypatch)
+    monkeypatch.setattr(owner_mailbox, "copy_owner_mailbox_for_retry", lambda *_a, **_k: False)
+
+    reap_timed_out_task({
+        "worker_id": 5,
+        "proc": None,
+        "task_id": "old-mailbox",
+        "task": {"id": "old-mailbox", "type": "task", "chat_id": 0},
+        "task_type": "task",
+        "terminal_reason": "idle_timeout",
+        "attempt": 1,
+        "owner_chat_id": 0,
+        "will_retry": True,
+        "retry_task_id": "new-mailbox",
+    })
+
+    assert enqueued == []
+    for task_id in ("old-mailbox", "new-mailbox"):
+        result = load_task_result(tmp_path, task_id)
+        assert result["status"] == STATUS_FAILED
+        assert result["reason_code"] == "idle_timeout_retry_mailbox_handoff_failed"
+
+
+def test_top_level_retry_refuses_if_attachment_handoff_fails(tmp_path, monkeypatch):
+    import ouroboros.artifacts as artifacts
+    from ouroboros.task_results import STATUS_FAILED, load_task_result
+    from supervisor.task_reaper import reap_timed_out_task
+
+    _events, enqueued = _patch_reaper(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        artifacts, "handoff_task_attachments_for_retry",
+        lambda *_a, **_k: ({}, "copy failed"),
+    )
+    reap_timed_out_task({
+        "worker_id": 6, "proc": None, "task_id": "old-inputs",
+        "task": {"id": "old-inputs", "type": "task", "chat_id": 0},
+        "task_type": "task", "terminal_reason": "idle_timeout", "attempt": 1,
+        "owner_chat_id": 0, "will_retry": True, "retry_task_id": "new-inputs",
+    })
+
+    assert enqueued == []
+    assert load_task_result(tmp_path, "old-inputs")["status"] == STATUS_FAILED
+    assert load_task_result(tmp_path, "new-inputs")["reason_code"] == (
+        "idle_timeout_retry_attachment_handoff_failed"
+    )
 
 
 def test_same_id_subagent_retry_preserves_parent_and_root_lineage(
@@ -416,32 +530,51 @@ def test_a_root_narrowed_by_a_childs_open_row_reports_that_rows_count(tmp_path, 
 
 
 def test_reaper_admission_block_terminalizes_retry(tmp_path, monkeypatch):
+    from ouroboros.artifacts import stage_task_attachments
+    import ouroboros.owner_mailbox as owner_mailbox
+    from ouroboros.owner_mailbox import _mailbox_path, write_owner_message
     from ouroboros.task_results import STATUS_FAILED, load_task_result
     from supervisor import queue
     from supervisor.task_reaper import reap_timed_out_task
 
+    real_cleanup = owner_mailbox.cleanup_task_mailbox
     events, _ = _patch_reaper(tmp_path, monkeypatch)
+    monkeypatch.setattr(owner_mailbox, "cleanup_task_mailbox", real_cleanup)
     monkeypatch.setattr(
         queue,
         "enqueue_task",
         lambda *_args, **_kwargs: {"_admission_blocked": "task_acceptance_fence"},
     )
+    source = tmp_path / "fenced.txt"
+    source.write_text("fenced", encoding="utf-8")
+    manifest = stage_task_attachments(
+        tmp_path, "fenced-retry", [{"path": str(source)}],
+    )
+    write_owner_message(tmp_path, "keep this", "fenced-retry", msg_id="owner-fenced")
 
     reap_timed_out_task({
         "worker_id": 4,
         "proc": None,
         "task_id": "fenced-retry",
-        "task": {"id": "fenced-retry", "type": "task", "chat_id": 0},
+        "task": {
+            "id": "fenced-retry", "type": "task", "chat_id": 0,
+            "attachments": [dict(row) for row in manifest],
+        },
         "task_type": "task",
         "terminal_reason": "idle_timeout",
         "attempt": 1,
         "owner_chat_id": 0,
         "will_retry": True,
+        "retry_task_id": "fenced-retry-new",
     })
 
     result = load_task_result(tmp_path, "fenced-retry")
     assert result["status"] == STATUS_FAILED
     assert result["reason_code"] == "idle_timeout_retry_admission_blocked"
+    assert not _mailbox_path(tmp_path, "fenced-retry-new").exists()
+    assert not (
+        tmp_path / "task_results" / "artifacts" / "fenced-retry-new"
+    ).exists()
     terminal = [event for event in events if event.get("type") == "task_done"]
     assert terminal and terminal[-1]["status"] == "failed"
 
@@ -674,6 +807,65 @@ def test_terminal_emitter_still_withholds_an_unavailable_projection(tmp_path, mo
     assert emitted["ledger_integrity_degraded"] is True
     assert [k for k, v in emitted.items() if v is None] == []
     assert "cost_usd" not in emitted and "non_final_rows" not in emitted
+
+
+def test_terminal_unknown_zero_cost_stays_nullable(tmp_path):
+    """An attributed opaque dispatch is unknown, never a terminal free $0."""
+    from ouroboros import usage_accounting
+    from supervisor import events
+    from supervisor.state import reconstruct_task_cost
+
+    usage_accounting.record_unmetered_external_dispatch(
+        "terminal-opaque", drive_root=tmp_path, provider="external-skill",
+        task_id="terminal-root", root_task_id="terminal-root",
+    )
+    fields = reconstruct_task_cost("terminal-root", fields=True, drive_root=tmp_path)
+    assert fields["cost_usd"] is None
+    assert fields["accounted_upper_bound_usd"] is None
+    assert fields["unknown_unmetered"] == 1
+
+    task = {
+        "id": "terminal-root", "root_task_id": "terminal-root",
+        "budget_drive_root": str(tmp_path),
+    }
+    terminal = events._authoritative_terminal_cost(
+        "terminal-root", task, dict(task), {}, tmp_path,
+    )
+    assert terminal["cost_usd"] is None
+    assert terminal["accounted_upper_bound_usd"] is None
+    assert terminal["cost_usd_with_children"] is None
+    assert terminal["accounted_upper_bound_usd_with_children"] is None
+    assert terminal["unknown_unmetered"] == 1
+
+
+def test_post_task_checkpoint_keeps_unknown_zero_cost_nullable(tmp_path):
+    import ouroboros.post_task_checkpoint as checkpoint
+    from ouroboros import usage_accounting
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
+
+    data = tmp_path / "data"
+    data.mkdir()
+    task_id = "post-task-opaque"
+    write_task_result(
+        data, task_id, STATUS_COMPLETED, root_task_id=task_id,
+        root_phase_checkpoint={"post_task_synthesis": "running"},
+    )
+    usage_accounting.record_unmetered_external_dispatch(
+        "post-opaque", drive_root=data, provider="external-skill",
+        task_id=task_id, root_task_id=task_id,
+    )
+
+    checkpoint.set_root_post_task_checkpoint(
+        SimpleNamespace(drive_root=data),
+        {"id": task_id, "root_task_id": task_id, "status": STATUS_COMPLETED},
+        "completed",
+    )
+    stored = load_task_result(data, task_id)
+    assert stored["cost_usd"] is None
+    assert stored["accounted_upper_bound_usd"] is None
+    assert stored["cost_usd_with_children"] is None
+    assert stored["accounted_upper_bound_usd_with_children"] is None
+    assert stored["unknown_unmetered"] == 1
 
 
 def _install_supervisor(tmp_path, monkeypatch):

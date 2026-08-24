@@ -59,10 +59,40 @@ def _payload_ctx(tmp_path: pathlib.Path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(data))
     monkeypatch.setenv("OUROBOROS_SUBAGENT_WORKTREE_ROOT", str(tmp_path / "snaps"))
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
+    configured = {
+        "enabled": True,
+        "items": [{
+            "subagent_id": "payload-session",
+            "name": "Payload session",
+            "recommended_use": "Edit an exact delegated skill payload.",
+            "route": {
+                "kind": "agent_session",
+                "target_id": "some-route=weak-model",
+                "credential_profile_id": "",
+            },
+            "effort": "low",
+        }],
+    }
+    monkeypatch.setenv("OUROBOROS_SUBAGENTS", json.dumps(configured))
     ctx = ToolContext(repo_dir=repo, drive_root=data)
     ctx.task_id = "t-payload"
     ctx.task_metadata = {"root_task_id": "t-payload"}
+    from ouroboros.subagent_runtime import select_subagent_snapshot
+
+    ctx._payload_subagent_snapshot = select_subagent_snapshot(
+        {"OUROBOROS_SUBAGENTS": json.dumps(configured)},
+        subagent_id="payload-session",
+    )[0]
     return ctx
+
+
+def _exact_payload_start(ctx, prompt: str, **params):
+    from ouroboros.subagent_runtime import exact_start
+
+    return exact_start(ctx, prompt, {
+        "snapshot": ctx._payload_subagent_snapshot,
+        **params,
+    })
 
 
 class _StartStub:
@@ -108,9 +138,10 @@ def _start_payload_run(ctx, monkeypatch, *, skill_name="alpha", bucket="external
     seen: dict = {}
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _StartStub(seen))
     delegate._CUSTODY.clear()
-    payload = json.loads(delegate._delegate_start(
+    payload = json.loads(_exact_payload_start(
         ctx, "edit the skill", root="skill_payload", bucket=bucket,
-        skill_name=skill_name))
+        skill_name=skill_name,
+    ))
     return payload, seen
 
 
@@ -195,21 +226,21 @@ def test_selector_argument_shapes_refuse_typed(tmp_path, monkeypatch):
 
 def test_native_missing_and_child_targets_refuse_before_any_gateway(tmp_path, monkeypatch):
     import ouroboros.claudexor_daemon as daemon
-    import ouroboros.tools.delegate as delegate
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.tools.registry import ToolContext
 
     ctx = _payload_ctx(tmp_path, monkeypatch)
-    _seed_skill(tmp_path / "data", name="native-ish", bucket="native")
+    native = _seed_skill(tmp_path / "data", name="native-ish", bucket="native")
+    (native / ".seed-origin").write_text("seeded\n", encoding="utf-8")
 
     def _no_gateway():
         raise AssertionError("the refusal must land BEFORE any gateway work")
 
     monkeypatch.setattr(daemon, "ensure_owned_gateway", _no_gateway)
-    out = json.loads(delegate._delegate_start(
+    out = json.loads(_exact_payload_start(
         ctx, "x", root="skill_payload", bucket="native", skill_name="native-ish"))
     assert out["reason"] == "payload_target_unresolved", out
-    out = json.loads(delegate._delegate_start(
+    out = json.loads(_exact_payload_start(
         ctx, "x", root="skill_payload", bucket="external", skill_name="ghost"))
     assert out["reason"] == "payload_target_unresolved", out
     assert "manifest" in out["detail"].lower() or "SKILL.md" in out["detail"], out
@@ -219,15 +250,71 @@ def test_native_missing_and_child_targets_refuse_before_any_gateway(tmp_path, mo
                         task_constraint=TaskConstraint(mode="local_readonly_subagent"))
     child.task_id = "t-child"
     child.task_metadata = {"parent_task_id": "t-payload"}
-    out = json.loads(delegate._delegate_start(
+    child._payload_subagent_snapshot = ctx._payload_subagent_snapshot
+    out = json.loads(_exact_payload_start(
         child, "x", root="skill_payload", bucket="external", skill_name="alpha"))
     assert out["reason"] == "payload_delegation_forbidden", out
     assert "AUTHORITY denial" in out["detail"], out
 
 
+@pytest.mark.parametrize("runtime_mode", ["light", "advanced", "pro"])
+def test_markerless_native_delegates_as_external_and_rebinds_by_marker(
+    runtime_mode,
+    tmp_path,
+    monkeypatch,
+):
+    import ouroboros.safety as safety
+    from ouroboros.gateways import claudexor as gw
+    from ouroboros.tools.delegate_integration import _rebind_payload_reference
+    from ouroboros.tools.registry import ToolRegistry
+
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    payload = _seed_skill(
+        tmp_path / "data",
+        name="user-native",
+        bucket="native",
+    )
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", runtime_mode)
+    monkeypatch.setattr(safety, "check_safety", lambda *a, **k: (True, ""))
+    seen: dict = {}
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _StartStub(seen))
+    custody._CUSTODY.clear()
+    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    registry.set_context(ctx)
+
+    started = json.loads(
+        registry.execute(
+            "delegate_start",
+            {
+                "subagent_id": "payload-session",
+                "prompt": "edit notes.txt",
+                "root": "skill_payload",
+                "bucket": "external",
+                "skill_name": "user-native",
+            },
+        )
+    )
+    assert started["status"] == "started", started
+    assert pathlib.Path(started["authority_target_root"]).resolve() == payload.resolve()
+    entry = custody.replay(tmp_path / "data")["run-p1"]
+    assert entry.resource_ref["source"] == "external"
+    assert entry.resource_ref["target_root"] == str(payload.resolve())
+
+    (payload / ".seed-origin").write_text("launcher-seed\n", encoding="utf-8")
+    rebound, _binding, refusal = _rebind_payload_reference(
+        ctx,
+        entry.resource_ref,
+        entry.target_root,
+        tool="integrate_delegated_patch",
+        context="test",
+    )
+    assert rebound is None
+    assert "payload_target_unresolved" in refusal
+    custody._CUSTODY.clear()
+
+
 def test_second_delegation_on_same_payload_is_refused_cheaply(tmp_path, monkeypatch):
     import ouroboros.claudexor_daemon as daemon
-    import ouroboros.tools.delegate as delegate
 
     ctx = _payload_ctx(tmp_path, monkeypatch)
     _seed_skill(tmp_path / "data")
@@ -238,10 +325,10 @@ def test_second_delegation_on_same_payload_is_refused_cheaply(tmp_path, monkeypa
         raise AssertionError("busy refusal must land BEFORE any gateway work")
 
     monkeypatch.setattr(daemon, "ensure_owned_gateway", _no_gateway)
-    out = json.loads(delegate._delegate_start(
+    out = json.loads(_exact_payload_start(
         ctx, "second", root="skill_payload", bucket="external", skill_name="alpha"))
-    assert out["reason"] == "payload_delegation_busy", out
-    assert out["holder"] == "run-p1"
+    assert out["reason"] == "replacement_requires_settlement", out
+    assert out["open_run_ids"] == ["run-p1"]
     custody._CUSTODY.clear()
 
 
@@ -563,6 +650,7 @@ def test_registry_golden_e2e_start_wait_apply_review_stale(tmp_path, monkeypatch
     custody._CUSTODY.clear()
 
     started = json.loads(registry.execute("delegate_start", {
+        "subagent_id": "payload-session",
         "prompt": "flip PENDING to DONE in notes.txt",
         "root": "skill_payload", "bucket": "external", "skill_name": "alpha"}))
     assert started["status"] == "started", started
@@ -848,13 +936,13 @@ def test_parallel_starts_on_same_payload_yield_exactly_one_winner(tmp_path, monk
         winner_out: list = []
 
         def _winner():
-            winner_out.append(json.loads(delegate._delegate_start(
+            winner_out.append(json.loads(_exact_payload_start(
                 ctx, "start winner", root="skill_payload", bucket="external",
                 skill_name="alpha")))
 
         thread = threading.Thread(target=_winner, name="winner")
         thread.start()
-        loser = json.loads(delegate._delegate_start(
+        loser = json.loads(_exact_payload_start(
             ctx, "start loser", root="skill_payload", bucket="external",
             skill_name="alpha"))
         release.set()
@@ -972,7 +1060,8 @@ def test_unknown_root_via_registry_is_typed_unsupported_root(tmp_path, monkeypat
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     registry.set_context(ctx)
     out = registry.execute("delegate_start", {
-        "prompt": "x", "root": "repo", "bucket": "external", "skill_name": "alpha"})
+        "subagent_id": "payload-session", "prompt": "x", "root": "repo",
+        "bucket": "external", "skill_name": "alpha"})
     parsed = json.loads(out)
     assert parsed["status"] == "refused", parsed
     assert parsed["reason"] == "unsupported_root", parsed

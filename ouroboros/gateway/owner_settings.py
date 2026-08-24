@@ -32,10 +32,12 @@ re-implemented (or silently skipped) per call site:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
 import pathlib
+import threading
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from starlette.requests import Request
@@ -52,6 +54,27 @@ log = logging.getLogger(__name__)
 # The context mode and its one-window false provenance tombstone are authored together by
 # the owner endpoint, never by a generic save (see prepare_settings_for_persist).
 _CONTEXT_MODE_KEYS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW")
+
+
+# In-PROCESS serialization for every read-merge-write on the settings document.
+# The FILE lock inside ``_owner_write_settings`` serializes only the WRITES: a
+# writer that reads the document, merges (possibly for a long time, off the
+# event loop), then writes, would silently revert a single-decision endpoint
+# that landed in between. Every event-loop writer used to inherit this
+# serialization for free from the loop itself; a threaded writer does not.
+# A read-fingerprint ``precondition`` (the onboarding transaction) refuses
+# THIS writer's own stale merge, but cannot stop a lock-holding writer whose
+# read predated this write from landing afterwards — so the onboarding
+# transaction holds this lock TOO, from its write through its environment
+# projection and hot-reload effects, symmetric with the generic save.
+_settings_document_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def settings_document_mutation():
+    """Hold the in-process document lock across one read-merge-write."""
+    with _settings_document_lock:
+        yield
 
 
 class SettingsPreconditionFailed(RuntimeError):
@@ -234,6 +257,7 @@ __all__ = [
     "CommitBoundary",
     "SettingsLockUnavailable",
     "SettingsPreconditionFailed",
+    "settings_document_mutation",
     "_CONTEXT_MODE_KEYS",
     "_owner_audit",
     "_owner_read_settings_raw",

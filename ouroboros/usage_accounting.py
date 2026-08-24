@@ -412,9 +412,9 @@ def usage_projection(
         configured_limit = max(0.0, float(global_limit_usd))
     else:
         try:
-            configured_limit = float(os.environ.get("TOTAL_BUDGET", "10") or 0.0)
+            configured_limit = float(os.environ.get("TOTAL_BUDGET", "200") or 0.0)
         except (TypeError, ValueError):
-            configured_limit = 10.0
+            configured_limit = 200.0
     apply_limit = global_limit_usd is not None or configured_limit > 0
     cache_key = (
         "usage_projection", "", "",
@@ -578,8 +578,11 @@ def review_wave_admission(
     models: Sequence[str],
     prompt_chars: int,
     max_completion_tokens: int = 65536,
+    remaining_usd_override: float | None = None,
 ) -> Dict[str, Any]:
-    """Read-only all-slot admission using the normal reservation math; fail open."""
+    """Read-only all-slot admission using the normal reservation math; fail open.
+    ``remaining_usd_override`` serves callers outside any task usage scope (the
+    managed-update admission gate): compared against instead of the projection."""
     result: Dict[str, Any] = {
         "fits": True,
         "estimated_wave_usd": None,
@@ -594,12 +597,15 @@ def review_wave_admission(
     try:
         from ouroboros.pricing import infer_provider_from_model
 
-        projection = usage_projection(drive_root, root_task_id=root_task_id)
-        limit = _number(projection.get("limit_usd"))
-        remaining = _number(projection.get("remaining_known_usd"))
-        if limit is None or remaining is None:
-            return result
-        result["limit_usd"] = limit
+        if remaining_usd_override is not None:
+            remaining = float(remaining_usd_override)
+        else:
+            projection = usage_projection(drive_root, root_task_id=root_task_id)
+            limit = _number(projection.get("limit_usd"))
+            remaining = _number(projection.get("remaining_known_usd"))
+            if limit is None or remaining is None:
+                return result
+            result["limit_usd"] = limit
         result["remaining_usd"] = remaining
         prompt_tokens = max(0, int(prompt_chars or 0)) // 4
         total = 0.0
@@ -629,10 +635,10 @@ def _global_limit(request: AttemptRequest) -> float:
     if request.global_limit_usd is not None:
         return max(0.0, float(request.global_limit_usd))
     try:
-        configured = float(os.environ.get("TOTAL_BUDGET", "10") or 0.0)
+        configured = float(os.environ.get("TOTAL_BUDGET", "200") or 0.0)
         return configured if configured > 0 else float("inf")
     except (TypeError, ValueError):
-        return 10.0
+        return 200.0
 
 
 def _active_root_budget_fence(root: pathlib.Path, root_task_id: str) -> Optional[Dict[str, Any]]:
@@ -965,7 +971,15 @@ def release_attempt(
 
 
 def mark_unresolved(reservation: AttemptReservation, reason: str) -> None:
-    _transition(reservation, "unresolved", reason=str(reason or "provider_outcome_unknown")[:500])
+    try:
+        from ouroboros.observability import redact_projection
+
+        safe_reason = str(redact_projection(
+            str(reason or "provider_outcome_unknown"),
+        ).value)
+    except Exception:
+        safe_reason = "provider_outcome_unknown:redaction_failed"
+    _transition(reservation, "unresolved", reason=safe_reason[:500])
 
 
 def terminalize_abandoned_attempt(
@@ -1155,7 +1169,7 @@ def _provider_exception_facts(exc: BaseException) -> Tuple[Optional[int], str, s
         from ouroboros.observability import redact_projection
         message = str(redact_projection(message).value)
     except Exception:
-        pass
+        message = f"{type(exc).__name__}: provider error details unavailable"
     return status, str(code or ""), str(error_type or type(exc).__name__), message
 
 

@@ -5,6 +5,17 @@ from __future__ import annotations
 import inspect
 import json
 import pathlib
+import time
+import types
+
+
+def _heartbeat_ctx(tmp_path, task):
+    pushed = []
+    return types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        RUNNING={task["id"]: {"task": task, "started_at": time.time()}},
+        bridge=types.SimpleNamespace(push_log=pushed.append),
+    ), pushed
 
 
 def test_routine_heartbeat_is_not_rendered_as_chat_message() -> None:
@@ -36,6 +47,113 @@ def test_liveness_and_incident_controls_remain_active() -> None:
         assert invariant in source
 
 
+def test_root_heartbeat_carries_one_live_subtree_projection(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: {
+        "accounted_usd": 76.82, "reserved_usd": 1.25,
+        "unresolved_upper_bound_usd": 0.5, "unknown_unmetered": 2,
+        "non_final_rows": 3, "integrity_degraded": False, "cost_final": True,
+    })
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-hb", "type": "task", "root_task_id": "root-hb",
+    })
+    _handle_task_heartbeat({"task_id": "root-hb", "phase": "running"}, ctx)
+
+    frame = pushed[0]
+    assert frame["cost_usd_with_children"] == 76.82
+    assert frame["accounted_upper_bound_usd_with_children"] == 76.82
+    assert frame["cost_final"] is False
+    assert frame["cost_with_children_partial"] is True
+    assert (frame["reserved_usd"], frame["unresolved_upper_bound_usd"]) == (1.25, 0.5)
+    assert frame["unknown_unmetered"] == 2
+
+
+def test_child_heartbeat_does_not_read_or_publish_live_cost(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: (
+        _ for _ in ()
+    ).throw(AssertionError("child heartbeat must not read the ledger")))
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "child-hb", "type": "task", "root_task_id": "root-hb",
+        "parent_task_id": "root-hb", "delegation_role": "subagent",
+    })
+    _handle_task_heartbeat({"task_id": "child-hb", "phase": "running"}, ctx)
+
+    assert "cost_accounting_status" not in pushed[0]
+    assert "cost_usd_with_children" not in pushed[0]
+
+
+def test_root_heartbeat_keeps_ledger_failure_honest(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: (
+        _ for _ in ()
+    ).throw(OSError("ledger unavailable")))
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-hb", "type": "task", "root_task_id": "root-hb",
+    })
+    _handle_task_heartbeat({"task_id": "root-hb", "phase": "running"}, ctx)
+
+    frame = pushed[0]
+    assert frame["cost_accounting_status"] == "unavailable"
+    assert frame["cost_usd_with_children"] is None
+    assert frame["accounted_upper_bound_usd_with_children"] is None
+    assert frame["cost_final"] is False
+
+
+def test_root_heartbeat_omits_empty_or_legacy_only_cost(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: {
+        "accounted_usd": 0.0, "attempt_counts": {"metadata_only": 4},
+        "subscription_sessions": 0, "unknown_unmetered": 0,
+        "non_final_rows": 0, "integrity_degraded": False,
+    })
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-empty", "type": "task", "root_task_id": "root-empty",
+    })
+    _handle_task_heartbeat({"task_id": "root-empty", "phase": "running"}, ctx)
+
+    assert "cost_accounting_status" not in pushed[0]
+    assert "cost_usd_with_children" not in pushed[0]
+
+
+def test_root_heartbeat_keeps_unknown_zero_cost_nullable_and_measured_zero_numeric(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    usage = {
+        "accounted_usd": 0.0, "attempt_counts": {"settled": 1},
+        "subscription_sessions": 0, "unknown_unmetered": 1,
+        "non_final_rows": 1, "integrity_degraded": False,
+    }
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: usage)
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-unknown", "type": "task", "root_task_id": "root-unknown",
+    })
+    _handle_task_heartbeat({"task_id": "root-unknown", "phase": "running"}, ctx)
+    unknown = pushed[0]
+    assert unknown["cost_accounting_status"] == "available"
+    assert unknown["cost_usd_with_children"] is None
+    assert unknown["accounted_upper_bound_usd_with_children"] is None
+    assert unknown["unknown_unmetered"] == 1
+
+    usage = {**usage, "unknown_unmetered": 0, "non_final_rows": 0}
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-free", "type": "task", "root_task_id": "root-free",
+    })
+    _handle_task_heartbeat({"task_id": "root-free", "phase": "running"}, ctx)
+    assert pushed[0]["cost_usd_with_children"] == 0.0
+
+
 def test_retired_timeout_defaults_are_quiet_but_custom_value_is_loud(tmp_path, monkeypatch) -> None:
     from supervisor import queue
 
@@ -50,23 +168,23 @@ def test_retired_timeout_defaults_are_quiet_but_custom_value_is_loud(tmp_path, m
     assert row["keys"] == ["OUROBOROS_SOFT_TIMEOUT_SEC"]
 
 
-def test_retired_planning_heartbeat_default_is_quiet_but_custom_value_is_loud(
+def test_retired_planning_heartbeat_key_is_silent_and_dropped_on_load(
     tmp_path, monkeypatch,
 ) -> None:
+    """The planning-scout heartbeat knob is RETIRED with the scout swarm (plan-review
+    redesign 2026-08-15): ``config.RETIRED_SETTING_KEYS`` drops it on settings load, so
+    there is no saved value left to be loud about, and the supervisor's timeout
+    deprecation path no longer names it (deleted consistently, not kept half-loud)."""
+    from ouroboros import config
     from supervisor import queue
 
-    monkeypatch.setattr(queue, "_timeout_deprecation_emitted", False)
-    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "120")
-    queue.init(tmp_path, 600, 1800)
-    events = tmp_path / "logs" / "events.jsonl"
-    assert not events.exists()
-
+    assert "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC" in config.RETIRED_SETTING_KEYS
     monkeypatch.setattr(queue, "_timeout_deprecation_emitted", False)
     monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "121")
     queue.init(tmp_path, 600, 1800)
-    row = json.loads(events.read_text(encoding="utf-8"))
-    assert row["type"] == "deprecated_settings_ignored"
-    assert row["keys"] == ["OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC"]
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+    queue.refresh_timeouts_from_settings({"OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC": 121})
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
 
 
 def test_owner_visible_incidents_use_canonical_message_seam() -> None:

@@ -17,7 +17,15 @@ import types
 
 import pytest
 
+from ouroboros.owner_mailbox import (
+    _ack_path,
+    _mailbox_path,
+    acknowledge_task_messages,
+    write_owner_message,
+)
+from ouroboros.task_results import load_task_result, write_task_result
 from supervisor import events as events_mod
+from supervisor import queue as queue_mod
 
 
 @pytest.fixture()
@@ -46,6 +54,15 @@ def _provider_death_event(task_id: str) -> dict:
 
 def _outage_lines(sent):
     return [text for _cid, text in sent if "provider outage" in text]
+
+
+def _write_mailbox_pair(root, task_id):
+    assert write_owner_message(root, "exact terminal bytes", task_id, msg_id="owner-1")
+    assert acknowledge_task_messages(
+        root, task_id, ["owner-1"], wake_id="attempt-1", attempt_key=1,
+    )
+    assert _mailbox_path(root, task_id).exists()
+    assert _ack_path(root, task_id).exists()
 
 
 def test_duplicate_already_done_after_normal_delivery_notifies_exactly_once(
@@ -185,3 +202,72 @@ def test_subagent_provider_death_never_pings_the_owner(sent_and_ctx):
 
     assert not _outage_lines(sent)
     assert [text for _cid, text in sent if "Subagent kidE failed" in text]
+
+
+def test_settled_dispatch_cleans_mailbox_only_after_durable_terminal(
+    sent_and_ctx, tmp_path, monkeypatch,
+):
+    _sent, make_ctx = sent_and_ctx
+    task_id = "terminal-mailbox"
+    task = {"id": task_id, "chat_id": 7}
+    _write_mailbox_pair(tmp_path, task_id)
+    write_task_result(tmp_path, task_id, "completed", result="done")
+    monkeypatch.setattr(queue_mod, "DRIVE_ROOT", tmp_path)
+
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx({task_id: {"task": task, "worker_id": 0}}),
+        task_id=task_id, worker_id=0, task=task,
+        final_task_result=load_task_result(tmp_path, task_id),
+        task_done_event={"type": "task_done", "task_id": task_id, "status": "completed"},
+    )
+
+    assert not _mailbox_path(tmp_path, task_id).exists()
+    assert not _ack_path(tmp_path, task_id).exists()
+
+
+def test_interrupted_dispatch_preserves_mailbox_for_retry(
+    sent_and_ctx, tmp_path, monkeypatch,
+):
+    _sent, make_ctx = sent_and_ctx
+    task_id = "interrupted-mailbox"
+    task = {"id": task_id, "chat_id": 7}
+    _write_mailbox_pair(tmp_path, task_id)
+    write_task_result(tmp_path, task_id, "interrupted", result="retry pending")
+    monkeypatch.setattr(queue_mod, "DRIVE_ROOT", tmp_path)
+
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx({task_id: {"task": task, "worker_id": 0}}),
+        task_id=task_id, worker_id=0, task=task,
+        final_task_result=load_task_result(tmp_path, task_id),
+        task_done_event={"type": "task_done", "task_id": task_id, "status": "interrupted"},
+    )
+
+    assert _mailbox_path(tmp_path, task_id).exists()
+    assert _ack_path(tmp_path, task_id).exists()
+
+
+def test_reaper_terminal_cleans_split_drive_not_canonical_mailbox(
+    sent_and_ctx, tmp_path, monkeypatch,
+):
+    _sent, make_ctx = sent_and_ctx
+    task_id = "split-mailbox"
+    child_drive = tmp_path / "child-drive"
+    _write_mailbox_pair(child_drive, task_id)
+    _write_mailbox_pair(tmp_path, task_id)
+    write_task_result(
+        tmp_path, task_id, "failed", result="terminal",
+        child_drive_root=str(child_drive),
+    )
+    durable = load_task_result(tmp_path, task_id)
+    monkeypatch.setattr(queue_mod, "DRIVE_ROOT", tmp_path)
+
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx({}), task_id=task_id, worker_id=0, task={},
+        final_task_result=durable,
+        task_done_event={"type": "task_done", "task_id": task_id, "status": "failed"},
+    )
+
+    assert not _mailbox_path(child_drive, task_id).exists()
+    assert not _ack_path(child_drive, task_id).exists()
+    assert _mailbox_path(tmp_path, task_id).exists()
+    assert _ack_path(tmp_path, task_id).exists()

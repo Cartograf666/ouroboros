@@ -83,16 +83,25 @@ def test_reflection_marker_uses_canonical_format():
     assert "OMISSION NOTE" in out and "[+" not in out
 
 
-def test_task_contract_marker_uses_canonical_format():
+def test_task_contract_preserves_complete_authority_fields():
     import inspect
 
     from ouroboros.contracts import task_contract
 
     source = inspect.getsource(task_contract)
     assert "chars omitted)" not in source  # legacy marker retired
-    # Both bounded fields delegate to the shared primitive (marker + floor SSOT).
-    assert source.count("truncate_review_artifact") >= 2
     assert "OMISSION NOTE" not in source  # no hand-rolled marker copies remain
+
+    intent = "intent-" + ("i" * 900) + "-tail"
+    claim = "claim-" + ("c" * 700) + "-tail"
+    support = "support-" + ("s" * 800) + "-tail"
+    contract = task_contract.build_task_contract({
+        "delegation_budget": {"intent_note": intent},
+        "acceptance_claims": [{"claim": claim, "support": support}],
+    })
+    assert contract["delegation_budget"]["intent_note"] == intent
+    assert contract["acceptance_claims"][0]["claim"] == claim
+    assert contract["acceptance_claims"][0]["support"] == support
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +271,38 @@ def test_stray_server_check_matches_packaged_install(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.platform_layer.process_group_id", lambda pid: pid)
     result, issues = checks.check_stray_server_processes(env)
     assert issues == 1 and result["status"] == "stray_processes"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pgrep/getuid semantics")
+def test_stray_server_check_annotates_same_install_scope(tmp_path, monkeypatch):
+    """The launcher reaps PROVEN same-install strays per generation, so the
+    report must say which class a survivor is in: a same_install WARN points at
+    a direct run or a spared/kill-surviving pid, a foreign one never does."""
+    import pathlib
+
+    from ouroboros import agent_startup_checks as checks
+
+    monkeypatch.setattr("ouroboros.config.REPO_DIR", pathlib.PurePosixPath("/opt/Ouroboros/repo"))
+    env = SimpleNamespace(drive_root=str(tmp_path))
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    ours = "/opt/Ouroboros/python/bin/python3 /opt/Ouroboros/repo/server.py"
+    theirs = "/Users/o/Ouroboros/python/bin/python3 /Users/o/Ouroboros/repo/server.py"
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "pgrep":
+            return SimpleNamespace(stdout="616161\n626262\n", returncode=0)
+        return SimpleNamespace(stdout="", returncode=1)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "ouroboros.platform_layer.process_command",
+        lambda pid: {616161: ours, 626262: theirs}.get(pid, ""),
+    )
+    monkeypatch.setattr("ouroboros.platform_layer.process_group_id", lambda pid: pid)
+    result, issues = checks.check_stray_server_processes(env)
+    assert issues == 1
+    scopes = {row["pid"]: row["scope"] for row in result["processes"]}
+    assert scopes == {616161: "same_install", 626262: "foreign"}
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pgrep/getuid semantics")

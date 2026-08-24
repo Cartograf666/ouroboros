@@ -65,8 +65,50 @@ def test_attempt_lifecycle_and_root_projection(data_root):
     assert [row["seq"] for row in rows] == [1, 2, 3]
 
 
+def test_unresolved_reason_is_redacted_before_truncation_and_fails_closed(
+    data_root, monkeypatch,
+):
+    secret = "dXNlcjpiYXNpYy1zZWNyZXQtdmFsdWU="
+    reservation = ua.reserve_attempt(_request(data_root))
+    ua.mark_dispatched(reservation)
+    ua.mark_unresolved(reservation, f"{'x' * 485} Basic {secret}")
+
+    reason = _ledger(data_root)[-1]["reason"]
+    assert secret not in reason
+    assert reason.endswith(" ***REDACTED***")
+
+    from ouroboros import observability
+
+    monkeypatch.setattr(
+        observability,
+        "redact_projection",
+        lambda _value: (_ for _ in ()).throw(RuntimeError("redactor failed")),
+    )
+    fallback = ua.reserve_attempt(_request(data_root, task_id="fallback"))
+    ua.mark_dispatched(fallback)
+    raw = f"must-not-persist:{secret}"
+    facts = ua._provider_exception_facts(RuntimeError(raw))
+    assert facts == (
+        None,
+        "",
+        "RuntimeError",
+        "RuntimeError: provider error details unavailable",
+    )
+    assert raw not in json.dumps(facts)
+    ua.mark_unresolved(fallback, raw)
+    assert _ledger(data_root)[-1]["reason"] == "provider_outcome_unknown:redaction_failed"
+
+
 def test_projection_uses_explicit_runtime_limit_over_environment(data_root):
     assert ua.usage_projection(data_root, global_limit_usd=7.5)["limit_usd"] == 7.5
+
+
+def test_projection_fallback_uses_the_shipped_total_budget(data_root, monkeypatch):
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    monkeypatch.delenv("TOTAL_BUDGET", raising=False)
+
+    assert ua.usage_projection(data_root)["limit_usd"] == SETTINGS_DEFAULTS["TOTAL_BUDGET"]
 
 
 def test_a_bucket_whose_rows_disclosed_no_token_counts_reports_absence_not_zero(data_root):
@@ -1070,30 +1112,36 @@ def test_actor_limit_blocks_third_retry_before_provider_send(data_root, monkeypa
     client = LLMClient(api_key="unused")
     sends = 0
 
+    class ParameterRejection(RuntimeError):
+        status_code = 400
+
+        def __init__(self, message):
+            super().__init__(message)
+            self.body = {"error": {"message": message}}
+
     def create(**kwargs):
         nonlocal sends
         sends += 1
-        raise RuntimeError(f"provider failure {sends}")
-
-    monkeypatch.setattr(
-        client,
-        "_retry_without_optional_sampling",
-        lambda kwargs, model, exc: {**kwargs, "temperature": None},
-    )
-    monkeypatch.setattr(
-        client,
-        "_openrouter_signature_retry_kwargs",
-        lambda target, kwargs, exc: {**kwargs, "messages": []},
-    )
+        message = (
+            "reasoning_effort value 'high' is not supported"
+            if sends == 1 else "temperature unsupported"
+        )
+        raise ParameterRejection(message)
     target = {
         "provider": "openai",
         "usage_model": "openai/gpt-5.2",
         "resolved_model": "gpt-5.2",
+        "base_url": "https://api.openai.example/v1",
     }
     with ua.physical_attempt_limit(2), pytest.raises(ua.PhysicalAttemptLimitExceeded):
         client._create_chat_completion_with_retries(
             create,
-            {"model": "gpt-5.2", "messages": [{"role": "user", "content": "x"}]},
+            {
+                "model": "gpt-5.2",
+                "messages": [{"role": "user", "content": "x"}],
+                "reasoning_effort": "high",
+                "temperature": 0.2,
+            },
             target,
         )
 
@@ -1379,3 +1427,35 @@ def test_a_non_final_projection_names_its_cause(data_root):
         root_task_id="root", spend_usd=0.0)
     free = ua.usage_projection(data_root / "free")
     assert free["non_final_rows"] == 0 and free["cost_final"] is True
+
+
+def test_review_wave_admission_override_compares_against_the_given_remaining(monkeypatch):
+    """The managed-update admission gate runs OUTSIDE any task usage scope: the
+    override branch must estimate with the normal reservation math and compare
+    against the caller's remaining USD, never a task projection."""
+    import ouroboros.usage_accounting as ua
+
+    monkeypatch.setattr(ua, "_reservation_cost", lambda _request: 1.25)
+    monkeypatch.setattr(
+        ua, "usage_projection",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("override must not read a projection")),
+    )
+
+    tight = ua.review_wave_admission(
+        root_task_id="managed-update-admission",
+        models=["prov/a", "prov/b"],
+        prompt_chars=400_000,
+        remaining_usd_override=2.0,
+    )
+    assert tight["fits"] is False
+    assert tight["estimated_wave_usd"] == 2.5
+    assert tight["remaining_usd"] == 2.0
+    assert tight["limit_usd"] is None
+
+    roomy = ua.review_wave_admission(
+        root_task_id="managed-update-admission",
+        models=["prov/a", "prov/b"],
+        prompt_chars=400_000,
+        remaining_usd_override=3.0,
+    )
+    assert roomy["fits"] is True and roomy["estimated_wave_usd"] == 2.5

@@ -3,7 +3,7 @@ import json
 import logging
 import pathlib
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from ouroboros.task_results import validate_task_id
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -16,6 +16,7 @@ _MAILBOX_DIR = "memory/owner_mailbox"
 # owner dialogue; control kinds carry supervisor->worker protocol signals and
 # are routed structurally (never shown as user prose).
 KIND_OWNER_TEXT = "owner_text"
+KIND_TASK_MESSAGE = "task_message"
 KIND_FINALIZE_NOW = "finalize_now"
 # Owner "hurry" control (HQ1, 2026-08-15): a task-local typed acceleration
 # directive — NEVER owner dialogue and NEVER revoked after drain (restart
@@ -40,12 +41,125 @@ def _mailbox_path(drive_root: pathlib.Path, task_id: str) -> pathlib.Path:
     return pathlib.Path(drive_root) / _MAILBOX_DIR / f"{validate_task_id(task_id)}.jsonl"
 
 
+def _ack_path(drive_root: pathlib.Path, task_id: str) -> pathlib.Path:
+    return pathlib.Path(drive_root) / _MAILBOX_DIR / f"{validate_task_id(task_id)}.acks.jsonl"
+
+
+def acknowledged_task_message_ids(
+    drive_root: pathlib.Path,
+    task_id: str,
+    *,
+    attempt_key: Any = None,
+) -> set[str]:
+    """Read acknowledgements effective for one physical attempt.
+
+    Legacy task-message acks (no attempt field) remain globally effective.
+    A legacy ack for durable owner text cannot prove which physical attempt
+    incorporated it, so fresh attempts replay that exact directive until
+    terminal cleanup. New owner-text acks are scoped by ``attempt_key``.
+    """
+
+    path = _ack_path(drive_root, task_id)
+    if not path.exists():
+        return set()
+    legacy_owner_ids: set[str] = set()
+    if attempt_key is not None:
+        try:
+            for line in _mailbox_path(drive_root, task_id).read_text(
+                encoding="utf-8",
+            ).splitlines():
+                try:
+                    entry = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    isinstance(entry, dict)
+                    and str(entry.get("kind") or KIND_OWNER_TEXT) == KIND_OWNER_TEXT
+                    and str(entry.get("msg_id") or "")
+                ):
+                    legacy_owner_ids.add(str(entry["msg_id"]))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning(
+                "Failed to classify legacy owner acknowledgements for %s",
+                task_id, exc_info=True,
+            )
+    found: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(row, dict) or not str(row.get("msg_id") or ""):
+                continue
+            row_attempt = row.get("attempt_key")
+            if (
+                attempt_key is None
+                or str(row_attempt) == str(attempt_key)
+                or (row_attempt is None and str(row["msg_id"]) not in legacy_owner_ids)
+            ):
+                found.add(str(row["msg_id"]))
+    except OSError:
+        log.warning("Failed to read task-message acknowledgements for %s", task_id, exc_info=True)
+    return found
+
+
+def acknowledge_task_messages(
+    drive_root: pathlib.Path,
+    task_id: str,
+    msg_ids: List[str],
+    *,
+    wake_id: str,
+    attempt_key: Any = None,
+) -> bool:
+    """Acknowledge messages only after their full content entered a transcript."""
+
+    path = _ack_path(drive_root, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = acknowledged_task_message_ids(
+        drive_root, task_id, attempt_key=attempt_key,
+    )
+    for msg_id in [str(item) for item in msg_ids if str(item) and str(item) not in existing]:
+        row = {
+            "ts": utc_now_iso(), "type": "task_message_acknowledged",
+            "task_id": str(task_id), "msg_id": msg_id, "wake_id": str(wake_id or ""),
+        }
+        if attempt_key is not None:
+            row["attempt_key"] = str(attempt_key)
+            row["settled"] = False
+        if not append_jsonl(path, row):
+            return False
+    return True
+
+
+def acknowledge_transcript_entry(
+    drive_root: pathlib.Path,
+    task_id: str,
+    entry: Dict[str, Any],
+    *,
+    wake_id: str = "loop_delivery",
+    attempt_key: Any = None,
+) -> None:
+    """Durably acknowledge one mailbox entry after transcript injection."""
+    if attempt_key is None:
+        attempt_key = entry.get("_owner_attempt_key")
+    msg_id = str(entry.get("msg_id") or "")
+    if msg_id and not acknowledge_task_messages(
+        drive_root, task_id, [msg_id], wake_id=wake_id, attempt_key=attempt_key,
+    ):
+        log.warning("Mailbox delivery acknowledgement failed for %s", msg_id)
+
+
 def write_owner_message(
     drive_root: pathlib.Path,
     text: str,
     task_id: str,
     msg_id: Optional[str] = None,
     kind: str = KIND_OWNER_TEXT,
+    client_surface: Optional[Dict[str, Any]] = None,
+    attachment_manifest: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     """Write an owner message or typed control entry to a task's mailbox."""
     path = _mailbox_path(drive_root, task_id)
@@ -56,6 +170,14 @@ def write_owner_message(
         "text": text,
         "kind": str(kind or KIND_OWNER_TEXT),
     }
+    if isinstance(client_surface, dict) and client_surface:
+        # Owner Surface Fact (additive, like ``ts``): which client surface sent
+        # this follow-up, so the loop can note a mid-task device change.
+        entry["client_surface"] = dict(client_surface)
+    if isinstance(attachment_manifest, list):
+        entry["attachment_manifest"] = [
+            dict(item) for item in attachment_manifest if isinstance(item, dict)
+        ]
     try:
         if not append_jsonl(path, entry):
             log.warning("Failed to durably append owner message for task %s", task_id)
@@ -64,6 +186,93 @@ def write_owner_message(
     except Exception:
         log.warning("Failed to write owner message for task %s", task_id, exc_info=True)
         return False
+
+
+def write_task_message(
+    drive_root: pathlib.Path,
+    text: str,
+    task_id: str,
+    *,
+    source_task_id: str,
+    provenance: str = "ancestor_task",
+    relayed_from_task_id: str = "",
+    msg_id: Optional[str] = None,
+) -> bool:
+    """Write an addressed task-tree message without forging owner provenance."""
+
+    if provenance not in {"ancestor_task", "peer_via_ancestor", "system"}:
+        return False
+    path = _mailbox_path(drive_root, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "msg_id": msg_id or uuid.uuid4().hex,
+        "ts": utc_now_iso(),
+        "text": str(text or ""),
+        "kind": KIND_TASK_MESSAGE,
+        "provenance": provenance,
+        "source_task_id": str(source_task_id or ""),
+    }
+    if relayed_from_task_id:
+        entry["relayed_from_task_id"] = str(relayed_from_task_id)
+    try:
+        return bool(append_jsonl(path, entry))
+    except Exception:
+        log.warning("Failed to write task message for task %s", task_id, exc_info=True)
+        return False
+
+
+def owner_attachment_manifest(drive_root: pathlib.Path, task_id: str) -> List[Dict[str, Any]]:
+    """Return every durable owner-text attachment row, including acknowledged mail."""
+
+    path = _mailbox_path(drive_root, task_id)
+    if not path.exists():
+        return []
+    manifests: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(entry, dict) or str(entry.get("kind") or KIND_OWNER_TEXT) != KIND_OWNER_TEXT:
+                continue
+            msg_id = str(entry.get("msg_id") or "")
+            if msg_id and msg_id in seen_ids:
+                continue
+            if msg_id:
+                seen_ids.add(msg_id)
+            manifest = entry.get("attachment_manifest")
+            if isinstance(manifest, list):
+                manifests.extend(dict(item) for item in manifest if isinstance(item, dict))
+    except OSError:
+        log.warning("Failed to read owner attachment manifest for %s", task_id, exc_info=True)
+    return manifests
+
+
+def deliver_task_message(
+    entry: Dict[str, Any], task_id: str, event_queue: Any, append_message: Any,
+) -> None:
+    """Render typed provenance and publish the corresponding worker event."""
+
+    provenance = str(entry.get("provenance") or "ancestor_task")
+    source = str(entry.get("source_task_id") or "unknown")
+    relayed = str(entry.get("relayed_from_task_id") or "")
+    if provenance == "peer_via_ancestor" and relayed:
+        prefix = f"[Message from task {relayed}, relayed by ancestor {source}]"
+    elif provenance == "system":
+        prefix = "[System task message]"
+    else:
+        prefix = f"[Message from ancestor task {source}]"
+    append_message(f"{prefix}\n{entry.get('text') or ''}")
+    if event_queue is not None:
+        try:
+            event_queue.put_nowait({
+                "type": "task_message_injected", "task_id": task_id,
+                "source_task_id": source, "provenance": provenance,
+            })
+        except Exception:
+            pass
 
 
 def revoke_owner_control(
@@ -84,10 +293,137 @@ def revoke_owner_control(
     )
 
 
+def reset_attempt_controls_for_retry(
+    drive_root: pathlib.Path,
+    task_id: str,
+) -> int:
+    """Revoke live attempt-local controls without deleting durable owner text.
+
+    A same-id retry is a new execution attempt, so ``hurry`` and
+    ``finalize_now`` must not arm it.  Owner dialogue and its acknowledgement
+    ledger are task authority, however, and survive until terminal cleanup.
+    Reuse the mailbox's existing append-only revocation protocol so repeated
+    retry resets are idempotent and no second delivery mechanism is introduced.
+    """
+
+    path = _mailbox_path(drive_root, task_id)
+    if not path.exists():
+        return 0
+    try:
+        rows: List[dict] = []
+        revoked: set[str] = set()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("kind") or KIND_OWNER_TEXT) == KIND_CONTROL_REVOKED:
+                revoked.add(str(row.get("text") or ""))
+            rows.append(row)
+        reset = 0
+        for row in rows:
+            kind = str(row.get("kind") or KIND_OWNER_TEXT)
+            msg_id = str(row.get("msg_id") or "")
+            if kind not in {KIND_HURRY, KIND_FINALIZE_NOW} or not msg_id or msg_id in revoked:
+                continue
+            if revoke_owner_control(drive_root, task_id, msg_id):
+                revoked.add(msg_id)
+                reset += 1
+        return reset
+    except OSError:
+        log.warning("Failed to reset owner controls for retry of %s", task_id, exc_info=True)
+        return 0
+
+
+def copy_owner_mailbox_for_retry(
+    drive_root: pathlib.Path,
+    task_id: str,
+    retry_task_id: str,
+    *,
+    path_replacements: Optional[Dict[str, str]] = None,
+) -> bool:
+    """Carry the existing mailbox protocol across a new-id physical retry.
+
+    Timeout retries of root tasks receive a fresh task id.  Copy the append-only
+    mailbox and acknowledgement rows by value so the retry keeps the same
+    durable message ids while later steering can continue on its new task id.
+    Repeated calls merge idempotently instead of replacing any newer rows.
+    """
+
+    task_id = validate_task_id(task_id)
+    retry_task_id = validate_task_id(retry_task_id)
+    if task_id == retry_task_id:
+        return True
+
+    for source, target in (
+        (_mailbox_path(drive_root, task_id), _mailbox_path(drive_root, retry_task_id)),
+        (_ack_path(drive_root, task_id), _ack_path(drive_root, retry_task_id)),
+    ):
+        if not source.exists():
+            continue
+        try:
+            source_rows = [
+                json.loads(line)
+                for line in source.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            target_rows = (
+                [
+                    json.loads(line)
+                    for line in target.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                if target.exists() else []
+            )
+        except (OSError, TypeError, ValueError):
+            log.warning(
+                "Failed to read owner mailbox retry handoff %s -> %s",
+                task_id, retry_task_id, exc_info=True,
+            )
+            return False
+
+        def _rebase(value: Any) -> Any:
+            if isinstance(value, str):
+                for old, new in (path_replacements or {}).items():
+                    value = value.replace(str(old), str(new))
+                return value
+            if isinstance(value, list):
+                return [_rebase(item) for item in value]
+            if isinstance(value, dict):
+                return {key: _rebase(item) for key, item in value.items()}
+            return value
+
+        normalized: List[dict] = []
+        for row in source_rows:
+            if not isinstance(row, dict):
+                continue
+            copied = dict(row)
+            if "task_id" in copied:
+                copied["task_id"] = retry_task_id
+            normalized.append(_rebase(copied))
+        fingerprints = {
+            json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            for row in target_rows if isinstance(row, dict)
+        }
+        for row in normalized:
+            fingerprint = json.dumps(
+                row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            if fingerprint in fingerprints:
+                continue
+            if not append_jsonl(target, row):
+                return False
+            fingerprints.add(fingerprint)
+    return True
+
+
 def drain_owner_entries(
     drive_root: pathlib.Path,
     task_id: str,
     seen_ids: Optional[set] = None,
+    attempt_key: Any = None,
 ) -> List[dict]:
     """Read unseen mailbox entries without mutating the append-only mailbox.
 
@@ -101,6 +437,11 @@ def drain_owner_entries(
         return []
     if seen_ids is None:
         seen_ids = set()
+    seen_ids.update(
+        acknowledged_task_message_ids(
+            drive_root, task_id, attempt_key=attempt_key,
+        )
+    )
     try:
         content = path.read_text(encoding="utf-8").strip()
         if not content:
@@ -136,10 +477,27 @@ def drain_owner_entries(
                 # ``ts`` is ADDITIVE (2026-08-15 Fable pin): typed controls such
                 # as ``hurry`` carry their request time into the drained entry so
                 # the attempt latch can preserve when the owner actually asked.
-                entries.append({
+                drained = {
                     "msg_id": mid, "text": text, "kind": kind,
                     "ts": str(entry.get("ts") or ""),
-                })
+                }
+                # Owner Surface Fact: the drain projection must carry the field
+                # explicitly or a written fact is never delivered (the exact
+                # dead-wire class this sprint closes).
+                if isinstance(entry.get("client_surface"), dict) and entry.get("client_surface"):
+                    drained["client_surface"] = dict(entry["client_surface"])
+                if isinstance(entry.get("attachment_manifest"), list):
+                    drained["attachment_manifest"] = [
+                        dict(item) for item in entry["attachment_manifest"]
+                        if isinstance(item, dict)
+                    ]
+                if attempt_key is not None and kind == KIND_OWNER_TEXT:
+                    drained["_owner_attempt_key"] = attempt_key
+                if kind == KIND_TASK_MESSAGE:
+                    drained["provenance"] = str(entry.get("provenance") or "ancestor_task")
+                    drained["source_task_id"] = str(entry.get("source_task_id") or "")
+                    drained["relayed_from_task_id"] = str(entry.get("relayed_from_task_id") or "")
+                entries.append(drained)
         return entries
     except Exception:
         log.debug("Failed to read mailbox for task %s", task_id, exc_info=True)
@@ -161,9 +519,9 @@ def drain_owner_messages(
 
 def cleanup_task_mailbox(drive_root: pathlib.Path, task_id: str) -> None:
     """Remove a task's mailbox file after task completes."""
-    path = _mailbox_path(drive_root, task_id)
-    try:
-        if path.exists():
-            path.unlink()
-    except Exception:
-        log.debug("Failed to cleanup mailbox for task %s", task_id, exc_info=True)
+    for path in (_mailbox_path(drive_root, task_id), _ack_path(drive_root, task_id)):
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            log.debug("Failed to cleanup mailbox for task %s", task_id, exc_info=True)

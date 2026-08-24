@@ -24,8 +24,14 @@ def test_live_task_message_marker_uses_my_human_wording():
     tools = (REPO_ROOT / "ouroboros" / "tools" / "core.py").read_text(encoding="utf-8")
 
     assert "[Message from my human]" in system
-    assert "_owner_marked_content(dmsg)" in loop
-    assert "[Message from my human]" in tools
+    # The drained mailbox text (plus its optional surface note) must still go
+    # through the owner-marking wrapper before injection.
+    assert "_owner_marked_content(noted_owner_text(owner_ctx, entry, dmsg))" in loop
+    # Addressed task-tree messages are peer/ancestor communication, not owner
+    # dialogue, and must never borrow the owner's priority marker.
+    assert "never labels this " in tools
+    assert "message as owner dialogue" in tools
+    assert "[Message from my human]" not in tools
     assert "[Owner message during task]" not in system
     assert "[Owner message during task]" not in loop
 

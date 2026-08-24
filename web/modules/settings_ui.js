@@ -20,9 +20,8 @@ const SETTINGS_TABS = [
 // Guard markers: renderTabStrip emits behavior/advanced tabs at runtime.
 
 const MODEL_CARDS = [
-    ['Main', 'Primary reasoning model.', 's-model', 's-local-main', 'x-ai/grok-4.5'],
-    ['Heavy', 'Strong acting/coding lane for mutative first-level subagents. Empty uses Main.', 's-model-heavy', 's-local-heavy', ''],
-    ['Light', 'Fast summaries, lightweight tasks, and all deep subagents. Empty uses Main.', 's-model-light', 's-local-light', 'google/gemini-3.6-flash'],
+    ['Main', 'Primary reasoning model.', 's-model', 's-local-main', 'google/gemini-3.7-flash'],
+    ['Light', 'Fast summaries, lightweight internal work, reflections, and the default Fast scout. Empty uses Main.', 's-model-light', 's-local-light', 'openai/gpt-5.6-luna'],
     ['Vision', 'Caption and VLM lane. Empty uses Main.', 's-model-vision', '', ''],
     ['Consciousness', 'High-horizon background consciousness. Empty uses Main.', 's-model-consciousness', 's-local-consciousness', ''],
     ['Fallback', 'Resilience and degraded path (comma-separated chain).', 's-model-fallback', 's-local-fallback', 'openai/gpt-5.6-luna'],
@@ -60,8 +59,8 @@ function secretField({ id, settingKey, label, placeholder }) {
             <label>${label}</label>
             <div class="secret-input-row">
                 <input id="${id}" data-secret-setting="${settingKey}" class="secret-input" type="password" placeholder="${placeholder}">
-                <button type="button" class="settings-ghost-btn secret-toggle" data-target="${id}">Show</button>
-                <button type="button" class="settings-ghost-btn secret-clear" data-target="${id}">Clear</button>
+                <button type="button" class="btn btn-default secret-toggle" data-target="${id}">Show</button>
+                <button type="button" class="btn btn-default secret-clear" data-target="${id}">Clear</button>
             </div>
         </div>
     `;
@@ -75,10 +74,14 @@ const PROVIDER_CARDS = [
     {
         id: 'openrouter', title: 'OpenRouter', icon: '/static/providers/openrouter.ico', hint: 'Default multi-model router', open: true,
         fields: [{ id: 's-openrouter', settingKey: 'OPENROUTER_API_KEY', label: 'OpenRouter API Key', placeholder: 'sk-or-...' }],
+        // testInputs must cover BOTH the secret and the plain fields of the card:
+        // the probe runs against what is typed, before anything is saved.
+        testProvider: 'openrouter', testInputs: { 's-openrouter': 'OPENROUTER_API_KEY' },
     },
     {
         id: 'openai', title: 'OpenAI', icon: '/static/providers/openai.svg', hint: 'Official OpenAI API',
         fields: [{ id: 's-openai', settingKey: 'OPENAI_API_KEY', label: 'OpenAI API Key', placeholder: 'sk-...' }],
+        testProvider: 'openai', testInputs: { 's-openai': 'OPENAI_API_KEY' },
         note: 'Use model values like <code>openai::gpt-5.6-terra</code> in the Models tab to route models directly here. If OpenRouter is absent and the shipped defaults are still untouched, Ouroboros auto-remaps them to official OpenAI defaults.',
     },
     {
@@ -87,6 +90,11 @@ const PROVIDER_CARDS = [
             { id: 's-openai-compatible-key', settingKey: 'OPENAI_COMPATIBLE_API_KEY', label: 'API Key', placeholder: 'Compatible provider key' },
             { id: 's-openai-compatible-base-url', label: 'Base URL', placeholder: 'https://provider.example/v1' },
         ],
+        testProvider: 'openai-compatible',
+        testInputs: {
+            's-openai-compatible-key': 'OPENAI_COMPATIBLE_API_KEY',
+            's-openai-compatible-base-url': 'OPENAI_COMPATIBLE_BASE_URL',
+        },
         note: 'Use this card for custom base URLs. Built-in web search only works with the official OpenAI Responses API, so keep <code>OPENAI_BASE_URL</code> empty when you want <code>web_search</code>.',
     },
     {
@@ -98,6 +106,11 @@ const PROVIDER_CARDS = [
             { id: 's-cloudru-key', settingKey: 'CLOUDRU_FOUNDATION_MODELS_API_KEY', label: 'API Key', placeholder: 'Cloud.ru Foundation Models API key' },
             { id: 's-cloudru-base-url', label: 'Base URL', placeholder: 'https://foundation-models.api.cloud.ru/v1' },
         ],
+        testProvider: 'cloudru',
+        testInputs: {
+            's-cloudru-key': 'CLOUDRU_FOUNDATION_MODELS_API_KEY',
+            's-cloudru-base-url': 'CLOUDRU_FOUNDATION_MODELS_BASE_URL',
+        },
     },
     {
         id: 'minimax', title: 'MiniMax', icon: '', hint: 'Direct regional OpenAI-compatible runtime', advanced: true,
@@ -105,6 +118,8 @@ const PROVIDER_CARDS = [
             { id: 's-minimax-key', settingKey: 'MINIMAX_API_KEY', label: 'API Key', placeholder: 'MiniMax API key' },
             { id: 's-minimax-region', label: 'Region', placeholder: 'global_en or cn_zh' },
         ],
+        testProvider: 'minimax',
+        testInputs: { 's-minimax-key': 'MINIMAX_API_KEY', 's-minimax-region': 'MINIMAX_REGION' },
         note: 'Use <code>minimax::MiniMax-M3</code> or <code>minimax::MiniMax-M2.7</code> in the Models tab. Leave Region empty for <code>global_en</code>; use <code>cn_zh</code> for the China endpoint.',
     },
     {
@@ -117,33 +132,55 @@ const PROVIDER_CARDS = [
             { id: 's-gigachat-base-url', label: 'Base URL', placeholder: 'https://api.giga.chat/v1' },
             { id: 's-gigachat-verify-ssl', label: 'Verify SSL Certs', placeholder: 'true / false' },
         ],
+        testProvider: 'gigachat',
+        testInputs: {
+            's-gigachat-credentials': 'GIGACHAT_CREDENTIALS',
+            's-gigachat-scope': 'GIGACHAT_SCOPE',
+            's-gigachat-user': 'GIGACHAT_USER',
+            's-gigachat-password': 'GIGACHAT_PASSWORD',
+            's-gigachat-base-url': 'GIGACHAT_BASE_URL',
+            's-gigachat-verify-ssl': 'GIGACHAT_VERIFY_SSL_CERTS',
+        },
         note: 'Use model values like <code>gigachat::GigaChat-2-Max</code> in the Models tab to route directly through GigaChat. Authenticate with either an Authorization Key (OAuth, scope <code>GIGACHAT_API_PERS</code>, <code>GIGACHAT_API_B2B</code>, or <code>GIGACHAT_API_CORP</code>) or User + Password.',
     },
     {
         id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct runtime plus Claude tooling',
         fields: [{ id: 's-anthropic', settingKey: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
+        testProvider: 'anthropic', testInputs: { 's-anthropic': 'ANTHROPIC_API_KEY' },
         note: 'Use model values like <code>anthropic::claude-sonnet-5</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
         extra: `
-            <div class="settings-toolbar" id="settings-claude-code-panel" hidden>
-                <button type="button" class="settings-ghost-btn" id="btn-claude-code-install">Repair Runtime</button>
-                <span id="settings-claude-code-status" class="settings-inline-status">Checking Claude runtime...</span>
+            <div class="settings-action-row" id="settings-claude-code-panel" hidden>
+                <span id="settings-claude-code-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true">Checking Claude runtime...</span>
+                <button type="button" class="btn btn-default" id="btn-claude-code-install">Repair Runtime</button>
             </div>
             <div class="settings-inline-note" id="settings-claude-code-copy" hidden>Claude runtime powers the advisory pre-review on the API route. It is managed automatically by the app.</div>
         `,
     },
 ];
 
+// {backend provider id: {DOM input id: settings key}} — settings.js reads the
+// live input values through this map to build the unsaved-credential overrides.
+export const PROVIDER_TEST_INPUTS = Object.fromEntries(
+    PROVIDER_CARDS.filter((card) => card.testProvider).map((card) => [card.testProvider, card.testInputs]),
+);
+
 function providerSettingsCard(spec) {
     const fields = (spec.fields || [])
         .map((field) => field.settingKey ? secretField(field) : plainField(field))
         .join('');
+    const test = spec.testProvider ? `
+            <div class="settings-action-row">
+                <span class="settings-inline-status" data-provider-test-status="${spec.testProvider}" role="status" aria-live="polite" aria-atomic="true"></span>
+                <button type="button" class="btn btn-default" data-provider-test="${spec.testProvider}" title="Sends one short model request. Provider charges may apply.">Test</button>
+            </div>
+        ` : '';
     return providerCard({
         id: spec.id,
         title: spec.title,
         icon: spec.icon,
         hint: spec.hint,
         open: spec.open,
-        body: `<div class="form-row">${fields}</div>${spec.note ? `<div class="settings-inline-note">${spec.note}</div>` : ''}${spec.extra || ''}`,
+        body: `<div class="form-row">${fields}</div>${test}${spec.note ? `<div class="settings-inline-note">${spec.note}</div>` : ''}${spec.extra || ''}`,
     });
 }
 
@@ -332,9 +369,9 @@ export function renderSettingsPage() {
                             These fields are cloud model IDs. Enable <code>Local</code> to route that model
                             through the GGUF server configured in Advanced.
                         </div>
-                        <div class="settings-toolbar">
-                            <button type="button" class="settings-ghost-btn" id="btn-refresh-model-catalog">Refresh Model Catalog</button>
-                            <span id="settings-model-catalog-status" class="settings-inline-status">Model catalog is optional and failure-tolerant.</span>
+                        <div class="settings-action-row">
+                            <span id="settings-model-catalog-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true">Model catalog is optional and failure-tolerant.</span>
+                            <button type="button" class="btn btn-default" id="btn-refresh-model-catalog">Refresh Model Catalog</button>
                         </div>
                         <div class="settings-model-grid">
                             ${MODEL_CARDS.map(([title, copy, inputId, toggleId, defaultValue]) => modelCard({ title, copy, inputId, toggleId, defaultValue })).join('')}
@@ -366,8 +403,9 @@ export function renderSettingsPage() {
                 <section class="settings-panel" data-settings-panel="agents">
                     <div class="settings-section-copy">
                         The agents Ouroboros delegates to, and what each of them is allowed to do:
-                        the subscription accounts, who reviews commits, and how subagents are run.
-                        API keys stay in Providers; API model ids and effort lanes stay in Models.
+                        the subscription accounts, who reviews commits, and the complete execution
+                        choices available to child tasks. API keys stay in Providers; global model
+                        lanes stay in Models, while each Available subagent owns its route here.
                     </div>
                     <!-- ONE service banner for the whole tab: the single place a
                          daemon or runtime problem is explained, instead of the
@@ -417,6 +455,26 @@ export function renderSettingsPage() {
                                     { value: 'off', label: 'Off' },
                                     { value: 'auto', label: 'Auto' },
                                     { value: 'required', label: 'Required' },
+                                ],
+                            })}
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Max Review Cycles</h3>
+                        <div class="settings-section-copy">One shared cap on paid review cycles per task for plan review, task acceptance (improvement passes = cycles &minus; 1), the commit gate (paid triad+scope cycles per root task, shared across the whole task tree; an unchanged diff never buys a new review after a recorded verdict block regardless of this number &mdash; blocking enforcement refuses it for free, while a pure advisory line records no verdict blocks and its no-new-spend guarantee is the free replay after exhaustion, with a loud durable disclosure) and skill review (paid panel runs per root task or per manual snapshot; identical snapshots replay free). <code>&infin;</code> removes the cap; the task's own deadline, budget and lifecycle rails still bind.</div>
+                        <div class="settings-effort-card">
+                            <label>Max Review Cycles</label>
+                            <input id="s-review-max-cycles" type="hidden" value="2">
+                            ${renderSegmentedField({
+                                target: 's-review-max-cycles',
+                                modifier: 'data-review-cycles-group',
+                                options: [
+                                    { value: '1', label: '1' },
+                                    { value: '2', label: '2' },
+                                    { value: '3', label: '3' },
+                                    { value: '5', label: '5' },
+                                    { value: 'unlimited', label: '\u221E' },
                                 ],
                             })}
                         </div>
@@ -781,16 +839,20 @@ export function renderSettingsPage() {
                                 <input id="s-workers" type="number" min="1" max="50" value="10">
                             </div>
                             <div class="form-field">
+                                <label>Concurrent Presence Conversations</label>
+                                <input id="s-presence-max-active" type="number" min="1" max="20" value="2">
+                            </div>
+                            <div class="form-field">
                                 <label>Tool Timeout (s)</label>
                                 <input id="s-tool-timeout" type="number" value="600">
                             </div>
                             <div class="form-field">
                                 <label>Total Budget (USD)</label>
-                                <input id="s-total-budget" type="number" min="0.01" step="any" value="10.0">
+                                <input id="s-total-budget" type="number" min="0.01" step="any" value="200.0">
                             </div>
                             <div class="form-field">
                                 <label>Per-Task Cost Cap (USD)</label>
-                                <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="20.0">
+                                <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="50.0">
                             </div>
                         </div>
                     </div>
@@ -934,6 +996,10 @@ export function bindSecretInputs(root) {
             target.dataset.forceClear = '1';
             const toggle = root.querySelector(`.secret-toggle[data-target="${button.dataset.target}"]`);
             if (toggle) toggle.textContent = 'Show';
+            // Programmatic value changes fire no 'input' event, but a Clear is
+            // an edit like any other: the provider-test verdict-expiry listener
+            // must see it, or a stale OK keeps vouching for a cleared key.
+            target.dispatchEvent(new Event('input', { bubbles: true }));
         });
     });
 }

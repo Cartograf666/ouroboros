@@ -854,6 +854,22 @@ def test_a_genuine_crash_is_not_reclassified_by_timeout_text_elsewhere_in_the_ou
     assert "300s per-test limit" not in result
 
 
+def test_diagnosis_keeps_the_failure_summary_tail_when_output_is_cut():
+    """pytest prints FAILURES + the short summary at the END: the bounded
+    diagnosis cuts the MIDDLE, never the tail naming the failing tests."""
+    from ouroboros.preflight_runner import _classify_pass_result
+
+    output = (
+        "= session starts =\n" + ("noise PASSED\n" * 400)
+        + "= FAILURES =\nE assert 0 == 1\nFAILED tests::test_the_culprit\n"
+    )
+    result = _classify_pass_result("parallel", 1, output, 2000, parallel=True)
+    assert result is not None and len(result) <= 2000
+    assert "session starts" in result  # the head survives too
+    assert "...(truncated)..." in result
+    assert "test_the_culprit" in result  # the tail survives the cut
+
+
 @pytest.mark.parametrize("max_output", [1, 40, 200])
 def test_diagnosis_never_overruns_a_declared_max_output(max_output):
     """`_diagnosis` promises the returned string stays inside the caller's

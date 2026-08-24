@@ -21,9 +21,10 @@ try:
 except ImportError:
     _HAS_STEALTH = False
 
-from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.server_auth import is_loopback_host
 from ouroboros.config import AGENT_SERVER_PORT
+from ouroboros.server_auth import is_loopback_host
+from ouroboros.tool_access import active_tool_profile
+from ouroboros.tools.registry import ToolContext, ToolEntry
 
 log = logging.getLogger(__name__)
 
@@ -1057,8 +1058,20 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
                     engine: str = "", device: str = "") -> str:
     normalized_action = str(action or "").strip().lower()
     readonly_subagent = _readonly_subagent(ctx)
-    if readonly_subagent and normalized_action == "evaluate":
-        return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents cannot run arbitrary browser JavaScript."
+    # Keep the broad restricted-subagent predicate for URL/install and
+    # secret/control protections, but do not make it a browser-JavaScript
+    # capability predicate: acting children already have an isolated write
+    # surface and may inspect the pages involved in their own work.  Invalid
+    # or missing delegated constraints still resolve to local-readonly through
+    # active_tool_profile and therefore remain blocked here.  Keeping the
+    # restricted-profile predicate in this condition also fails closed if a
+    # future restricted profile is added without an explicit acting contract.
+    if (
+        readonly_subagent
+        and active_tool_profile(ctx) != "acting_subagent"
+        and normalized_action == "evaluate"
+    ):
+        return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: local-readonly subagents cannot run arbitrary browser JavaScript."
 
     def _do_action():
         page = _ensure_browser(

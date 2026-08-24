@@ -14,6 +14,42 @@ from typing import Any
 from starlette.routing import BaseRoute, Route, WebSocketRoute
 
 
+def _local_model_routes() -> list:
+    """The local model's own lifecycle surface: start, stop, look, test, install."""
+    from ouroboros.gateway.models import (
+        api_local_model_discovered,
+        api_local_model_install_runtime,
+        api_local_model_start,
+        api_local_model_status,
+        api_local_model_stop,
+        api_local_model_test,
+    )
+
+    return [
+        Route("/api/local-model/start", endpoint=api_local_model_start, methods=["POST"]),
+        Route("/api/local-model/stop", endpoint=api_local_model_stop, methods=["POST"]),
+        Route("/api/local-model/status", endpoint=api_local_model_status),
+        Route("/api/local-model/discovered", endpoint=api_local_model_discovered, methods=["GET"]),
+        Route("/api/local-model/test", endpoint=api_local_model_test, methods=["POST"]),
+        Route("/api/local-model/install-runtime",
+              endpoint=api_local_model_install_runtime, methods=["POST"]),
+    ]
+
+
+def _execution_plan_routes() -> list:
+    """Per-task allocation: what the work can run on, and the owner's answer."""
+    from ouroboros.gateway.execution_plan import (
+        api_execution_plan_decision,
+        api_execution_targets,
+    )
+
+    return [
+        Route("/api/execution-targets", endpoint=api_execution_targets, methods=["GET"]),
+        Route("/api/execution-plan/decision",
+              endpoint=api_execution_plan_decision, methods=["POST"]),
+    ]
+
+
 def collect_routes(
     *,
     data_dir: pathlib.Path,
@@ -70,22 +106,16 @@ def collect_routes(
         api_claudexor_status,
         api_claudexor_wake,
     )
-    from ouroboros.gateway.execution_plan import (
-        api_execution_plan_decision,
-        api_execution_targets,
+    from ouroboros.gateway.onboarding import (
+        api_onboarding_complete,
+        api_onboarding_subagents_preview,
     )
-    from ouroboros.gateway.onboarding import api_onboarding_complete
     from ouroboros.gateway.settings import api_reviewer_slots
     from ouroboros.gateway.mcp import api_mcp_refresh, api_mcp_status, api_mcp_test
     from ouroboros.gateway.models import (
-        api_local_model_install_runtime,
-        api_local_model_start,
-        api_local_model_status,
-        api_local_model_stop,
-        api_local_model_test,
         api_model_catalog,
         api_openai_compatible_models,
-        api_local_model_discovered,
+        api_provider_test,
     )
     from ouroboros.gateway.schedules import (
         api_schedules_delete,
@@ -114,6 +144,7 @@ def collect_routes(
         api_projects_list,
     )
     from ouroboros.gateway.state import api_health, api_state
+    from ouroboros.gateway.skill_publish import skill_publish_routes
     from ouroboros.gateway.tasks import (
         api_task_artifact,
         api_task_cancel,
@@ -142,8 +173,8 @@ def collect_routes(
         api_settings_get,
         api_settings_post,
     )
+    from ouroboros.gateway.presence_settings import api_owner_skill_presence_runtime
     from ouroboros.gateway.ws import ws_endpoint
-
     settings_handlers = settings_handlers or {}
     settings_get = settings_handlers.get("api_settings_get", api_settings_get)
     settings_post = settings_handlers.get("api_settings_post", api_settings_post)
@@ -172,12 +203,14 @@ def collect_routes(
         Route("/api/skills/daemons", endpoint=api_skill_daemons, methods=["GET"]),
         Route("/api/skills/lifecycle-queue", endpoint=api_skill_lifecycle_queue, methods=["GET"]),
         Route("/api/skills/{skill}/review", endpoint=api_skill_review, methods=["POST"]),
+        *skill_publish_routes(),
         Route(
             "/api/skills/{skill}/review-history/{job_id}",
             endpoint=api_skill_review_history_detail,
             methods=["GET"],
         ),
         Route("/api/owner/skills/{skill}/attest-review", endpoint=api_owner_skill_attest_review, methods=["POST"]),
+        Route("/api/owner/skills/{skill}/presence-runtime", endpoint=api_owner_skill_presence_runtime, methods=["POST"]),
         Route("/api/skills/{skill}/grants", endpoint=api_skill_grants, methods=["POST"]),
         Route("/api/skills/{skill}/reconcile", endpoint=api_skill_reconcile, methods=["POST"]),
         Route("/api/marketplace/clawhub/search", endpoint=api_marketplace_search, methods=["GET"]),
@@ -208,6 +241,11 @@ def collect_routes(
         Route("/api/onboarding", endpoint=onboarding),
         # ONE atomic owner-scoped completion (D-8): replaces the wizard's old
         # POST /api/settings + POST /api/owner/runtime-mode pair.
+        Route(
+            "/api/onboarding/subagents/preview",
+            endpoint=api_onboarding_subagents_preview,
+            methods=["POST"],
+        ),
         Route(
             "/api/onboarding/complete",
             endpoint=api_onboarding_complete,
@@ -264,30 +302,15 @@ def collect_routes(
         Route("/api/chat/upload", endpoint=api_chat_upload_delete, methods=["DELETE"]),
         Route("/api/chat/stop", endpoint=api_chat_stop, methods=["POST"]),
         Route("/api/openai-compatible/models", endpoint=api_openai_compatible_models, methods=["POST"]),
-        Route("/api/local-model/start", endpoint=api_local_model_start, methods=["POST"]),
-        Route("/api/local-model/stop", endpoint=api_local_model_stop, methods=["POST"]),
-        Route("/api/local-model/status", endpoint=api_local_model_status),
-        Route("/api/local-model/discovered", endpoint=api_local_model_discovered, methods=["GET"]),
-        Route("/api/local-model/test", endpoint=api_local_model_test, methods=["POST"]),
-        Route(
-            "/api/local-model/install-runtime",
-            endpoint=api_local_model_install_runtime,
-            methods=["POST"],
-        ),
+        Route("/api/providers/test", endpoint=api_provider_test, methods=["POST"]),
+        *_local_model_routes(),
         Route("/api/mcp/status", endpoint=api_mcp_status, methods=["GET"]),
         Route("/api/mcp/refresh", endpoint=api_mcp_refresh, methods=["POST"]),
         Route("/api/mcp/test", endpoint=api_mcp_test, methods=["POST"]),
         # Agent accounts (D30): thin proxies of the owned Claudexor daemon's
         # own account surface; zero auth logic on this side.
         Route("/api/reviewer-slots", endpoint=api_reviewer_slots, methods=["GET"]),
-        # Per-task execution allocation: what the work can run on, and the
-        # owner's answer to a proposal waiting on it.
-        Route("/api/execution-targets", endpoint=api_execution_targets, methods=["GET"]),
-        Route(
-            "/api/execution-plan/decision",
-            endpoint=api_execution_plan_decision,
-            methods=["POST"],
-        ),
+        *_execution_plan_routes(),
         Route("/api/claudexor/status", endpoint=api_claudexor_status, methods=["GET"]),
         Route("/api/claudexor/wake", endpoint=api_claudexor_wake, methods=["POST"]),
         Route("/api/claudexor/login", endpoint=api_claudexor_login, methods=["POST"]),
@@ -309,7 +332,10 @@ def collect_routes(
         Route(
             "/api/claudexor/credential-profiles/{harness}/{profile_id}",
             endpoint=api_claudexor_credential_profile,
-            methods=["DELETE"],
+            # DELETE = forget the named account; PATCH = the Enabled toggle
+            # (both thin proxies of the engine's own credential-profile
+            # contract; the handler dispatches on the method).
+            methods=["DELETE", "PATCH"],
         ),
         WebSocketRoute("/ws", endpoint=ws_endpoint),
     ]

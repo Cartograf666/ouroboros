@@ -6,6 +6,7 @@ import pathlib
 from typing import Any, Dict, Tuple
 
 from ouroboros.observability import new_call_id, persist_call
+from ouroboros.anthropic_native_custody import public_custody_projection
 from ouroboros.utils import sanitize_tool_result_for_log
 
 
@@ -44,7 +45,7 @@ def chat_observed(
             task_id=task_id or call_type,
             call_id=f"{call_id}_request",
             call_type=f"{call_type}_request",
-            payload={"kwargs": kwargs},
+            payload={"kwargs": public_custody_projection(kwargs)},
             manifest=_base_manifest(call_type, kwargs),
         )
     except Exception:
@@ -59,19 +60,26 @@ def chat_observed(
                 task_id=task_id or call_type,
                 call_id=f"{call_id}_error",
                 call_type=f"{call_type}_error",
-                payload={"error": f"{type(exc).__name__}: {exc}", "kwargs": kwargs},
+                payload={"error": f"{type(exc).__name__}: {exc}", "kwargs": public_custody_projection(kwargs)},
                 manifest={**_base_manifest(call_type, kwargs), "status": "error", "error": safe},
             )
         except Exception:
             pass
         raise
     try:
+        from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
+
+        public_usage = dict(usage)
+        public_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
         persist_call(
             root,
             task_id=task_id or call_type,
             call_id=f"{call_id}_response",
             call_type=f"{call_type}_response",
-            payload={"message": msg, "usage": usage},
+            payload={
+                "message": public_custody_projection(msg),
+                "usage": public_usage,
+            },
             manifest={**_base_manifest(call_type, kwargs), "status": "ok"},
         )
     except Exception:

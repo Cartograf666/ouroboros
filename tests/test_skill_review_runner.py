@@ -585,6 +585,58 @@ def test_lifecycle_finish_keeps_raw_only_review_private(tmp_path, monkeypatch):
     assert history[0]["raw_actor_records"][0]["raw_text"] == raw_text
 
 
+def test_lifecycle_history_redacts_secret_shaped_reviewer_prose(tmp_path, monkeypatch):
+    import json
+
+    _reset_queue()
+    drive_root = tmp_path / "drive"
+    repo_dir = tmp_path / "repo"
+    skills_root = tmp_path / "skills"
+    drive_root.mkdir()
+    repo_dir.mkdir()
+    skills_root.mkdir()
+    skill_dir = _build_extension(skills_root, "alpha")
+    content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
+    candidate = "sk-" + "A1" * 20
+    ctx = SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir, messages=[])
+
+    def fake_review(_ctx, skill_name):
+        return SkillReviewOutcome(
+            skill_name=skill_name,
+            status="fail",
+            content_hash=content_hash,
+            reviewer_models=["fake/reviewer"],
+            findings=[{
+                "item": "secret_handling",
+                "verdict": "FAIL",
+                "severity": "critical",
+                "reason": f"Remove {candidate} from the fixture.",
+                "model": "fake/reviewer",
+            }],
+            raw_actor_records=[{
+                "model_id": "fake/reviewer",
+                "status": "ok",
+                "raw_text": f"The candidate is {candidate}.",
+            }],
+        )
+
+    monkeypatch.setattr("supervisor.message_bus.send_with_budget", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "ouroboros.skill_review_runner._reconcile_extension_payload",
+        lambda *_a, **_k: ("noop", "review_failed"),
+    )
+    run_skill_review_lifecycle_blocking(
+        ctx, "alpha", source="test", review_impl=fake_review, repo_path=str(skills_root),
+    )
+
+    history_path = drive_root / "state" / "skills" / "alpha" / "review_history.jsonl"
+    raw_history = history_path.read_text(encoding="utf-8")
+    history = [json.loads(line) for line in raw_history.splitlines()]
+    assert candidate not in raw_history
+    assert "***REDACTED***" in history[0]["fail_findings"][0]["reason_excerpt"]
+    assert "***REDACTED***" in history[0]["raw_actor_records"][0]["raw_text"]
+
+
 def test_self_authored_review_requires_configured_requested_keys(tmp_path, monkeypatch):
     _reset_queue()
     drive_root = tmp_path / "drive"

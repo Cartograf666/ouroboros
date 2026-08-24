@@ -80,7 +80,7 @@ def test_supervisor_dispatches_skill_lifecycle_to_log_and_event_bus(tmp_path, mo
         append_jsonl=append_jsonl,
         bridge=SimpleNamespace(
             push_log=pushed.append,
-            send_video=lambda chat_id, video_bytes, caption="", mime="": (
+            send_video=lambda chat_id, video_bytes, caption="", mime="", task_id="": (
                 sent_video.append((chat_id, video_bytes, caption, mime)) or (True, "ok")
             ),
         ),

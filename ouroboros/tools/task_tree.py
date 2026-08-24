@@ -57,20 +57,30 @@ def _tree_note(
     )
 
 
-def _tree_read(ctx: ToolContext, limit: int = 40) -> str:
-    from ouroboros.task_tree_ledger import tree_ledger_tail_digest
+def _tree_read(
+    ctx: ToolContext,
+    limit: int = 40,
+    offset: int = 0,
+    snapshot: str = "",
+) -> str:
+    from ouroboros.task_tree_ledger import tree_ledger_page
+    from ouroboros.tool_access import canonical_data_root
 
     rid = tree_root_id(ctx)
     if not rid:
         return "⚠️ TOOL_ARG_ERROR (tree_read): no task-tree scope."
-    try:
-        lim = max(1, min(int(limit), 200))
-    except (TypeError, ValueError):
-        lim = 40
-    digest = tree_ledger_tail_digest(rid, limit=lim)
-    if not digest:
+    page = tree_ledger_page(
+        rid,
+        limit=limit,
+        offset=offset,
+        snapshot=snapshot,
+        data_root=canonical_data_root(ctx),
+    )
+    if not page:
         return f"(task-tree coordination ledger [{rid}] is empty)"
-    return f"## Task-tree coordination ledger ({rid})\n\n{digest}"
+    if page.startswith("TREE_READ_SNAPSHOT_CHANGED"):
+        return page
+    return f"## Task-tree coordination ledger ({rid})\n\n{page}"
 
 
 def get_tools() -> List[ToolEntry]:
@@ -153,8 +163,20 @@ def get_tools() -> List[ToolEntry]:
             ),
             "parameters": {"type": "object", "properties": {
                 "limit": {"type": "integer", "default": 40, "description": "Max entries (<=200)."},
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "Number of newer entries already consumed.",
+                },
+                "snapshot": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Stable cursor returned by the preceding page.",
+                },
             }},
-        }, lambda ctx, limit=40: _tree_read(ctx, limit), timeout_sec=15),
+        }, lambda ctx, limit=40, offset=0, snapshot="": _tree_read(
+            ctx, limit, offset, snapshot,
+        ), timeout_sec=15),
     ]
 
 

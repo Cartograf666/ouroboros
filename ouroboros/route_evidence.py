@@ -337,3 +337,47 @@ def format_route_evidence_digest(drive_root: Any, *, limit: int = 8) -> str:
           "a target missing from this list has no history yet, which is worth saying "
           "plainly when you propose it."
     )
+
+
+def record_task_eval(
+    drive_root: Any,
+    drive_logs: Any,
+    task: Dict[str, Any],
+    outcome_axes: Dict[str, Any],
+    cost_fields: Dict[str, Any],
+    *,
+    reason_code: Any,
+    duration_sec: float,
+    n_tool_calls: int,
+    n_tool_errors: int,
+    response_len: int,
+    loop_outcome: Dict[str, Any],
+    ok: bool,
+) -> None:
+    """Write what one finished task cost and did — the eval row and the fold.
+
+    Both readings come off the SAME seam, the one moment where the wall clock,
+    the reconstructed cost and the outcome are all known at once, so they live
+    together rather than being re-derived at two call sites that could drift.
+    The eval row is the raw per-task record (GC'd on the owner's retention);
+    the fold is the aggregate that has to outlive it. A failure to append the
+    row must not cost the aggregate, so they fail independently.
+    """
+    from ouroboros.utils import append_jsonl
+
+    try:
+        append_jsonl(pathlib.Path(drive_logs) / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "task_eval", "ok": ok,
+            "task_id": task.get("id"), "task_type": task.get("type"),
+            "outcome_axes": outcome_axes,
+            "reason_code": reason_code,
+            "review_eligibility": str(loop_outcome.get("review_eligibility") or ""),
+            "review_trigger": str(loop_outcome.get("review_trigger") or ""),
+            "duration_sec": duration_sec,
+            "tool_calls": n_tool_calls,
+            "tool_errors": n_tool_errors,
+            "response_len": response_len,
+        })
+    except Exception:
+        log.warning("Failed to log task eval event", exc_info=True)
+    fold_task_outcome(drive_root, task, outcome_axes, duration_sec, cost_fields, ok=ok)

@@ -274,7 +274,7 @@ def _rewrite_ledger(drive_root: pathlib.Path, entries: List[Dict[str, Any]]) -> 
 
     path = ledger_path(drive_root)
     try:
-        from ouroboros.utils import jsonl_append_lock_path
+        from ouroboros.utils import jsonl_append_lock_path, replace_atomic
         from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 
         lock_path = jsonl_append_lock_path(path)
@@ -285,7 +285,7 @@ def _rewrite_ledger(drive_root: pathlib.Path, entries: List[Dict[str, Any]]) -> 
                 "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries),
                 encoding="utf-8",
             )
-            os.replace(tmp, path)
+            replace_atomic(tmp, path)
         finally:
             release_exclusive_file_lock(lock_path, lock_fd)
     except Exception:

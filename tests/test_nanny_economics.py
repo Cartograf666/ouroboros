@@ -35,8 +35,11 @@ def _owned_gateway_uses_each_test_transport(monkeypatch):
 # -- B1.1: the contract rides the host instructions ----------------------------
 
 
-def _start_with_contract(tmp_path, monkeypatch, contract):
+def _start_with_contract(
+    tmp_path, monkeypatch, contract, *, prompt="run the tests", compiled_work_order=False,
+):
     import ouroboros.tools.delegate as delegate
+    from ouroboros import subagent_runtime
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.gateways import claudexor as gw
     from ouroboros.tools.registry import ToolContext
@@ -73,7 +76,21 @@ def _start_with_contract(tmp_path, monkeypatch, contract):
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
-    payload = json.loads(delegate._delegate_start(ctx, "run the tests"))
+    snapshot = {
+        "schema": 1,
+        "selected_subagent_id": "economics-fixture",
+        "config_fingerprint": "economics-fixture-v1",
+        "route": {
+            "kind": "agent_session",
+            "target_id": "some-route=weak-model",
+            "credential_profile_id": "",
+        },
+        "effort": "low",
+    }
+    payload = json.loads(subagent_runtime.exact_start(ctx, prompt, {
+        "snapshot": snapshot,
+        "compiled_work_order": compiled_work_order,
+    }))
     delegate._CUSTODY.clear()
     assert payload["status"] == "started", payload
     return seen["request"]
@@ -93,6 +110,38 @@ def test_the_contract_objective_rides_the_run_instructions_structurally(tmp_path
     assert "ghost-core" not in request["prompt"]
     # The prohibitions stay the opening statement of the channel.
     assert instructions.index("git commit") < instructions.index("HOST TASK OBJECTIVE")
+
+
+def test_direct_start_request_carries_complete_normalized_contract_authority(tmp_path, monkeypatch):
+    context = " \nAPI_CONTEXT_EXACT\n "
+    contract = {
+        "objective": "delegate the Cat build",
+        "context": context,
+        "constraints": "Claudexor only; no native edits",
+        "acceptance_claims": [{"id": "nested", "claim": "L1 asks L2 to spawn L3"}],
+        "delegation_budget": {"may_delegate": True, "depth_remaining": 3,
+                              "intent_note": "L1\nL2\nL3"},
+        "allowed_resources": {"network": False},
+        "predecessor_authority": {
+            "source": {"kind": "task_result", "task_id": "cat-old"},
+            "task_contract": {
+                "objective": "CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3",
+                "context": "never use native/API fallback",
+            },
+        },
+    }
+
+    request = _start_with_contract(tmp_path, monkeypatch, contract)
+    marker = "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
+    payload = request["instructions"].split(marker, 1)[1]
+    normalized = json.loads(payload)
+
+    assert normalized["context"] == context
+    assert normalized["constraints"] == contract["constraints"]
+    assert normalized["acceptance_claims"][0]["claim"] == "L1 asks L2 to spawn L3"
+    assert normalized["delegation_budget"]["intent_note"] == "L1\nL2\nL3"
+    assert normalized["allowed_resources"]["network"] is False
+    assert normalized["predecessor_authority"] == contract["predecessor_authority"]
 
 
 def test_a_missing_contract_contributes_nothing(tmp_path, monkeypatch):
@@ -653,45 +702,61 @@ def test_forced_wrapup_over_a_succeeded_run_stays_silent_below_threshold(tmp_pat
     assert _forced_delegation_note(ctx, {"tool_calls": []}) == ""
 
 
-# -- B1.1 addendum: the assignment-field truncator is STRICT (F11) --------------
+# -- Configured-session work order wire budget ---------------------------------
 
 
-def test_assignment_field_truncation_is_strict_with_the_marker_inside_the_budget():
-    """F11 (sol #9, probe 4050→4050): the generic preview helper's anti-waste
-    floor let a small overflow pass whole and appended its marker BEYOND the
-    limit. The assignment field is a bounded prompt-channel field: at 4000 it
-    passes untouched, at 4001 it is cut WITH the marker inside 4000, and a
-    multibyte tail is never severed mid-codepoint."""
-    from ouroboros.utils import truncate_within_limit
+def test_work_order_preserves_complete_fields_and_refuses_over_one_total_budget():
+    """No ordinary field becomes a misleading 4k prefix; the total wire bound is atomic."""
+    import pytest
+
+    from ouroboros.subagent_work_order import WorkOrderBudgetExceeded, compile_external_work_order
     from ouroboros.tools.delegate import _ASSIGNMENT_FIELD_CHARS
 
     limit = _ASSIGNMENT_FIELD_CHARS
-    assert limit == 4000
-
-    exact = "a" * limit
-    assert truncate_within_limit(exact, limit) == exact
-
-    over_by_one = "a" * (limit + 1)
-    out = truncate_within_limit(over_by_one, limit)
-    assert len(out) <= limit
-    assert "OMISSION NOTE" in out
-    assert f"original length {limit + 1}" in out
-
-    probe = "a" * 4050
-    out = truncate_within_limit(probe, limit)
-    assert len(out) <= limit, "the 4050→4050 passthrough is the exact probe defect"
-    assert "OMISSION NOTE" in out
-
-    unicode_text = "яё𐍈🚀" * 2000  # multibyte + astral-plane codepoints
-    out = truncate_within_limit(unicode_text, limit)
-    assert len(out) <= limit
-    assert "OMISSION NOTE" in out
-    out.encode("utf-8")  # a mid-codepoint cut would be impossible by slicing, prove it
+    assert limit == 250_000
+    ordinary = "яё𐍈🚀" * 2_000
+    rendered = compile_external_work_order({"id": "child", "objective": ordinary})
+    assert ordinary in rendered and "OMISSION NOTE" not in rendered
+    with pytest.raises(WorkOrderBudgetExceeded) as refused:
+        compile_external_work_order({"id": "child", "objective": "a" * (limit + 1)})
+    assert refused.value.chars > limit
+    assert len(refused.value.sha256) == 64
 
 
-def test_the_contract_block_rides_bounded_through_the_instructions(tmp_path, monkeypatch):
-    """End to end: an oversized objective lands in the run instructions AT the
-    strict bound, marker inside, never 4050 chars of field."""
+def test_over_budget_source_request_is_a_small_partial_lens_without_a_prefix():
+    from ouroboros.subagent_work_order import (
+        WorkOrderBudgetExceeded,
+        build_work_order_source_request,
+        compile_external_work_order,
+    )
+
+    marker = "DECISIVE_SOURCE_MARKER"
+    task = {
+        "id": "child-source",
+        "objective": ("x" * 250_100) + marker,
+        "origin_message_ref": {"kind": "chat_message", "message_id": "m-1"},
+    }
+    with pytest.raises(WorkOrderBudgetExceeded) as refused:
+        compile_external_work_order(task)
+    prompt, envelope = build_work_order_source_request(task, refused.value)
+
+    assert len(prompt) < 10_000
+    assert marker not in prompt
+    assert envelope["coverage"] == "partial"
+    assert envelope["complete_chars"] == refused.value.chars
+    assert envelope["complete_sha256"] == refused.value.sha256
+    assert envelope["source"]["kind"] == "task_result"
+    assert envelope["source"]["tool"] == "get_task_result"
+    assert envelope["source"]["arguments"] == {
+        "task_id": "child-source", "include_authority": True,
+        "include_work_order_source": True,
+    }
+    assert envelope["source"]["projection"] == "canonical_work_order"
+    assert "cannot_verify" in prompt
+
+
+def test_an_ordinary_contract_field_reaches_the_run_instructions_complete(tmp_path, monkeypatch):
+    """End to end, the old per-field 4k prefix is gone from the wire."""
     request = _start_with_contract(tmp_path, monkeypatch, {
         "objective": "O" * 4050,
         "expected_output": "ok",
@@ -700,7 +765,109 @@ def test_the_contract_block_rides_bounded_through_the_instructions(tmp_path, mon
     start = instructions.index("HOST TASK OBJECTIVE")
     end = instructions.index("HOST EXPECTED OUTPUT")
     field = instructions[start:end]
-    # The whole labelled block stays within label + strict field budget (+ slack
-    # for the label sentence and separators).
-    assert "OMISSION NOTE" in field
-    assert "O" * 4001 not in field
+    assert "OMISSION NOTE" not in field
+    assert "O" * 4050 in field
+
+
+def test_atomic_compiled_work_order_sends_dynamic_brief_once(tmp_path, monkeypatch):
+    from ouroboros.subagent_work_order import compile_external_work_order
+
+    objective = "UNIQUE_ATOMIC_OBJECTIVE"
+    task = {
+        "id": "t-nanny",
+        "objective": objective,
+        "expected_output": "verified patch",
+        "task_contract": {
+            "objective": objective,
+            "expected_output": "verified patch",
+        },
+    }
+    work_order = compile_external_work_order(task)
+    request = _start_with_contract(
+        tmp_path,
+        monkeypatch,
+        task["task_contract"],
+        prompt=work_order,
+        compiled_work_order=True,
+    )
+    assert request["prompt"].count(objective) == 1
+    assert objective not in request["instructions"]
+    assert "git commit" in request["instructions"]
+
+
+def test_compiled_work_order_carries_exact_context_and_contract_tail():
+    from ouroboros.subagent_work_order import compile_external_work_order
+
+    context_tail = "API_CONTEXT_DECISIVE_TAIL"
+    intent_tail = "NEST_L1_L2_L3"
+    task = {
+        "id": "t-authority",
+        "objective": "research",
+        "context": "c" * 700 + context_tail,
+        "task_contract": {
+            "objective": "research",
+            "context": "c" * 700 + context_tail,
+            "delegation_budget": {"intent_note": "i" * 700 + intent_tail},
+        },
+    }
+
+    rendered = compile_external_work_order(task)
+
+    assert context_tail in rendered
+    assert intent_tail in rendered
+    assert "TASK CONTRACT AUTHORITY" in rendered
+    assert "chars omitted" not in rendered
+
+
+def test_compiled_work_order_preserves_context_boundary_whitespace():
+    from ouroboros.subagent_work_order import compile_external_work_order
+
+    context = " \nEXACT_CONTEXT_WITH_BOUNDARIES\n "
+    rendered = compile_external_work_order({
+        "id": "t-boundaries",
+        "objective": "research",
+        "context": context,
+        "task_contract": {"objective": "research", "context": context},
+    })
+
+    assert context in rendered
+
+
+def test_authority_fingerprint_binds_every_normalized_contract_field(tmp_path):
+    from ouroboros.delegate_recovery import authority_fingerprint_from_task
+
+    base = {
+        "id": "t-fingerprint",
+        "drive_root": str(tmp_path),
+        "task_contract": {
+            "objective": "build",
+            "context": "context-A",
+            "constraints": "constraint-A",
+            "delegation_budget": {"intent_note": "intent-A"},
+        },
+    }
+    original = authority_fingerprint_from_task(base)
+    for field, value in (
+        ("context", "context-B"),
+        ("constraints", "constraint-B"),
+        ("delegation_budget", {"intent_note": "intent-B"}),
+        ("predecessor_authority", {"source": {"task_id": "different"}}),
+    ):
+        changed = json.loads(json.dumps(base))
+        changed["task_contract"][field] = value
+        assert authority_fingerprint_from_task(changed) != original
+
+
+def test_normalized_contract_rebuild_keeps_workspace_lineage_and_predecessor():
+    from ouroboros.contracts.task_contract import build_task_contract
+
+    normalized = build_task_contract({
+        "id": "child", "workspace_root": "/tmp/project", "workspace_mode": "external",
+        "parent_task_id": "parent", "root_task_id": "root", "session_id": "session",
+        "delegation_role": "subagent", "predecessor_authority": {
+            "source": {"task_id": "previous"},
+            "task_contract": {"objective": "exact predecessor"},
+        },
+    })
+
+    assert build_task_contract({"task_contract": normalized}) == normalized

@@ -1,55 +1,25 @@
-// The owner's answer to «where should this run» — one editable row per piece of
+// The owner's answer to «which agent runs this» — one editable row per piece of
 // work, on the running task's own card.
 //
-// The route VOCABULARY is imported from reviewer_slots, not restated: an install
-// with two spellings of `agent_session` would eventually disagree with itself
-// about the same route. What differs here is the CHOICE value. A reviewer row
-// keeps the route and the model in separate controls, so its api entry is a
-// single `api`; a plan row's api target IS the model, so a choice has to carry
-// it. That is why this file encodes `api:<model>` rather than reusing
-// reviewer_slots' encodeRouteChoice, and the difference is deliberate.
+// A row names a CONFIGURED SUBAGENT by id, never a route. Which agents exist is
+// the owner's standing catalog in Settings (Available subagents); this card only
+// decides which of them each piece of THIS task gets. So the dropdown shows the
+// row's own name and what it is recommended for — the words the owner already
+// wrote — and no route vocabulary is restated here at all.
 
 import { apiFetch } from './api_client.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
-import { ROUTE_KIND_API, ROUTE_KIND_SESSION } from './reviewer_slots.js';
 
-export { ROUTE_KIND_API, ROUTE_KIND_SESSION };
-
-export function encodeTargetChoice(route) {
-    const kind = String(route?.kind || '');
-    const target = String(route?.target_id || '');
-    if (!kind || !target) return '';
-    return `${kind}:${target}`;
-}
-
-export function decodeTargetChoice(value) {
-    const raw = String(value || '');
-    const cut = raw.indexOf(':');
-    if (cut <= 0) return null;
-    const kind = raw.slice(0, cut);
-    const target = raw.slice(cut + 1);
-    if (!target) return null;
-    if (kind !== ROUTE_KIND_API && kind !== ROUTE_KIND_SESSION) return null;
-    return { kind, target_id: target };
-}
-
-// What the owner is choosing between, in one flat list. Unavailable targets are
-// KEPT and marked rather than filtered out: «codex — subscription window spent,
-// resets 14:20» is the fact behind the recommendation, and hiding the row would
-// leave the owner wondering why their usual choice vanished.
-export function targetChoices(catalog) {
-    const rows = [
-        ...(catalog?.api_chat || []),
-        ...(catalog?.agent_session || []),
-    ];
-    return rows
-        .filter((row) => row && row.target_id)
+// What the owner is choosing between: the catalog, in its own words. A row's
+// `recommended_use` is the owner's own note about when to reach for it, so it
+// rides into the option text rather than being summarized away.
+export function subagentChoices(catalog) {
+    return (catalog?.subagents || [])
+        .filter((row) => row && row.subagent_id)
         .map((row) => ({
-            value: encodeTargetChoice(row),
-            label: String(row.label || row.target_id),
-            available: row.available !== false,
-            reason: String(row.unavailable_reason || ''),
-            kind: String(row.kind || ''),
+            value: String(row.subagent_id),
+            label: String(row.name || row.subagent_id),
+            hint: String(row.recommended_use || ''),
         }));
 }
 
@@ -72,31 +42,17 @@ export function estimateLine(estimate) {
 // The payload the decision endpoint takes. Pure, so what gets POSTed is testable
 // without a browser — and so the shape has exactly one author.
 export function buildDecisionPayload(proposal, selections) {
-    const items = (proposal?.items || []).map((item) => {
-        const chosen = decodeTargetChoice(selections?.[item.item_id])
-            || {
-                kind: String(item?.recommended_route?.kind || ''),
-                target_id: String(item?.recommended_route?.target_id || ''),
-            };
-        const route = { kind: chosen.kind, target_id: chosen.target_id };
-        const model = String(item?.recommended_route?.model || '');
-        // The proposed harness model survives only while the harness itself does.
-        // Carried onto a target the owner switched to, it would pin one engine's
-        // model id on another.
-        if (model && chosen.kind === ROUTE_KIND_SESSION
-            && chosen.target_id === String(item?.recommended_route?.target_id || '')) {
-            route.model = model;
-        }
-        return {
-            item_id: String(item.item_id || ''),
-            title: String(item.title || ''),
-            route,
-        };
-    });
+    const items = (proposal?.items || []).map((item) => ({
+        item_id: String(item.item_id || ''),
+        title: String(item.title || ''),
+        // An untouched row keeps what was proposed; the select only ever holds
+        // a catalog id, so there is nothing to decode and nothing to carry over.
+        subagent_id: String(selections?.[item.item_id] || item.subagent_id || ''),
+    }));
     return {
         task_id: String(proposal?.task_id || ''),
         plan: {
-            version: 1,
+            version: 2,
             root_task_id: String(proposal?.root_task_id || ''),
             items,
         },
@@ -105,16 +61,15 @@ export function buildDecisionPayload(proposal, selections) {
 
 function optionsHtml(choices, selected) {
     return choices.map((choice) => {
-        const suffix = choice.available ? '' : ` — unavailable (${choice.reason || 'not reachable'})`;
-        const disabled = choice.available ? '' : ' disabled';
+        const hint = choice.hint ? ` — ${choice.hint}` : '';
         const isSelected = choice.value === selected ? ' selected' : '';
-        return `<option value="${escapeHtml(choice.value)}"${disabled}${isSelected}>`
-            + `${escapeHtml(choice.label + suffix)}</option>`;
+        return `<option value="${escapeHtml(choice.value)}"${isSelected}>`
+            + `${escapeHtml(choice.label + hint)}</option>`;
     }).join('');
 }
 
 function rowHtml(item, choices) {
-    const selected = encodeTargetChoice(item.recommended_route);
+    const selected = String(item.subagent_id || '');
     const estimate = estimateLine(item.estimate);
     const known = choices.some((choice) => choice.value === selected);
     return `
@@ -125,7 +80,7 @@ function rowHtml(item, choices) {
             </div>
             ${item.why ? `<div class="exec-plan-row-why">${escapeHtml(item.why)}</div>` : ''}
             <select class="exec-plan-select" data-exec-plan-select aria-label="Where ${escapeHtml(item.title || item.item_id)} runs">
-                ${known ? '' : `<option value="${escapeHtml(selected)}" selected>${escapeHtml(String(item.recommended_route?.target_id || '') + ' — not in the current catalog')}</option>`}
+                ${known ? '' : `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected + ' — no longer in the catalog')}</option>`}
                 ${optionsHtml(choices, selected)}
             </select>
         </div>`;
@@ -138,11 +93,11 @@ export function renderExecutionPlanCard(proposal, catalog, submit) {
     const host = document.createElement('div');
     host.className = 'chat-bubble system exec-plan-card';
     host.dataset.execPlanTask = String(proposal?.task_id || '');
-    const choices = targetChoices(catalog);
+    const choices = subagentChoices(catalog);
     const items = proposal?.items || [];
     host.innerHTML = `
         <div class="exec-plan-head">
-            <span class="exec-plan-title">Where should this run?</span>
+            <span class="exec-plan-title">Which agent runs each part?</span>
             ${proposal?.headline ? `<span class="exec-plan-headline">${escapeHtml(proposal.headline)}</span>` : ''}
         </div>
         <div class="exec-plan-rows">${items.map((item) => rowHtml(item, choices)).join('')}</div>

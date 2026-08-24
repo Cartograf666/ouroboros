@@ -771,9 +771,13 @@ def test_vcs_cache_dirs_are_not_hashed(tmp_path):
     (skill_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     (skill_dir / "__pycache__").mkdir()
     (skill_dir / "__pycache__" / "main.cpython-311.pyc").write_bytes(b"\x00\x01")
+    (skill_dir / ".pytest_cache" / "v" / "cache").mkdir(parents=True)
+    pytest_cache = skill_dir / ".pytest_cache" / "v" / "cache" / "nodeids"
+    pytest_cache.write_text('["tests/test_one.py"]', encoding="utf-8")
     before = compute_content_hash(skill_dir, manifest_scripts=[{"name": "main.py"}])
     (skill_dir / ".git" / "HEAD").write_text("ref: refs/heads/other\n", encoding="utf-8")
     (skill_dir / "__pycache__" / "main.cpython-311.pyc").write_bytes(b"\x02\x03")
+    pytest_cache.write_text('["tests/test_two.py"]', encoding="utf-8")
     after = compute_content_hash(skill_dir, manifest_scripts=[{"name": "main.py"}])
     assert before == after, "VCS/cache scratch must be excluded from the hash."
 

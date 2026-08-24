@@ -226,6 +226,10 @@ within one instance, aligned with the TB/GAIA templates; NOT independent
 attempts with selection), and `OUROBOROS_SAFETY_MODE=light` (the LLM safety
 pass adds cost/latency inside an isolated jail while the deterministic guards
 do the protecting; the LLM check stays for integration tools).
+Every committed and derived fixed-model profile carries exactly one canonical
+`api_model` row in `OUROBOROS_SUBAGENTS`, on the solve model. Thus decomposition
+cannot inherit a default Light scout, second provider family, or agent-session
+substrate even after the product's install defaults evolve.
 `claude_code_edit` and `switch_model` stay in the default `--disable-tools` list:
 benches measure the single-model Ouroboros harness. The retired edit name keeps
 withholding its delegated coding successor through the task-contract compatibility

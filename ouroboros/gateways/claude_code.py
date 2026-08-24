@@ -805,7 +805,7 @@ def _run_readonly_out_of_process(
     )
 
 
-def resolve_claude_code_model(default: str = "opus[1m]") -> str:
+def resolve_claude_code_model(default: str = "claude-sonnet-5") -> str:
     """Return the env/settings Claude Code model, aligned with config defaults."""
     return os.environ.get("CLAUDE_CODE_MODEL", default).strip() or default
 

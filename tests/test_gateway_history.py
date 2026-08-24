@@ -79,6 +79,46 @@ def test_chat_history_replays_delivered_document_row(tmp_path):
     assert rec["caption"] == "quarterly numbers"
 
 
+def test_chat_history_replays_durable_photo_and_keeps_legacy_row_as_text(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    rows = [
+        {
+            "ts": "2026-08-21T00:00:00Z", "direction": "out", "chat_id": 1,
+            "user_id": 7, "text": "durable shot", "type": "photo",
+            "mime": "image/png", "caption": "durable shot", "task_id": "media-task",
+            "download_url": "/api/tasks/media-task/artifacts/chat-media-" + "a" * 64 + ".png",
+        },
+        {
+            "ts": "2026-08-21T00:01:00Z", "direction": "out", "chat_id": 1,
+            "user_id": 7, "text": "durable clip", "type": "video",
+            "mime": "video/mp4", "caption": "durable clip", "task_id": "media-task",
+            "download_url": "/api/tasks/media-task/artifacts/chat-media-" + "b" * 64 + ".mp4",
+        },
+        {
+            "ts": "2026-08-21T00:02:00Z", "direction": "out", "chat_id": 1,
+            "user_id": 7, "text": "legacy shot", "type": "photo", "mime": "image/png",
+            "task_id": "still-running",
+        },
+    ]
+    (logs / "chat.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    durable = next(item for item in payload if item["text"] == "durable shot")
+    video = next(item for item in payload if item["text"] == "durable clip")
+    legacy = next(item for item in payload if item["text"] == "legacy shot")
+    assert durable["msg_type"] == "photo"
+    assert durable["download_url"].endswith(".png")
+    assert video["msg_type"] == "video"
+    assert video["download_url"].endswith(".mp4")
+    assert "msg_type" not in legacy
+    assert legacy["task_id"] == "still-running"
+
+
 def test_chat_history_backfills_from_rotated_archive(tmp_path):
     """The live chat.jsonl is rotated to archive/chat_<ts>.jsonl at ~800KB. History
     replay must backfill from the most recent archive(s) so a rotation does not
@@ -149,6 +189,105 @@ def test_chat_history_backfills_from_rotated_archive(tmp_path):
     assert doc["download_url"] == "/api/files/download?path=Desktop/archived_report.pdf"
     # Chronological reassembly: archived rows precede the newer live row.
     assert texts.index("older message before the rotation") < texts.index("newest live message")
+
+
+def test_chat_history_marks_malformed_rows_incomplete(tmp_path):
+    """A skipped JSONL row must not make the bounded window claim completeness."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_bytes(
+        json.dumps({
+            "ts": "2026-08-21T18:00:00Z",
+            "direction": "in",
+            "chat_id": 1,
+            "text": "surviving row",
+        }).encode("utf-8")
+        + b"\n{malformed row\n"
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))
+
+    assert any(item.get("text") == "surviving row" for item in payload["messages"])
+    assert payload["window"]["complete"] is False
+    assert "chat_malformed_jsonl" in payload["window"]["truncated_by"]
+
+
+def test_history_gap_metadata_keeps_reader_failures_fail_soft(tmp_path, monkeypatch):
+    """Adding gap metadata must not turn the existing best-effort reader into a 500."""
+    from ouroboros.gateway import history
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("synthetic reader failure")
+
+    monkeypatch.setattr(history, "_read_chat_history_entries", fail)
+    rows, quota, gaps = history._collect_chat_rows(
+        tmp_path / "chat.jsonl",
+        tmp_path / "archive",
+        10,
+        lambda *_args: True,
+        {},
+        include_gaps=True,
+    )
+
+    assert rows == []
+    assert quota == 0
+    assert gaps == set()
+
+
+def test_history_gap_metadata_keeps_legacy_reader_call_shape(tmp_path, monkeypatch):
+    """The opt-in metadata path must not change existing private helper callers."""
+    from ouroboros.gateway import history
+
+    row = {
+        "direction": "in",
+        "chat_id": 1,
+        "text": "legacy helper row",
+        "ts": "2026-08-21T18:01:00Z",
+    }
+
+    def legacy(_live, _archive, _want, _predicate):
+        return [row]
+
+    monkeypatch.setattr(history, "_read_chat_history_entries", legacy)
+    rows, quota = history._collect_chat_rows(
+        tmp_path / "chat.jsonl",
+        tmp_path / "archive",
+        10,
+        lambda *_args: True,
+        {},
+    )
+
+    assert rows[0]["text"] == "legacy helper row"
+    assert quota == 1
+
+
+def test_rotated_reader_legacy_mode_keeps_parser_call_shape(tmp_path, monkeypatch):
+    """Non-metadata callers retain the old iterator signature and cost path."""
+    from ouroboros.gateway import _helpers
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    live = logs / "chat.jsonl"
+    live.write_text("{}\n", encoding="utf-8")
+
+    def legacy(path, *, tail_bytes=None):
+        assert tail_bytes is None or isinstance(tail_bytes, int)
+        return iter([{"text": str(path), "direction": "in"}])
+
+    monkeypatch.setattr(_helpers, "iter_jsonl_objects", legacy)
+    entries = _helpers.read_rotated_jsonl_entries(
+        live,
+        tmp_path / "archive",
+        "chat",
+        10,
+        lambda _entry: True,
+    )
+
+    assert isinstance(entries, list)
+    assert entries[0]["direction"] == "in"
 
 
 def test_progress_history_backfills_from_rotated_archive(tmp_path):
@@ -612,3 +751,80 @@ def test_chat_history_preserves_cancelable_marker(tmp_path):
 
     rec = next(item for item in payload if item.get("task_id") == "root1")
     assert rec["cancelable"] is True
+
+
+def test_main_history_keeps_only_host_project_root_completion_while_project_keeps_detail(
+    tmp_path,
+):
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "launch", name="Launch 🚀")
+    project_chat = int(project["chat_id"])
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "chat.jsonl").write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False)
+            for row in (
+                {
+                    "ts": "2026-08-21T00:00:02Z",
+                    "direction": "system",
+                    "chat_id": project_chat,
+                    "type": "task_summary",
+                    "task_id": "root-project",
+                    "text": "Detailed Project summary",
+                    "tool_calls": 3,
+                    "rounds": 4,
+                },
+                {
+                    "ts": "2026-08-21T00:00:03Z",
+                    "direction": "system",
+                    "chat_id": 1,
+                    "type": "project_completion_summary",
+                    "task_id": "root-project",
+                    "project_id": "launch",
+                    "project_name": "Launch 🚀",
+                    "target_label": "Launch 🚀 › Ship release",
+                    "status": "completed",
+                    "text": "Launch 🚀 › Ship release · Completed",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text(
+        json.dumps(
+            {
+                "ts": "2026-08-21T00:00:01Z",
+                "chat_id": project_chat,
+                "content": "Project-only progress",
+                "task_id": "root-project",
+                "is_progress": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    main = json.loads(
+        asyncio.run(endpoint(SimpleNamespace(query_params={"chat_id": "1"}))).body
+    )["messages"]
+    project_rows = json.loads(
+        asyncio.run(
+            endpoint(SimpleNamespace(query_params={"chat_id": str(project_chat)}))
+        ).body
+    )["messages"]
+
+    assert [row["system_type"] for row in main if row.get("system_type")] == [
+        "project_completion_summary"
+    ]
+    completion = main[0]
+    assert completion["task_id"] == "root-project"
+    assert completion["project_id"] == "launch"
+    assert completion["project_name"] == "Launch 🚀"
+    assert completion["target_label"] == "Launch 🚀 › Ship release"
+    assert completion["status"] == "completed"
+    assert any(row.get("is_progress") for row in project_rows)
+    assert any(row.get("system_type") == "task_summary" for row in project_rows)
